@@ -55,6 +55,10 @@ class Row:
 
 
 def db_config() -> dict[str, Any]:
+    database_url = os.environ.get("DATABASE_URL")
+    if database_url:
+        return {"dsn": database_url, "connect_timeout": int(os.environ.get("DB_CONNECT_TIMEOUT", "15"))}
+
     cfg: dict[str, Any] = {
         "host": os.environ.get("DB_HOST", "localhost"),
         "port": int(os.environ.get("DB_PORT", "5432")),
@@ -605,16 +609,25 @@ init();
 def register_routes(application) -> None:
     from flask import jsonify, request
 
+    if getattr(application, "_brak_routes_registered", False):
+        return
+    application._brak_routes_registered = True
+
     cfg = load_config()
 
     @application.route("/")
     def index():
-        embed = {
-            "wh_catalog": cfg.get("wh_catalog", []),
-            "buildings": cfg.get("buildings", []),
-        }
-        page = DASHBOARD_HTML.replace("__CONFIG_JSON__", json.dumps(embed, ensure_ascii=False))
-        return page
+        try:
+            embed = {
+                "wh_catalog": cfg.get("wh_catalog", []),
+                "buildings": cfg.get("buildings", []),
+            }
+            page = DASHBOARD_HTML.replace(
+                "__CONFIG_JSON__", json.dumps(embed, ensure_ascii=False)
+            )
+            return page
+        except Exception as exc:
+            return f"<pre>Index error: {exc}</pre>", 500
 
     @application.route("/api/report")
     def api_report():
