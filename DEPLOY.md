@@ -17,8 +17,13 @@ npm i -g vercel
 | `DB_NAME` | `botdb` |
 | `DB_USER` | `aperepechkin` |
 | `DB_PASSWORD` | *(ваш пароль)* |
+| `DB_SSLMODE` | `prefer` или `require` (опционально) |
 
 Файл `.env` в репозиторий не попадает — только через панель Vercel.
+
+После деплоя проверьте:
+- `https://ваш-проект.vercel.app/health` — приложение запустилось
+- `https://ваш-проект.vercel.app/health/db` — связь с PostgreSQL
 
 ## 3. PostgreSQL
 

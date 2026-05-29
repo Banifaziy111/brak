@@ -55,14 +55,25 @@ class Row:
 
 
 def db_config() -> dict[str, Any]:
-    return {
+    cfg: dict[str, Any] = {
         "host": os.environ.get("DB_HOST", "localhost"),
         "port": int(os.environ.get("DB_PORT", "5432")),
         "dbname": os.environ.get("DB_NAME", "botdb"),
         "user": os.environ.get("DB_USER", ""),
         "password": os.environ.get("DB_PASSWORD", ""),
-        "connect_timeout": 20,
+        "connect_timeout": int(os.environ.get("DB_CONNECT_TIMEOUT", "15")),
     }
+    sslmode = os.environ.get("DB_SSLMODE")
+    if sslmode:
+        cfg["sslmode"] = sslmode
+    return cfg
+
+
+def check_db_env() -> str | None:
+    missing = [k for k in ("DB_HOST", "DB_USER", "DB_PASSWORD") if not os.environ.get(k)]
+    if missing:
+        return "Не заданы переменные Vercel: " + ", ".join(missing)
+    return None
 
 
 @contextmanager
@@ -608,21 +619,28 @@ def create_app():
 
     @application.route("/api/report")
     def api_report():
-        year = request.args.get("year", cfg.get("week_year", 2026), type=int)
-        week_prev = request.args.get("week_prev", cfg.get("week_prev", 20), type=int)
-        week_last = request.args.get("week_last", cfg.get("week_last", 21), type=int)
-        wh_raw = request.args.get("wh_ids", "")
-        catalog_ids = catalog_wh_ids(cfg)
-        wh_ids: list[int] | None
-        if wh_raw.strip():
-            wh_ids = [int(x) for x in wh_raw.split(",") if x.strip()]
-        elif catalog_ids:
-            wh_ids = catalog_ids
-        else:
-            wh_ids = None
+        env_err = check_db_env()
+        if env_err:
+            return jsonify({"error": env_err}), 503
 
-        office_id = cfg.get("office_id")
-        data = build_report_data(wh_ids, office_id, year, week_prev, week_last)
+        try:
+            year = request.args.get("year", cfg.get("week_year", 2026), type=int)
+            week_prev = request.args.get("week_prev", cfg.get("week_prev", 20), type=int)
+            week_last = request.args.get("week_last", cfg.get("week_last", 21), type=int)
+            wh_raw = request.args.get("wh_ids", "")
+            catalog_ids = catalog_wh_ids(cfg)
+            wh_ids: list[int] | None
+            if wh_raw.strip():
+                wh_ids = [int(x) for x in wh_raw.split(",") if x.strip()]
+            elif catalog_ids:
+                wh_ids = catalog_ids
+            else:
+                wh_ids = None
+
+            office_id = cfg.get("office_id")
+            data = build_report_data(wh_ids, office_id, year, week_prev, week_last)
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
 
         html_grid = (
             render_table(
@@ -674,12 +692,23 @@ def create_app():
 
     @application.route("/health")
     def health():
-        return jsonify({"status": "ok"})
+        return jsonify({"status": "ok", "config": str(CONFIG_PATH.name)})
+
+    @application.route("/health/db")
+    def health_db():
+        env_err = check_db_env()
+        if env_err:
+            return jsonify({"status": "error", "detail": env_err}), 503
+        try:
+            with get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                cur.fetchone()
+            return jsonify({"status": "ok", "database": "connected"})
+        except Exception as exc:
+            return jsonify({"status": "error", "detail": str(exc)}), 503
 
     return application
-
-
-app = create_app()
 
 
 def run_server() -> None:
@@ -687,7 +716,7 @@ def run_server() -> None:
     port = int(os.environ.get("HTML_PORT", "8080"))
     print(f"Дашборд: http://{host}:{port}/")
     print(f"Корпуса: {CONFIG_PATH}")
-    app.run(host=host, port=port, debug=False)
+    create_app().run(host=host, port=port, debug=False)
 
 
 def main() -> int:
