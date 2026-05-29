@@ -34,49 +34,91 @@ if _env_file.exists():
 class Row:
     row_id: int | None
     name: str
-    w_prev: float
-    w_last: float
+    amounts: dict[int, float]
 
-    @property
-    def dynamics(self) -> float | None:
-        if self.w_prev == 0:
-            return None if self.w_last == 0 else 100.0
-        return (self.w_last - self.w_prev) / self.w_prev * 100
+    def amount(self, week: int) -> float:
+        return self.amounts.get(week, 0.0)
 
-    @property
-    def average(self) -> float:
-        return (self.w_prev + self.w_last) / 2
+    def dynamics(self, week_prev: int, week_last: int) -> float | None:
+        w_prev, w_last = self.amount(week_prev), self.amount(week_last)
+        if w_prev == 0:
+            return None if w_last == 0 else 100.0
+        return (w_last - w_prev) / w_prev * 100
 
-    @property
-    def pct_vs_avg(self) -> float | None:
-        if self.average == 0:
+    def average(self, week_prev: int, week_last: int) -> float:
+        return (self.amount(week_prev) + self.amount(week_last)) / 2
+
+    def pct_vs_avg(self, week_prev: int, week_last: int) -> float | None:
+        avg = self.average(week_prev, week_last)
+        if avg == 0:
             return None
-        return self.w_last / self.average * 100
+        return self.amount(week_last) / avg * 100
+
+
+def normalize_database_url(url: str) -> str:
+    """postgresql+psycopg://… → postgresql://… для psycopg2."""
+    from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+    url = url.strip()
+    if "://" in url:
+        scheme, rest = url.split("://", 1)
+        if "+" in scheme:
+            scheme = scheme.split("+", 1)[0]
+        url = f"{scheme}://{rest}"
+
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        return url
+
+    query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k and v]
+    if not query and parsed.query:
+        # обрезанный ?sslmode без значения
+        pass
+    fixed = parsed._replace(query=urlencode(query))
+    return urlunparse(fixed)
 
 
 def db_config() -> dict[str, Any]:
-    database_url = os.environ.get("DATABASE_URL")
-    if database_url:
-        return {"dsn": database_url, "connect_timeout": int(os.environ.get("DB_CONNECT_TIMEOUT", "15"))}
+    timeout = int(os.environ.get("DB_CONNECT_TIMEOUT", "15"))
+    host = os.environ.get("DB_HOST", "").strip()
+    user = os.environ.get("DB_USER", "").strip()
+    password = os.environ.get("DB_PASSWORD", "")
 
-    cfg: dict[str, Any] = {
-        "host": os.environ.get("DB_HOST", "localhost"),
+    # Локально: DB_* надёжнее, если DATABASE_URL в формате SQLAlchemy
+    if host and user and password:
+        cfg: dict[str, Any] = {
+            "host": host,
+            "port": int(os.environ.get("DB_PORT", "5432")),
+            "dbname": os.environ.get("DB_NAME", "botdb"),
+            "user": user,
+            "password": password,
+            "connect_timeout": timeout,
+        }
+        sslmode = os.environ.get("DB_SSLMODE")
+        if sslmode:
+            cfg["sslmode"] = sslmode
+        return cfg
+
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if database_url:
+        return {"dsn": normalize_database_url(database_url), "connect_timeout": timeout}
+
+    return {
+        "host": host or "localhost",
         "port": int(os.environ.get("DB_PORT", "5432")),
         "dbname": os.environ.get("DB_NAME", "botdb"),
-        "user": os.environ.get("DB_USER", ""),
-        "password": os.environ.get("DB_PASSWORD", ""),
-        "connect_timeout": int(os.environ.get("DB_CONNECT_TIMEOUT", "15")),
+        "user": user,
+        "password": password,
+        "connect_timeout": timeout,
     }
-    sslmode = os.environ.get("DB_SSLMODE")
-    if sslmode:
-        cfg["sslmode"] = sslmode
-    return cfg
 
 
 def check_db_env() -> str | None:
+    if os.environ.get("DATABASE_URL", "").strip():
+        return None
     missing = [k for k in ("DB_HOST", "DB_USER", "DB_PASSWORD") if not os.environ.get(k)]
     if missing:
-        return "Не заданы переменные Vercel: " + ", ".join(missing)
+        return "Не заданы: DATABASE_URL или " + ", ".join(missing)
     return None
 
 
@@ -143,6 +185,33 @@ def fetch_wh_list(office_id: int | None) -> list[dict]:
     ]
 
 
+def fetch_available_weeks(
+    year: int,
+    office_id: int | None,
+    wh_ids: list[int] | None,
+) -> list[int]:
+    clauses: list[str] = ["date IS NOT NULL", "EXTRACT(ISOYEAR FROM date) = %s"]
+    params: list[Any] = [year]
+    if office_id is not None:
+        clauses.append("office_id = %s")
+        params.append(office_id)
+    if wh_ids:
+        clauses.append("wh_id = ANY(%s)")
+        params.append(wh_ids)
+    where = " WHERE " + " AND ".join(clauses)
+    sql = f"""
+        SELECT DISTINCT EXTRACT(WEEK FROM date)::int AS w
+        FROM brak_team.write_offs
+        {where}
+        ORDER BY w
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+    return [int(r[0]) for r in rows]
+
+
 def fetch_top(
     *,
     group_col: str,
@@ -151,7 +220,7 @@ def fetch_top(
     office_id: int | None,
     org0_only: bool,
     year: int,
-    week_prev: int,
+    weeks: list[int],
     week_last: int,
     limit: int = 20,
 ) -> list[Row]:
@@ -175,72 +244,90 @@ def fetch_top(
     params.append(year)
 
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
-    id_select = f"{id_col} AS row_id," if id_col else "NULL::int AS row_id,"
-    name_expr = group_col
+    if not weeks:
+        weeks = [week_last]
 
-    sql = f"""
+    week_cols = ",\n            ".join(
+        f"COALESCE(SUM(amount) FILTER (WHERE EXTRACT(WEEK FROM date) = %s), 0) AS w_{w}"
+        for w in weeks
+    )
+
+    if id_col:
+        # Один ИД — одна строка (в БД reason_descr может отличаться при том же reason_id)
+        sql = f"""
         SELECT
-            {id_select}
-            COALESCE({name_expr}, '—') AS name,
-            COALESCE(SUM(amount) FILTER (
-                WHERE EXTRACT(WEEK FROM date) = %s
-            ), 0) AS w_prev,
-            COALESCE(SUM(amount) FILTER (
-                WHERE EXTRACT(WEEK FROM date) = %s
-            ), 0) AS w_last
+            {id_col} AS row_id,
+            COALESCE(MAX({group_col}), '—') AS name,
+            {week_cols}
         FROM brak_team.write_offs
         {where}
-        GROUP BY {id_col + ',' if id_col else ''} {name_expr}
-        ORDER BY w_last DESC NULLS LAST, w_prev DESC NULLS LAST
+        GROUP BY {id_col}
+        ORDER BY w_{week_last} DESC NULLS LAST
         LIMIT %s
     """
-    # %s в FILTER идут в тексте раньше, чем в WHERE
-    qparams = [week_prev, week_last, *params, limit]
+    else:
+        sql = f"""
+        SELECT
+            NULL::int AS row_id,
+            COALESCE({group_col}, '—') AS name,
+            {week_cols}
+        FROM brak_team.write_offs
+        {where}
+        GROUP BY {group_col}
+        ORDER BY w_{week_last} DESC NULLS LAST
+        LIMIT %s
+    """
+    qparams = [*weeks, *params, limit]
 
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(sql, qparams)
         raw = cur.fetchall()
 
-    return [
-        Row(
-            row_id=int(r[0]) if r[0] is not None else None,
-            name=str(r[1]),
-            w_prev=to_float(r[2]),
-            w_last=to_float(r[3]),
+    out: list[Row] = []
+    for r in raw:
+        amounts = {w: to_float(r[2 + i]) for i, w in enumerate(weeks)}
+        out.append(
+            Row(
+                row_id=int(r[0]) if r[0] is not None else None,
+                name=str(r[1]),
+                amounts=amounts,
+            )
         )
-        for r in raw
-    ]
+    return out
 
 
-def add_shares(rows: list[Row]) -> list[dict]:
-    total_last = sum(r.w_last for r in rows)
+def add_shares(rows: list[Row], week_prev: int, week_last: int) -> list[dict]:
+    total_last = sum(r.amount(week_last) for r in rows)
     out: list[dict] = []
     for i, r in enumerate(rows, start=1):
-        share = (r.w_last / total_last * 100) if total_last else 0
+        share = (r.amount(week_last) / total_last * 100) if total_last else 0
         out.append(
             {
                 "num": i,
                 "row_id": r.row_id,
                 "name": r.name,
-                "w_prev": r.w_prev,
-                "w_last": r.w_last,
-                "dynamics": r.dynamics,
+                "amounts": dict(r.amounts),
+                "w_prev": r.amount(week_prev),
+                "w_last": r.amount(week_last),
+                "dynamics": r.dynamics(week_prev, week_last),
                 "share": share,
-                "average": r.average,
-                "pct_vs_avg": r.pct_vs_avg,
+                "average": r.average(week_prev, week_last),
+                "pct_vs_avg": r.pct_vs_avg(week_prev, week_last),
             }
         )
     return out
 
 
-def totals(rows: list[dict]) -> dict:
-    w_prev = sum(x["w_prev"] for x in rows)
-    w_last = sum(x["w_last"] for x in rows)
+def totals(rows: list[dict], weeks: list[int], week_prev: int, week_last: int) -> dict:
+    amounts = {w: sum(x["amounts"].get(w, 0) for x in rows) for w in weeks}
+    w_prev = amounts.get(week_prev, 0)
+    w_last = amounts.get(week_last, 0)
     avg = (w_prev + w_last) / 2 if rows else 0
     dyn = ((w_last - w_prev) / w_prev * 100) if w_prev else None
     pct_avg = (w_last / avg * 100) if avg else None
     return {
+        "amounts": amounts,
         "w_prev": w_prev,
         "w_last": w_last,
         "dynamics": dyn,
@@ -283,66 +370,96 @@ def heat_style(value: float | None, mode: str) -> str:
     return "background:#ffeb9c"
 
 
+def _week_cell_style(week: int, week_prev: int, week_last: int) -> str:
+    if week == week_last:
+        return "background:#fff2cc;font-weight:600"
+    if week == week_prev:
+        return "background:#e2efda"
+    return ""
+
+
 def render_table(
     title: str,
     rows: list[dict],
     total: dict,
     *,
     show_id: bool,
+    weeks: list[int],
     week_prev: int,
     week_last: int,
+    name_header: str = "Наименование",
 ) -> str:
-    id_hdr = "<th>ИД</th>" if show_id else "<th>№</th>"
+    id_hdr = (
+        "<th class='sticky col-id'>ИД</th>"
+        if show_id
+        else "<th class='sticky col-id'>№</th>"
+    )
+    week_hdrs = "".join(
+        f"<th class='n week-col'>{w}</th>" for w in weeks
+    )
     body = []
     for r in rows:
         id_cell = (
-            f"<td class='c'>{r['row_id']}</td>"
+            f"<td class='c sticky col-id'>{r['row_id']}</td>"
             if show_id
-            else f"<td class='c'>{r['num']}</td>"
+            else f"<td class='c sticky col-id'>{r['num']}</td>"
+        )
+        week_cells = "".join(
+            f"<td class='n week-col' style='{_e(_week_cell_style(w, week_prev, week_last))}'>"
+            f"{fmt_num(r['amounts'].get(w, 0))}</td>"
+            for w in weeks
         )
         body.append(
             f"<tr>{id_cell}"
-            f"<td class='name'>{_e(r['name'])}</td>"
-            f"<td class='n'>{fmt_num(r['w_prev'])}</td>"
-            f"<td class='n'>{fmt_num(r['w_last'])}</td>"
-            f"<td class='n' style='{_e(heat_style(r['dynamics'], 'dynamics'))}'>{fmt_pct(r['dynamics'])}</td>"
-            f"<td class='n' style='{_e(heat_style(r['share'], 'share'))}'>{fmt_pct(r['share'])}</td>"
-            f"<td class='n'>{fmt_num(r['average'])}</td>"
-            f"<td class='n' style='{_e(heat_style(r['pct_vs_avg'], 'pct_vs_avg'))}'>{fmt_pct(r['pct_vs_avg'])}</td>"
+            f"<td class='name sticky col-name' title='{_e(r['name'])}'>{_e(r['name'])}</td>"
+            f"{week_cells}"
+            f"<td class='n metric' style='{_e(heat_style(r['dynamics'], 'dynamics'))}'>{fmt_pct(r['dynamics'])}</td>"
+            f"<td class='n metric' style='{_e(heat_style(r['share'], 'share'))}'>{fmt_pct(r['share'])}</td>"
+            f"<td class='n metric'>{fmt_num(r['average'])}</td>"
+            f"<td class='n metric' style='{_e(heat_style(r['pct_vs_avg'], 'pct_vs_avg'))}'>{fmt_pct(r['pct_vs_avg'])}</td>"
             "</tr>"
         )
 
     t = total
+    week_total_cells = "".join(
+        f"<td class='n week-col' style='{_e(_week_cell_style(w, week_prev, week_last))}'>"
+        f"<b>{fmt_num(t['amounts'].get(w, 0))}</b></td>"
+        for w in weeks
+    )
     body.append(
         f"<tr class='total'>"
-        f"<td colspan='2'><b>Итого</b></td>"
-        f"<td class='n'><b>{fmt_num(t['w_prev'])}</b></td>"
-        f"<td class='n'><b>{fmt_num(t['w_last'])}</b></td>"
-        f"<td class='n' style='{_e(heat_style(t['dynamics'], 'dynamics'))}'><b>{fmt_pct(t['dynamics'])}</b></td>"
-        f"<td class='n'><b>{fmt_pct(t['share'])}</b></td>"
-        f"<td class='n'><b>{fmt_num(t['average'])}</b></td>"
-        f"<td class='n' style='{_e(heat_style(t['pct_vs_avg'], 'pct_vs_avg'))}'><b>{fmt_pct(t['pct_vs_avg'])}</b></td>"
+        f"<td colspan='2' class='sticky col-id'><b>Итого</b></td>"
+        f"{week_total_cells}"
+        f"<td class='n metric' style='{_e(heat_style(t['dynamics'], 'dynamics'))}'><b>{fmt_pct(t['dynamics'])}</b></td>"
+        f"<td class='n metric'><b>{fmt_pct(t['share'])}</b></td>"
+        f"<td class='n metric'><b>{fmt_num(t['average'])}</b></td>"
+        f"<td class='n metric' style='{_e(heat_style(t['pct_vs_avg'], 'pct_vs_avg'))}'><b>{fmt_pct(t['pct_vs_avg'])}</b></td>"
         f"</tr>"
     )
 
     return f"""
 <section class="panel">
   <h2>{_e(title)}</h2>
+  <div class="table-scroll">
   <table>
+    <colgroup>
+      <col class="col-id">
+      <col class="col-name">
+    </colgroup>
     <thead>
       <tr>
         {id_hdr}
-        <th>Дефект/Неделя</th>
-        <th class="n">{week_prev}</th>
-        <th class="n">{week_last}</th>
-        <th>Динамика последней недели к предыдущей</th>
-        <th>Доля от общего брака</th>
-        <th>Среднее за 2 недели</th>
-        <th>% последней недели от средней</th>
+        <th class="sticky col-name">{_e(name_header)}</th>
+        {week_hdrs}
+        <th class="metric">Динамика {week_last} к {week_prev}</th>
+        <th class="metric">Доля от общего брака</th>
+        <th class="metric">Среднее за 2 нед.</th>
+        <th class="metric">% посл. к средней</th>
       </tr>
     </thead>
     <tbody>{''.join(body)}</tbody>
   </table>
+  </div>
 </section>
 """
 
@@ -359,7 +476,17 @@ def build_report_data(
     year: int,
     week_prev: int,
     week_last: int,
+    weeks: list[int] | None = None,
 ) -> dict:
+    if weeks is None:
+        weeks = fetch_available_weeks(year, office_id, wh_ids)
+    if not weeks:
+        weeks = [week_prev, week_last]
+    if week_prev not in weeks:
+        weeks = sorted(set(weeks) | {week_prev})
+    if week_last not in weeks:
+        weeks = sorted(set(weeks) | {week_last})
+
     defects = fetch_top(
         group_col="reason_descr",
         id_col="reason_id",
@@ -367,7 +494,7 @@ def build_report_data(
         office_id=office_id,
         org0_only=False,
         year=year,
-        week_prev=week_prev,
+        weeks=weeks,
         week_last=week_last,
     )
     defects_org0 = fetch_top(
@@ -377,7 +504,7 @@ def build_report_data(
         office_id=office_id,
         org0_only=True,
         year=year,
-        week_prev=week_prev,
+        weeks=weeks,
         week_last=week_last,
     )
     cats = fetch_top(
@@ -387,7 +514,7 @@ def build_report_data(
         office_id=office_id,
         org0_only=False,
         year=year,
-        week_prev=week_prev,
+        weeks=weeks,
         week_last=week_last,
     )
     cats_org0 = fetch_top(
@@ -397,24 +524,25 @@ def build_report_data(
         office_id=office_id,
         org0_only=True,
         year=year,
-        week_prev=week_prev,
+        weeks=weeks,
         week_last=week_last,
     )
 
-    d_rows = add_shares(defects)
-    d0_rows = add_shares(defects_org0)
-    c_rows = add_shares(cats)
-    c0_rows = add_shares(cats_org0)
+    d_rows = add_shares(defects, week_prev, week_last)
+    d0_rows = add_shares(defects_org0, week_prev, week_last)
+    c_rows = add_shares(cats, week_prev, week_last)
+    c0_rows = add_shares(cats_org0, week_prev, week_last)
 
     return {
+        "weeks": weeks,
         "defects": d_rows,
-        "defects_total": totals(d_rows),
+        "defects_total": totals(d_rows, weeks, week_prev, week_last),
         "defects_org0": d0_rows,
-        "defects_org0_total": totals(d0_rows),
+        "defects_org0_total": totals(d0_rows, weeks, week_prev, week_last),
         "categories": c_rows,
-        "categories_total": totals(c_rows),
+        "categories_total": totals(c_rows, weeks, week_prev, week_last),
         "categories_org0": c0_rows,
-        "categories_org0_total": totals(c0_rows),
+        "categories_org0_total": totals(c0_rows, weeks, week_prev, week_last),
     }
 
 
@@ -443,7 +571,25 @@ header h1 { margin: 0; font-size: 18px; font-weight: 600; }
 .wh-grid .corpus-hdr { font-weight: 700; font-size: 11px; color: #1f4e79; margin-top: 8px;
                       padding: 4px 0 2px; border-bottom: 1px solid #ccc; }
 .wh-grid .corpus-hdr:first-child { margin-top: 0; }
-.weeks input { width: 56px; padding: 4px; margin-right: 8px; }
+.weeks input, .weeks select { padding: 4px; margin-right: 8px; font-size: 12px; }
+.weeks select { min-width: 64px; }
+.weeks .hint { display: block; font-size: 11px; color: #666; margin-top: 6px; max-width: 320px; }
+.panel .table-scroll { overflow-x: auto; max-width: 100%; }
+.panel table { min-width: max-content; }
+th.week-col, td.week-col { min-width: 72px; }
+th.metric, td.metric { min-width: 110px; }
+th.metric { background: #1f4e79; color: #fff; }
+td.metric { background: #f5f8fc; color: #000; }
+th.sticky, td.sticky { position: sticky; z-index: 2; }
+th.sticky { background: #1f4e79; z-index: 4; }
+td.sticky { background: #fff; }
+.col-id { width: 52px; min-width: 52px; }
+.col-name { width: 260px; min-width: 200px; }
+th.col-id, td.col-id { left: 0; }
+th.col-name, td.col-name { left: 52px; box-shadow: 2px 0 4px rgba(0,0,0,.08); }
+td.col-name { white-space: normal; line-height: 1.25; vertical-align: top; }
+tr.total td.sticky { background: #d9e2f3; }
+tr.total th.sticky { background: #1f4e79; }
 .actions { display: flex; align-items: flex-end; gap: 8px; }
 .actions button { padding: 8px 20px; background: #217346; color: #fff; border: none;
   border-radius: 4px; cursor: pointer; font-weight: 600; }
@@ -457,7 +603,7 @@ header h1 { margin: 0; font-size: 18px; font-weight: 600; }
 table { width: 100%; border-collapse: collapse; }
 th, td { border: 1px solid #b4b4b4; padding: 3px 6px; }
 th { background: #1f4e79; color: #fff; font-weight: 600; text-align: center; font-size: 11px; }
-td.name { text-align: left; max-width: 200px; }
+td.name { text-align: left; }
 td.c, td.n { text-align: right; white-space: nowrap; }
 tr.total td { background: #d9e2f3; font-weight: 600; }
 .loading { opacity: 0.5; pointer-events: none; }
@@ -474,8 +620,9 @@ tr.total td { background: #d9e2f3; font-weight: 600; }
   <fieldset class="group weeks">
     <legend>Недели (ISO)</legend>
     <label>Год <input type="number" id="year" value="2026"></label>
-    <label>Пред. <input type="number" id="weekPrev" value="20" min="1" max="53"></label>
-    <label>Посл. <input type="number" id="weekLast" value="21" min="1" max="53"></label>
+    <label>Расчёт: пред. <select id="weekPrev"></select></label>
+    <label>посл. <select id="weekLast"></select></label>
+    <span class="hint">Все недели года — в таблице (прокрутка). Динамика, доля и среднее — только по двум выбранным неделям.</span>
   </fieldset>
   <div class="actions">
     <button type="button" id="btnApply">Обновить</button>
@@ -493,6 +640,7 @@ const ALL_WH_IDS = CATALOG.map(w => w.wh_id);
 
 let selectedWh = new Set();
 let activeBuilding = 'custom';
+let availableWeeks = [];
 
 function whLabel(id) {
   const w = CATALOG.find(x => x.wh_id === id);
@@ -500,6 +648,7 @@ function whLabel(id) {
 }
 
 function init() {
+  if (CONFIG.week_year) document.getElementById('year').value = CONFIG.week_year;
   const grid = document.getElementById('whGrid');
   let lastCorpus = null;
   CATALOG.forEach(w => {
@@ -536,20 +685,65 @@ function init() {
     btns.appendChild(btn);
   });
 
+  document.getElementById('year').addEventListener('change', () => refreshWeeks().then(loadReport));
+  document.getElementById('weekPrev').addEventListener('change', loadReport);
+  document.getElementById('weekLast').addEventListener('change', loadReport);
   document.getElementById('btnApply').onclick = loadReport;
-  document.getElementById('btnAllWh').onclick = () => {
+  document.getElementById('btnAllWh').onclick = async () => {
     selectedWh = new Set(ALL_WH_IDS);
     document.querySelectorAll('#whGrid input').forEach(cb => cb.checked = true);
     activeBuilding = 'all';
     syncBuildingButtons();
+    await refreshWeeks();
     loadReport();
   };
 
-  if (CONFIG.buildings.length) selectBuilding(CONFIG.buildings[0]);
-  else loadReport();
+  refreshWeeks().then(() => {
+    if (CONFIG.week_prev && CONFIG.week_last && availableWeeks.length) {
+      fillWeekSelects(availableWeeks, CONFIG.week_prev, CONFIG.week_last);
+    }
+    if (CONFIG.buildings.length) selectBuilding(CONFIG.buildings[0]);
+    else loadReport();
+  });
 }
 
-function selectBuilding(b) {
+function fillWeekSelects(weeks, prev, last) {
+  const selPrev = document.getElementById('weekPrev');
+  const selLast = document.getElementById('weekLast');
+  selPrev.innerHTML = '';
+  selLast.innerHTML = '';
+  weeks.forEach(w => {
+    const o1 = document.createElement('option');
+    o1.value = w; o1.textContent = w;
+    const o2 = o1.cloneNode(true);
+    selPrev.appendChild(o1);
+    selLast.appendChild(o2);
+  });
+  if (weeks.length >= 2) {
+    selPrev.value = String(prev ?? weeks[weeks.length - 2]);
+    selLast.value = String(last ?? weeks[weeks.length - 1]);
+  } else if (weeks.length === 1) {
+    selPrev.value = selLast.value = String(weeks[0]);
+  }
+}
+
+async function refreshWeeks() {
+  const year = document.getElementById('year').value;
+  const wh = selectedWh.size ? Array.from(selectedWh).join(',') : '';
+  const q = new URLSearchParams({ year });
+  if (wh) q.set('wh_ids', wh);
+  try {
+    const r = await fetch('/api/weeks?' + q);
+    if (!r.ok) return;
+    const data = await r.json();
+    availableWeeks = data.weeks || [];
+    const prev = parseInt(document.getElementById('weekPrev').value, 10);
+    const last = parseInt(document.getElementById('weekLast').value, 10);
+    fillWeekSelects(availableWeeks, prev, last);
+  } catch (_) {}
+}
+
+async function selectBuilding(b) {
   activeBuilding = b.id;
   syncBuildingButtons();
   if (!b.wh_ids || b.wh_ids.length === 0) {
@@ -561,6 +755,7 @@ function selectBuilding(b) {
       cb.checked = selectedWh.has(parseInt(cb.value, 10));
     });
   }
+  await refreshWeeks();
   loadReport();
 }
 
@@ -570,28 +765,60 @@ function syncBuildingButtons() {
   });
 }
 
+function selectedWeeks() {
+  let wp = document.getElementById('weekPrev').value;
+  let wl = document.getElementById('weekLast').value;
+  if (!wp || !wl) {
+    if (availableWeeks.length >= 2) {
+      wp = String(availableWeeks[availableWeeks.length - 2]);
+      wl = String(availableWeeks[availableWeeks.length - 1]);
+    } else {
+      wp = String(CONFIG.week_prev || 20);
+      wl = String(CONFIG.week_last || 21);
+    }
+    fillWeekSelects(availableWeeks.length ? availableWeeks : [parseInt(wp,10)], parseInt(wp,10), parseInt(wl,10));
+  }
+  return { wp, wl };
+}
+
 async function loadReport() {
   const status = document.getElementById('status');
   const grid = document.getElementById('reportGrid');
   grid.classList.add('loading');
   const wh = selectedWh.size ? Array.from(selectedWh).join(',') : '';
+  const { wp, wl } = selectedWeeks();
   const q = new URLSearchParams({
     year: document.getElementById('year').value,
-    week_prev: document.getElementById('weekPrev').value,
-    week_last: document.getElementById('weekLast').value,
+    week_prev: wp,
+    week_last: wl,
   });
   if (wh) q.set('wh_ids', wh);
   status.textContent = 'Загрузка…';
   try {
     const r = await fetch('/api/report?' + q);
-    if (!r.ok) throw new Error(await r.text());
-    const data = await r.json();
+    const raw = await r.text();
+    if (!r.ok) {
+      try {
+        const err = JSON.parse(raw);
+        throw new Error(err.error || raw);
+      } catch (e) {
+        if (e instanceof Error && e.message !== raw) throw e;
+        throw new Error(raw || r.statusText);
+      }
+    }
+    const data = JSON.parse(raw);
     grid.innerHTML = data.html;
     const sorted = Array.from(selectedWh).sort((a,b)=>a-b);
     const label = selectedWh.size === ALL_WH_IDS.length
       ? 'все корпуса (' + ALL_WH_IDS.length + ' WH)'
       : sorted.map(whLabel).join('; ');
-    status.textContent = `WH: ${label} · недели ${data.week_prev}/${data.week_last} ${data.year}`;
+    status.textContent = `WH: ${label} · расчёт нед. ${data.week_prev}→${data.week_last}, в таблице: ${(data.weeks || []).join(', ')} (${data.year})`;
+    if (data.weeks && data.weeks.length) {
+      availableWeeks = data.weeks;
+      const p = document.getElementById('weekPrev').value;
+      const l = document.getElementById('weekLast').value;
+      fillWeekSelects(data.weeks, parseInt(p, 10), parseInt(l, 10));
+    }
   } catch (e) {
     status.textContent = 'Ошибка: ' + e.message;
   } finally {
@@ -621,6 +848,9 @@ def register_routes(application) -> None:
             embed = {
                 "wh_catalog": cfg.get("wh_catalog", []),
                 "buildings": cfg.get("buildings", []),
+                "week_year": cfg.get("week_year", 2026),
+                "week_prev": cfg.get("week_prev", 20),
+                "week_last": cfg.get("week_last", 21),
             }
             page = DASHBOARD_HTML.replace(
                 "__CONFIG_JSON__", json.dumps(embed, ensure_ascii=False)
@@ -637,8 +867,18 @@ def register_routes(application) -> None:
 
         try:
             year = request.args.get("year", cfg.get("week_year", 2026), type=int)
-            week_prev = request.args.get("week_prev", cfg.get("week_prev", 20), type=int)
-            week_last = request.args.get("week_last", cfg.get("week_last", 21), type=int)
+
+            def _week_arg(name: str, default: int) -> int:
+                raw = request.args.get(name, "")
+                if raw is None or str(raw).strip() == "":
+                    return default
+                try:
+                    return int(raw)
+                except (TypeError, ValueError):
+                    return default
+
+            week_prev = _week_arg("week_prev", cfg.get("week_prev", 20))
+            week_last = _week_arg("week_last", cfg.get("week_last", 21))
             wh_raw = request.args.get("wh_ids", "")
             catalog_ids = catalog_wh_ids(cfg)
             wh_ids: list[int] | None
@@ -654,38 +894,47 @@ def register_routes(application) -> None:
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
+        weeks = data["weeks"]
         html_grid = (
             render_table(
                 "Дефект ТОП-20, рубли",
                 data["defects"],
                 data["defects_total"],
                 show_id=True,
+                weeks=weeks,
                 week_prev=week_prev,
                 week_last=week_last,
+                name_header="Дефект",
             )
             + render_table(
                 "Дефект ТОП-20, ORG 0, рубли",
                 data["defects_org0"],
                 data["defects_org0_total"],
                 show_id=True,
+                weeks=weeks,
                 week_prev=week_prev,
                 week_last=week_last,
+                name_header="Дефект",
             )
             + render_table(
                 "ТОП-20 категорий, рубли",
                 data["categories"],
                 data["categories_total"],
                 show_id=False,
+                weeks=weeks,
                 week_prev=week_prev,
                 week_last=week_last,
+                name_header="Категория",
             )
             + render_table(
                 "ТОП-20 категорий, ORG 0, рубли",
                 data["categories_org0"],
                 data["categories_org0_total"],
                 show_id=False,
+                weeks=weeks,
                 week_prev=week_prev,
                 week_last=week_last,
+                name_header="Категория",
             )
         )
 
@@ -693,10 +942,44 @@ def register_routes(application) -> None:
             {
                 "html": html_grid,
                 "year": year,
+                "weeks": weeks,
                 "week_prev": week_prev,
                 "week_last": week_last,
             }
         )
+
+    @application.route("/api/weeks")
+    def api_weeks():
+        env_err = check_db_env()
+        if env_err:
+            return jsonify({"error": env_err}), 503
+        try:
+            year = request.args.get("year", cfg.get("week_year", 2026), type=int)
+            wh_raw = request.args.get("wh_ids", "")
+            catalog_ids = catalog_wh_ids(cfg)
+            if wh_raw.strip():
+                wh_ids = [int(x) for x in wh_raw.split(",") if x.strip()]
+            elif catalog_ids:
+                wh_ids = catalog_ids
+            else:
+                wh_ids = None
+            weeks = fetch_available_weeks(year, cfg.get("office_id"), wh_ids)
+            week_prev = cfg.get("week_prev", 20)
+            week_last = cfg.get("week_last", 21)
+            if len(weeks) >= 2:
+                week_prev, week_last = weeks[-2], weeks[-1]
+            elif len(weeks) == 1:
+                week_prev = week_last = weeks[0]
+            return jsonify(
+                {
+                    "year": year,
+                    "weeks": weeks,
+                    "week_prev": week_prev,
+                    "week_last": week_last,
+                }
+            )
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
 
     @application.route("/api/wh_ids")
     def api_wh_ids():
