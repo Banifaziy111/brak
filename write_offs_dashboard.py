@@ -602,11 +602,10 @@ init();
 """
 
 
-def create_app():
-    from flask import Flask, jsonify, request
+def register_routes(application) -> None:
+    from flask import jsonify, request
 
     cfg = load_config()
-    application = Flask(__name__)
 
     @application.route("/")
     def index():
@@ -708,6 +707,12 @@ def create_app():
         except Exception as exc:
             return jsonify({"status": "error", "detail": str(exc)}), 503
 
+
+def create_app():
+    from flask import Flask
+
+    application = Flask(__name__)
+    register_routes(application)
     return application
 
 
