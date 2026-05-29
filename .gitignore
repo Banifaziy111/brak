@@ -1,0 +1,9 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.vercel
+*.csv
+*.csv.zip
+*_xlsx/
+159_split/
