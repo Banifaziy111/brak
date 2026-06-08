@@ -185,6 +185,79 @@ def fetch_wh_list(office_id: int | None) -> list[dict]:
     ]
 
 
+def fetch_db_stats(
+    office_id: int | None,
+    wh_ids: list[int] | None,
+) -> dict[str, Any]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if office_id is not None:
+        clauses.append("office_id = %s")
+        params.append(office_id)
+    if wh_ids:
+        clauses.append("wh_id = ANY(%s)")
+        params.append(wh_ids)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    sql = f"""
+        SELECT COUNT(*)::bigint,
+               MAX(date)::text,
+               COALESCE(ROUND(SUM(amount)::numeric, 0), 0)
+        FROM brak_team.write_offs
+        {where}
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        row = cur.fetchone()
+    return {
+        "row_count": int(row[0]) if row else 0,
+        "max_date": row[1] if row else None,
+        "total_amount": to_float(row[2]) if row else 0.0,
+    }
+
+
+def run_db_refresh() -> str | None:
+    """
+    Опционально запускает обновление источника (ETL) перед чтением отчёта.
+    DB_REFRESH_SQL — SQL на сервере (функция/REFRESH).
+    DB_REFRESH_URL — HTTP-вызов внешней выгрузки.
+  """
+    import urllib.error
+    import urllib.request
+
+    sql = os.environ.get("DB_REFRESH_SQL", "").strip()
+    if sql:
+        with get_conn() as conn:
+            conn.autocommit = True
+            cur = conn.cursor()
+            cur.execute(sql)
+            try:
+                row = cur.fetchone()
+                if row and row[0] is not None:
+                    return str(row[0])
+            except Exception:
+                pass
+        return "SQL обновления выполнен"
+
+    url = os.environ.get("DB_REFRESH_URL", "").strip()
+    if not url:
+        return None
+
+    method = os.environ.get("DB_REFRESH_METHOD", "POST").upper()
+    req = urllib.request.Request(url, method=method)
+    token = os.environ.get("DB_REFRESH_TOKEN", "").strip()
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    timeout = int(os.environ.get("DB_REFRESH_TIMEOUT", "120"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")[:300]
+            return body or f"HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        raise RuntimeError(f"DB_REFRESH_URL: HTTP {exc.code} {detail}") from exc
+
+
 def fetch_available_weeks(
     year: int,
     office_id: int | None,
@@ -591,9 +664,13 @@ td.col-name { white-space: normal; line-height: 1.25; vertical-align: top; }
 tr.total td.sticky { background: #d9e2f3; }
 tr.total th.sticky { background: #1f4e79; }
 .actions { display: flex; align-items: flex-end; gap: 8px; }
-.actions button { padding: 8px 20px; background: #217346; color: #fff; border: none;
-  border-radius: 4px; cursor: pointer; font-weight: 600; }
-.actions button:hover { background: #1a5c38; }
+.actions button { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer;
+  font-weight: 600; font-size: 12px; }
+.actions button.primary { background: #1f4e79; color: #fff; }
+.actions button.primary:hover { background: #163a5c; }
+.actions button.primary:disabled { opacity: 0.6; cursor: wait; }
+.actions button.secondary { background: #217346; color: #fff; }
+.actions button.secondary:hover { background: #1a5c38; }
 #status { padding: 8px 16px; color: #555; font-size: 12px; }
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 12px; }
 @media (max-width: 1200px) { .grid { grid-template-columns: 1fr; } }
@@ -625,8 +702,9 @@ tr.total td { background: #d9e2f3; font-weight: 600; }
     <span class="hint">Все недели года — в таблице (прокрутка). Динамика, доля и среднее — только по двум выбранным неделям.</span>
   </fieldset>
   <div class="actions">
-    <button type="button" id="btnApply">Обновить</button>
-    <button type="button" id="btnAllWh">Все WH</button>
+    <button type="button" id="btnRefreshData" class="primary">Обновить данные</button>
+    <button type="button" id="btnApply" class="secondary">Применить</button>
+    <button type="button" id="btnAllWh" class="secondary">Все WH</button>
   </div>
 </div>
 <div id="status">Загрузка…</div>
@@ -689,6 +767,7 @@ function init() {
   document.getElementById('weekPrev').addEventListener('change', loadReport);
   document.getElementById('weekLast').addEventListener('change', loadReport);
   document.getElementById('btnApply').onclick = loadReport;
+  document.getElementById('btnRefreshData').onclick = refreshData;
   document.getElementById('btnAllWh').onclick = async () => {
     selectedWh = new Set(ALL_WH_IDS);
     document.querySelectorAll('#whGrid input').forEach(cb => cb.checked = true);
@@ -781,6 +860,57 @@ function selectedWeeks() {
   return { wp, wl };
 }
 
+async function parseApiResponse(r) {
+  const raw = await r.text();
+  if (!r.ok) {
+    try {
+      const err = JSON.parse(raw);
+      throw new Error(err.error || raw);
+    } catch (e) {
+      if (e instanceof Error && e.message !== raw) throw e;
+      throw new Error(raw || r.statusText);
+    }
+  }
+  return JSON.parse(raw);
+}
+
+async function refreshData() {
+  const status = document.getElementById('status');
+  const grid = document.getElementById('reportGrid');
+  const btn = document.getElementById('btnRefreshData');
+  btn.disabled = true;
+  grid.classList.add('loading');
+  status.textContent = 'Обновление базы и загрузка отчёта…';
+  const wh = selectedWh.size ? Array.from(selectedWh).join(',') : '';
+  const year = document.getElementById('year').value;
+  const q = new URLSearchParams({ year });
+  if (wh) q.set('wh_ids', wh);
+  try {
+    const data = await parseApiResponse(await fetch('/api/refresh?' + q, { method: 'POST' }));
+    if (data.weeks && data.weeks.length) {
+      availableWeeks = data.weeks;
+      const wp = data.week_prev ?? availableWeeks[availableWeeks.length - 2];
+      const wl = data.week_last ?? availableWeeks[availableWeeks.length - 1];
+      fillWeekSelects(availableWeeks, wp, wl);
+    } else {
+      await refreshWeeks();
+    }
+    await loadReport();
+    const parts = [
+      'Данные обновлены',
+      data.row_count != null ? data.row_count.toLocaleString('ru') + ' строк' : '',
+      data.max_date ? 'посл. дата ' + data.max_date : '',
+    ].filter(Boolean);
+    if (data.refresh_note) parts.push(data.refresh_note);
+    status.textContent = parts.join(' · ');
+  } catch (e) {
+    status.textContent = 'Ошибка обновления: ' + e.message;
+  } finally {
+    btn.disabled = false;
+    grid.classList.remove('loading');
+  }
+}
+
 async function loadReport() {
   const status = document.getElementById('status');
   const grid = document.getElementById('reportGrid');
@@ -795,18 +925,7 @@ async function loadReport() {
   if (wh) q.set('wh_ids', wh);
   status.textContent = 'Загрузка…';
   try {
-    const r = await fetch('/api/report?' + q);
-    const raw = await r.text();
-    if (!r.ok) {
-      try {
-        const err = JSON.parse(raw);
-        throw new Error(err.error || raw);
-      } catch (e) {
-        if (e instanceof Error && e.message !== raw) throw e;
-        throw new Error(raw || r.statusText);
-      }
-    }
-    const data = JSON.parse(raw);
+    const data = await parseApiResponse(await fetch('/api/report?' + q));
     grid.innerHTML = data.html;
     const sorted = Array.from(selectedWh).sort((a,b)=>a-b);
     const label = selectedWh.size === ALL_WH_IDS.length
@@ -834,17 +953,30 @@ init();
 
 
 def register_routes(application) -> None:
+    from datetime import datetime, timezone
+
     from flask import jsonify, request
 
     if getattr(application, "_brak_routes_registered", False):
         return
     application._brak_routes_registered = True
 
-    cfg = load_config()
+    def _cfg() -> dict:
+        return load_config()
+
+    def _resolve_wh_ids(cfg: dict) -> list[int] | None:
+        wh_raw = request.args.get("wh_ids", "")
+        catalog_ids = catalog_wh_ids(cfg)
+        if wh_raw.strip():
+            return [int(x) for x in wh_raw.split(",") if x.strip()]
+        if catalog_ids:
+            return catalog_ids
+        return None
 
     @application.route("/")
     def index():
         try:
+            cfg = _cfg()
             embed = {
                 "wh_catalog": cfg.get("wh_catalog", []),
                 "buildings": cfg.get("buildings", []),
@@ -859,6 +991,43 @@ def register_routes(application) -> None:
         except Exception as exc:
             return f"<pre>Index error: {exc}</pre>", 500
 
+    @application.route("/api/refresh", methods=["POST"])
+    def api_refresh():
+        env_err = check_db_env()
+        if env_err:
+            return jsonify({"error": env_err}), 503
+
+        try:
+            cfg = _cfg()
+            year = request.args.get("year", cfg.get("week_year", 2026), type=int)
+            wh_ids = _resolve_wh_ids(cfg)
+            office_id = cfg.get("office_id")
+
+            refresh_note = run_db_refresh()
+            stats = fetch_db_stats(office_id, wh_ids)
+            weeks = fetch_available_weeks(year, office_id, wh_ids)
+            week_prev = cfg.get("week_prev", 20)
+            week_last = cfg.get("week_last", 21)
+            if len(weeks) >= 2:
+                week_prev, week_last = weeks[-2], weeks[-1]
+
+            return jsonify(
+                {
+                    "ok": True,
+                    "refreshed_at": datetime.now(timezone.utc).isoformat(),
+                    "refresh_note": refresh_note,
+                    "row_count": stats["row_count"],
+                    "max_date": stats["max_date"],
+                    "total_amount": stats["total_amount"],
+                    "year": year,
+                    "weeks": weeks,
+                    "week_prev": week_prev,
+                    "week_last": week_last,
+                }
+            )
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
     @application.route("/api/report")
     def api_report():
         env_err = check_db_env()
@@ -866,6 +1035,7 @@ def register_routes(application) -> None:
             return jsonify({"error": env_err}), 503
 
         try:
+            cfg = _cfg()
             year = request.args.get("year", cfg.get("week_year", 2026), type=int)
 
             def _week_arg(name: str, default: int) -> int:
@@ -879,16 +1049,7 @@ def register_routes(application) -> None:
 
             week_prev = _week_arg("week_prev", cfg.get("week_prev", 20))
             week_last = _week_arg("week_last", cfg.get("week_last", 21))
-            wh_raw = request.args.get("wh_ids", "")
-            catalog_ids = catalog_wh_ids(cfg)
-            wh_ids: list[int] | None
-            if wh_raw.strip():
-                wh_ids = [int(x) for x in wh_raw.split(",") if x.strip()]
-            elif catalog_ids:
-                wh_ids = catalog_ids
-            else:
-                wh_ids = None
-
+            wh_ids = _resolve_wh_ids(cfg)
             office_id = cfg.get("office_id")
             data = build_report_data(wh_ids, office_id, year, week_prev, week_last)
         except Exception as exc:
@@ -954,15 +1115,9 @@ def register_routes(application) -> None:
         if env_err:
             return jsonify({"error": env_err}), 503
         try:
+            cfg = _cfg()
             year = request.args.get("year", cfg.get("week_year", 2026), type=int)
-            wh_raw = request.args.get("wh_ids", "")
-            catalog_ids = catalog_wh_ids(cfg)
-            if wh_raw.strip():
-                wh_ids = [int(x) for x in wh_raw.split(",") if x.strip()]
-            elif catalog_ids:
-                wh_ids = catalog_ids
-            else:
-                wh_ids = None
+            wh_ids = _resolve_wh_ids(cfg)
             weeks = fetch_available_weeks(year, cfg.get("office_id"), wh_ids)
             week_prev = cfg.get("week_prev", 20)
             week_last = cfg.get("week_last", 21)
@@ -983,7 +1138,7 @@ def register_routes(application) -> None:
 
     @application.route("/api/wh_ids")
     def api_wh_ids():
-        return jsonify(fetch_wh_list(cfg.get("office_id")))
+        return jsonify(fetch_wh_list(_cfg().get("office_id")))
 
     @application.route("/health")
     def health():
