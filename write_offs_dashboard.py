@@ -17,8 +17,11 @@ import sys
 from io import BytesIO
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from threading import RLock
+from time import monotonic
 from typing import Any
 
 from dotenv import load_dotenv
@@ -29,6 +32,34 @@ CONFIG_PATH = ROOT / "wh_buildings.json"
 _env_file = ROOT / ".env"
 if _env_file.exists():
     load_dotenv(_env_file)
+
+CACHE_TTL_SEC = int(os.environ.get("REPORT_CACHE_TTL_SEC", "120"))
+WEEKS_CACHE_TTL_SEC = int(os.environ.get("WEEKS_CACHE_TTL_SEC", "300"))
+_CACHE_LOCK = RLock()
+_CACHE: dict[str, tuple[float, Any]] = {}
+
+
+def _cache_get(key: str) -> Any | None:
+    now = monotonic()
+    with _CACHE_LOCK:
+        item = _CACHE.get(key)
+        if not item:
+            return None
+        expires_at, payload = item
+        if expires_at < now:
+            _CACHE.pop(key, None)
+            return None
+        return payload
+
+
+def _cache_set(key: str, payload: Any, ttl_sec: int) -> None:
+    with _CACHE_LOCK:
+        _CACHE[key] = (monotonic() + max(1, ttl_sec), payload)
+
+
+def _cache_clear_all() -> None:
+    with _CACHE_LOCK:
+        _CACHE.clear()
 
 
 @dataclass
@@ -277,8 +308,6 @@ def check_refresh_access() -> str | None:
 
 def fetch_totals_all(
     *,
-    group_col: str,
-    id_col: str | None,
     wh_ids: list[int] | None,
     office_id: int | None,
     org0_only: bool,
@@ -286,11 +315,10 @@ def fetch_totals_all(
     week_prev: int,
     week_last: int,
 ) -> dict[str, float]:
-    if group_col not in ("reason_descr", "parent_name"):
-        raise ValueError("invalid group_col")
-
-    clauses: list[str] = ["date IS NOT NULL", "EXTRACT(ISOYEAR FROM date) = %s"]
-    params: list[Any] = [year]
+    clauses: list[str] = ["date IS NOT NULL", "date >= %s", "date < %s"]
+    year_start = date.fromisocalendar(year, 1, 1)
+    year_end = date.fromisocalendar(year + 1, 1, 1)
+    params: list[Any] = [year_start, year_end]
     if office_id is not None:
         clauses.append("office_id = %s")
         params.append(office_id)
@@ -300,35 +328,13 @@ def fetch_totals_all(
     if org0_only:
         clauses.append("cnt_org = 0")
     where = " WHERE " + " AND ".join(clauses)
-
-    if id_col:
-        sql = f"""
-            SELECT
-                COALESCE(SUM(w_prev), 0) AS total_prev,
-                COALESCE(SUM(w_last), 0) AS total_last
-            FROM (
-                SELECT {id_col},
-                       COALESCE(SUM(amount) FILTER (WHERE EXTRACT(WEEK FROM date) = %s), 0) AS w_prev,
-                       COALESCE(SUM(amount) FILTER (WHERE EXTRACT(WEEK FROM date) = %s), 0) AS w_last
-                FROM brak_team.write_offs
-                {where}
-                GROUP BY {id_col}
-            ) s
-        """
-    else:
-        sql = f"""
-            SELECT
-                COALESCE(SUM(w_prev), 0) AS total_prev,
-                COALESCE(SUM(w_last), 0) AS total_last
-            FROM (
-                SELECT COALESCE({group_col}, '—') AS grp,
-                       COALESCE(SUM(amount) FILTER (WHERE EXTRACT(WEEK FROM date) = %s), 0) AS w_prev,
-                       COALESCE(SUM(amount) FILTER (WHERE EXTRACT(WEEK FROM date) = %s), 0) AS w_last
-                FROM brak_team.write_offs
-                {where}
-                GROUP BY COALESCE({group_col}, '—')
-            ) s
-        """
+    sql = f"""
+        SELECT
+            COALESCE(SUM(amount) FILTER (WHERE EXTRACT(WEEK FROM date) = %s), 0) AS total_prev,
+            COALESCE(SUM(amount) FILTER (WHERE EXTRACT(WEEK FROM date) = %s), 0) AS total_last
+        FROM brak_team.write_offs
+        {where}
+    """
     qparams = [week_prev, week_last, *params]
     with get_conn() as conn:
         cur = conn.cursor()
@@ -588,8 +594,15 @@ def fetch_available_weeks(
     office_id: int | None,
     wh_ids: list[int] | None,
 ) -> list[int]:
-    clauses: list[str] = ["date IS NOT NULL", "EXTRACT(ISOYEAR FROM date) = %s"]
-    params: list[Any] = [year]
+    key = f"weeks:{year}:{office_id}:{','.join(map(str, wh_ids or []))}"
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+
+    clauses: list[str] = ["date IS NOT NULL", "date >= %s", "date < %s"]
+    year_start = date.fromisocalendar(year, 1, 1)
+    year_end = date.fromisocalendar(year + 1, 1, 1)
+    params: list[Any] = [year_start, year_end]
     if office_id is not None:
         clauses.append("office_id = %s")
         params.append(office_id)
@@ -607,7 +620,9 @@ def fetch_available_weeks(
         cur = conn.cursor()
         cur.execute(sql, params)
         rows = cur.fetchall()
-    return [int(r[0]) for r in rows]
+    weeks = [int(r[0]) for r in rows]
+    _cache_set(key, weeks, WEEKS_CACHE_TTL_SEC)
+    return weeks
 
 
 def fetch_top(
@@ -637,9 +652,12 @@ def fetch_top(
     if org0_only:
         clauses.append("cnt_org = 0")
 
+    year_start = date.fromisocalendar(year, 1, 1)
+    year_end = date.fromisocalendar(year + 1, 1, 1)
     clauses.append("date IS NOT NULL")
-    clauses.append("EXTRACT(ISOYEAR FROM date) = %s")
-    params.append(year)
+    clauses.append("date >= %s")
+    clauses.append("date < %s")
+    params.extend([year_start, year_end])
 
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     if not weeks:
@@ -693,6 +711,131 @@ def fetch_top(
             )
         )
     return out
+
+
+def warm_report_cache_async(
+    wh_ids: list[int] | None,
+    office_id: int | None,
+    year: int,
+    week_prev: int,
+    week_last: int,
+) -> None:
+    import threading
+
+    def _worker() -> None:
+        try:
+            build_report_data(wh_ids, office_id, year, week_prev, week_last)
+        except Exception:
+            # warm-up best effort
+            pass
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def fetch_top_bundle(
+    *,
+    wh_ids: list[int] | None,
+    office_id: int | None,
+    year: int,
+    weeks: list[int],
+    week_last: int,
+    limit: int = 20,
+) -> dict[str, list[Row]]:
+    """
+    One SQL pass for all 4 report blocks:
+      defects / defects_org0 / categories / categories_org0
+    """
+    if not weeks:
+        weeks = [week_last]
+
+    clauses: list[str] = ["date IS NOT NULL", "date >= %s", "date < %s"]
+    year_start = date.fromisocalendar(year, 1, 1)
+    year_end = date.fromisocalendar(year + 1, 1, 1)
+    params: list[Any] = [year_start, year_end]
+    if office_id is not None:
+        clauses.append("office_id = %s")
+        params.append(office_id)
+    if wh_ids:
+        clauses.append("wh_id = ANY(%s)")
+        params.append(wh_ids)
+    where = " WHERE " + " AND ".join(clauses)
+
+    week_cols = ",\n               ".join(
+        f"COALESCE(SUM(amount) FILTER (WHERE week_no = %s), 0) AS w_{w}"
+        for w in weeks
+    )
+
+    sql = f"""
+WITH base AS (
+    SELECT reason_id,
+           COALESCE(reason_descr, '—') AS reason_descr,
+           COALESCE(parent_name, '—') AS parent_name,
+           EXTRACT(WEEK FROM date)::int AS week_no,
+           cnt_org,
+           amount
+    FROM brak_team.write_offs
+    {where}
+),
+defects_all AS (
+    SELECT reason_id AS row_id, MAX(reason_descr) AS name, {week_cols}
+    FROM base
+    GROUP BY reason_id
+),
+defects_org0 AS (
+    SELECT reason_id AS row_id, MAX(reason_descr) AS name, {week_cols}
+    FROM base
+    WHERE cnt_org = 0
+    GROUP BY reason_id
+),
+cats_all AS (
+    SELECT NULL::int AS row_id, parent_name AS name, {week_cols}
+    FROM base
+    GROUP BY parent_name
+),
+cats_org0 AS (
+    SELECT NULL::int AS row_id, parent_name AS name, {week_cols}
+    FROM base
+    WHERE cnt_org = 0
+    GROUP BY parent_name
+),
+u AS (
+    SELECT 'defects'::text AS bucket, row_id, name, {", ".join(f"w_{w}" for w in weeks)} FROM defects_all
+    UNION ALL
+    SELECT 'defects_org0'::text, row_id, name, {", ".join(f"w_{w}" for w in weeks)} FROM defects_org0
+    UNION ALL
+    SELECT 'categories'::text, row_id, name, {", ".join(f"w_{w}" for w in weeks)} FROM cats_all
+    UNION ALL
+    SELECT 'categories_org0'::text, row_id, name, {", ".join(f"w_{w}" for w in weeks)} FROM cats_org0
+),
+r AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY bucket ORDER BY w_{week_last} DESC NULLS LAST) AS rn
+    FROM u
+)
+SELECT bucket, row_id, name, {", ".join(f"w_{w}" for w in weeks)}
+FROM r
+WHERE rn <= %s
+ORDER BY bucket, rn
+"""
+    qparams = [*params, *weeks, *weeks, *weeks, *weeks, limit]
+
+    buckets: dict[str, list[Row]] = {
+        "defects": [],
+        "defects_org0": [],
+        "categories": [],
+        "categories_org0": [],
+    }
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, qparams)
+        raw = cur.fetchall()
+
+    for rec in raw:
+        bucket = str(rec[0])
+        row_id = int(rec[1]) if rec[1] is not None else None
+        name = str(rec[2])
+        amounts = {w: to_float(rec[3 + i]) for i, w in enumerate(weeks)}
+        buckets[bucket].append(Row(row_id=row_id, name=name, amounts=amounts))
+    return buckets
 
 
 def add_shares(rows: list[Row], week_prev: int, week_last: int) -> list[dict]:
@@ -901,6 +1044,14 @@ def build_report_data(
     week_last: int,
     weeks: list[int] | None = None,
 ) -> dict:
+    key = (
+        f"report:{year}:{week_prev}:{week_last}:{office_id}:"
+        f"{','.join(map(str, wh_ids or []))}:{','.join(map(str, weeks or []))}"
+    )
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+
     if weeks is None:
         weeks = fetch_available_weeks(year, office_id, wh_ids)
     if not weeks:
@@ -910,46 +1061,18 @@ def build_report_data(
     if week_last not in weeks:
         weeks = sorted(set(weeks) | {week_last})
 
-    defects = fetch_top(
-        group_col="reason_descr",
-        id_col="reason_id",
+    bundle = fetch_top_bundle(
         wh_ids=wh_ids,
         office_id=office_id,
-        org0_only=False,
         year=year,
         weeks=weeks,
         week_last=week_last,
+        limit=20,
     )
-    defects_org0 = fetch_top(
-        group_col="reason_descr",
-        id_col="reason_id",
-        wh_ids=wh_ids,
-        office_id=office_id,
-        org0_only=True,
-        year=year,
-        weeks=weeks,
-        week_last=week_last,
-    )
-    cats = fetch_top(
-        group_col="parent_name",
-        id_col=None,
-        wh_ids=wh_ids,
-        office_id=office_id,
-        org0_only=False,
-        year=year,
-        weeks=weeks,
-        week_last=week_last,
-    )
-    cats_org0 = fetch_top(
-        group_col="parent_name",
-        id_col=None,
-        wh_ids=wh_ids,
-        office_id=office_id,
-        org0_only=True,
-        year=year,
-        weeks=weeks,
-        week_last=week_last,
-    )
+    defects = bundle["defects"]
+    defects_org0 = bundle["defects_org0"]
+    cats = bundle["categories"]
+    cats_org0 = bundle["categories_org0"]
 
     d_rows = add_shares(defects, week_prev, week_last)
     d0_rows = add_shares(defects_org0, week_prev, week_last)
@@ -967,50 +1090,32 @@ def build_report_data(
         "categories_org0": c0_rows,
         "categories_org0_total": totals(c0_rows, weeks, week_prev, week_last),
     }
+    total_all = fetch_totals_all(
+        wh_ids=wh_ids,
+        office_id=office_id,
+        org0_only=False,
+        year=year,
+        week_prev=week_prev,
+        week_last=week_last,
+    )
+    total_org0 = fetch_totals_all(
+        wh_ids=wh_ids,
+        office_id=office_id,
+        org0_only=True,
+        year=year,
+        week_prev=week_prev,
+        week_last=week_last,
+    )
     all_totals = {
-        "defects": fetch_totals_all(
-            group_col="reason_descr",
-            id_col="reason_id",
-            wh_ids=wh_ids,
-            office_id=office_id,
-            org0_only=False,
-            year=year,
-            week_prev=week_prev,
-            week_last=week_last,
-        ),
-        "defects_org0": fetch_totals_all(
-            group_col="reason_descr",
-            id_col="reason_id",
-            wh_ids=wh_ids,
-            office_id=office_id,
-            org0_only=True,
-            year=year,
-            week_prev=week_prev,
-            week_last=week_last,
-        ),
-        "categories": fetch_totals_all(
-            group_col="parent_name",
-            id_col=None,
-            wh_ids=wh_ids,
-            office_id=office_id,
-            org0_only=False,
-            year=year,
-            week_prev=week_prev,
-            week_last=week_last,
-        ),
-        "categories_org0": fetch_totals_all(
-            group_col="parent_name",
-            id_col=None,
-            wh_ids=wh_ids,
-            office_id=office_id,
-            org0_only=True,
-            year=year,
-            week_prev=week_prev,
-            week_last=week_last,
-        ),
+        "defects": total_all,
+        "defects_org0": total_org0,
+        "categories": total_all,
+        "categories_org0": total_org0,
     }
     report["all_totals"] = all_totals
-    return enrich_coverages(report, all_totals)
+    final_report = enrich_coverages(report, all_totals)
+    _cache_set(key, final_report, CACHE_TTL_SEC)
+    return final_report
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -1446,6 +1551,7 @@ def register_routes(application) -> None:
             office_id = cfg.get("office_id")
 
             refresh_note = run_db_refresh()
+            _cache_clear_all()
             stats = fetch_db_stats(office_id, wh_ids)
             weeks = fetch_available_weeks(year, office_id, wh_ids)
             week_prev = cfg.get("week_prev", 20)
@@ -1453,6 +1559,7 @@ def register_routes(application) -> None:
             if len(weeks) >= 2:
                 week_prev, week_last = weeks[-2], weeks[-1]
 
+            warm_report_cache_async(wh_ids, office_id, year, week_prev, week_last)
             return jsonify(
                 {
                     "ok": True,
@@ -1659,6 +1766,7 @@ def main() -> int:
     if not os.environ.get("DB_PASSWORD"):
         print("Создайте .env с DB_PASSWORD", file=sys.stderr)
         return 1
+    print(f"Кэш отчета: {CACHE_TTL_SEC}s, кэш недель: {WEEKS_CACHE_TTL_SEC}s")
     try:
         run_server()
     except Exception as e:
