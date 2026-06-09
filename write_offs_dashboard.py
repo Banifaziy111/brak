@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from io import BytesIO
 from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
@@ -258,6 +259,330 @@ def run_db_refresh() -> str | None:
         raise RuntimeError(f"DB_REFRESH_URL: HTTP {exc.code} {detail}") from exc
 
 
+def check_refresh_access() -> str | None:
+    token = os.environ.get("REFRESH_API_TOKEN", "").strip()
+    if not token:
+        return None
+
+    # Проверка токена в заголовке или query для ручного теста.
+    from flask import request
+
+    got = request.headers.get("X-Refresh-Token", "").strip() or request.args.get(
+        "refresh_token", ""
+    ).strip()
+    if got != token:
+        return "Недостаточно прав для обновления данных"
+    return None
+
+
+def fetch_totals_all(
+    *,
+    group_col: str,
+    id_col: str | None,
+    wh_ids: list[int] | None,
+    office_id: int | None,
+    org0_only: bool,
+    year: int,
+    week_prev: int,
+    week_last: int,
+) -> dict[str, float]:
+    if group_col not in ("reason_descr", "parent_name"):
+        raise ValueError("invalid group_col")
+
+    clauses: list[str] = ["date IS NOT NULL", "EXTRACT(ISOYEAR FROM date) = %s"]
+    params: list[Any] = [year]
+    if office_id is not None:
+        clauses.append("office_id = %s")
+        params.append(office_id)
+    if wh_ids:
+        clauses.append("wh_id = ANY(%s)")
+        params.append(wh_ids)
+    if org0_only:
+        clauses.append("cnt_org = 0")
+    where = " WHERE " + " AND ".join(clauses)
+
+    if id_col:
+        sql = f"""
+            SELECT
+                COALESCE(SUM(w_prev), 0) AS total_prev,
+                COALESCE(SUM(w_last), 0) AS total_last
+            FROM (
+                SELECT {id_col},
+                       COALESCE(SUM(amount) FILTER (WHERE EXTRACT(WEEK FROM date) = %s), 0) AS w_prev,
+                       COALESCE(SUM(amount) FILTER (WHERE EXTRACT(WEEK FROM date) = %s), 0) AS w_last
+                FROM brak_team.write_offs
+                {where}
+                GROUP BY {id_col}
+            ) s
+        """
+    else:
+        sql = f"""
+            SELECT
+                COALESCE(SUM(w_prev), 0) AS total_prev,
+                COALESCE(SUM(w_last), 0) AS total_last
+            FROM (
+                SELECT COALESCE({group_col}, '—') AS grp,
+                       COALESCE(SUM(amount) FILTER (WHERE EXTRACT(WEEK FROM date) = %s), 0) AS w_prev,
+                       COALESCE(SUM(amount) FILTER (WHERE EXTRACT(WEEK FROM date) = %s), 0) AS w_last
+                FROM brak_team.write_offs
+                {where}
+                GROUP BY COALESCE({group_col}, '—')
+            ) s
+        """
+    qparams = [week_prev, week_last, *params]
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, qparams)
+        row = cur.fetchone()
+    return {
+        "w_prev": to_float(row[0] if row else 0),
+        "w_last": to_float(row[1] if row else 0),
+    }
+
+
+def enrich_coverages(report: dict, all_totals: dict[str, dict[str, float]]) -> dict:
+    for key, totals_key in (
+        ("defects", "defects_total"),
+        ("defects_org0", "defects_org0_total"),
+        ("categories", "categories_total"),
+        ("categories_org0", "categories_org0_total"),
+    ):
+        top = report[totals_key]
+        full = all_totals[key]
+        top_last = top["w_last"]
+        all_last = full["w_last"]
+        cover = (top_last / all_last * 100) if all_last else None
+        top["all_w_prev"] = full["w_prev"]
+        top["all_w_last"] = full["w_last"]
+        top["top20_cover_last"] = cover
+    return report
+
+
+def export_report_xlsx(report: dict, year: int, week_prev: int, week_last: int) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    if wb.active:
+        wb.remove(wb.active)
+
+    # palette close to dashboard colors
+    fill_header = PatternFill("solid", fgColor="1F4E79")
+    fill_prev = PatternFill("solid", fgColor="E2EFDA")
+    fill_last = PatternFill("solid", fgColor="FFF2CC")
+    fill_total = PatternFill("solid", fgColor="D9E2F3")
+    fill_metric = PatternFill("solid", fgColor="F5F8FC")
+    fill_heat_red = PatternFill("solid", fgColor="F8D7DA")
+    fill_heat_green = PatternFill("solid", fgColor="D4EDDA")
+    fill_heat_yellow = PatternFill("solid", fgColor="FFF3CD")
+    fill_heat_share = PatternFill("solid", fgColor="FAD9DE")
+    fill_pct_green = PatternFill("solid", fgColor="C6EFCE")
+    fill_pct_red = PatternFill("solid", fgColor="FFC7CE")
+    fill_pct_yellow = PatternFill("solid", fgColor="FFEB9C")
+    border = Border(
+        left=Side(style="thin", color="B4B4B4"),
+        right=Side(style="thin", color="B4B4B4"),
+        top=Side(style="thin", color="B4B4B4"),
+        bottom=Side(style="thin", color="B4B4B4"),
+    )
+    font_header = Font(color="FFFFFF", bold=True, size=10)
+    font_bold = Font(bold=True, size=10)
+    align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    align_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    align_right = Alignment(horizontal="right", vertical="center")
+
+    def apply_heat(cell, value: float | None, mode: str) -> None:
+        if value is None:
+            return
+        if mode == "dynamics":
+            if value < -2:
+                cell.fill = fill_heat_green
+            elif value > 2:
+                cell.fill = fill_heat_red
+            else:
+                cell.fill = fill_heat_yellow
+        elif mode == "share":
+            cell.fill = fill_heat_share
+        else:
+            v = value - 100
+            if v < -2:
+                cell.fill = fill_pct_green
+            elif v > 2:
+                cell.fill = fill_pct_red
+            else:
+                cell.fill = fill_pct_yellow
+
+    def write_section(
+        ws,
+        title: str,
+        rows: list[dict],
+        total: dict,
+        all_totals: dict[str, float],
+        show_id: bool,
+        name_header: str,
+        weeks: list[int],
+        week_prev: int,
+        week_last: int,
+    ) -> None:
+        # section title
+        ws.append([title])
+        row_title = ws.max_row
+        ws.merge_cells(start_row=row_title, start_column=1, end_row=row_title, end_column=2 + len(weeks) + 4)
+        c = ws.cell(row_title, 1)
+        c.fill = fill_header
+        c.font = font_header
+        c.alignment = align_center
+        c.border = border
+
+        headers = [("ИД" if show_id else "№"), name_header, *[str(w) for w in weeks], f"Динамика {week_last} к {week_prev}", "Доля", "Среднее 2 нед.", "% посл. к средней"]
+        ws.append(headers)
+        hrow = ws.max_row
+        for col in range(1, len(headers) + 1):
+            cell = ws.cell(hrow, col)
+            cell.fill = fill_header
+            cell.font = font_header
+            cell.alignment = align_center
+            cell.border = border
+            if col >= 3 + len(weeks):
+                cell.fill = fill_header
+            if col == 3 + weeks.index(week_prev):
+                cell.fill = fill_prev
+            if col == 3 + weeks.index(week_last):
+                cell.fill = fill_last
+
+        def write_data_row(r: dict, total_style: bool = False, label: str | None = None):
+            row_idx = ws.max_row + 1
+            c1 = ws.cell(row_idx, 1, label if label is not None else (r.get("row_id") if r.get("row_id") is not None else r.get("num")))
+            c2 = ws.cell(row_idx, 2, r.get("name", ""))
+            c1.alignment = align_center
+            c2.alignment = align_left
+            c1.border = c2.border = border
+            if total_style:
+                c1.font = c2.font = font_bold
+                c1.fill = c2.fill = fill_total
+
+            for i, w in enumerate(weeks, start=3):
+                val = r.get("amounts", {}).get(w, 0.0)
+                cw = ws.cell(row_idx, i, val)
+                cw.number_format = "# ##0"
+                cw.alignment = align_right
+                cw.border = border
+                if total_style:
+                    cw.font = font_bold
+                    cw.fill = fill_total
+                elif w == week_prev:
+                    cw.fill = fill_prev
+                elif w == week_last:
+                    cw.fill = fill_last
+
+            base = 3 + len(weeks)
+            c_dyn = ws.cell(row_idx, base, r.get("dynamics"))
+            c_share = ws.cell(row_idx, base + 1, r.get("share"))
+            c_avg = ws.cell(row_idx, base + 2, r.get("average"))
+            c_pct = ws.cell(row_idx, base + 3, r.get("pct_vs_avg"))
+            for c in (c_dyn, c_share, c_avg, c_pct):
+                c.border = border
+                c.alignment = align_right
+                c.fill = fill_metric
+            c_dyn.number_format = "0.00%"
+            c_share.number_format = "0.00%"
+            c_avg.number_format = "# ##0"
+            c_pct.number_format = "0.00%"
+            if c_dyn.value is not None:
+                c_dyn.value = c_dyn.value / 100
+            if c_share.value is not None:
+                c_share.value = c_share.value / 100
+            if c_pct.value is not None:
+                c_pct.value = c_pct.value / 100
+
+            apply_heat(c_dyn, r.get("dynamics"), "dynamics")
+            apply_heat(c_share, r.get("share"), "share")
+            apply_heat(c_pct, r.get("pct_vs_avg"), "pct_vs_avg")
+
+            if total_style:
+                for c in (c_dyn, c_share, c_avg, c_pct):
+                    c.font = font_bold
+                    c.fill = fill_total
+
+        for r in rows:
+            write_data_row(r)
+
+        write_data_row(
+            {
+                "name": "Итого ТОП-20",
+                "amounts": total.get("amounts", {}),
+                "dynamics": total.get("dynamics"),
+                "share": total.get("share"),
+                "average": total.get("average"),
+                "pct_vs_avg": total.get("pct_vs_avg"),
+            },
+            total_style=True,
+            label="Итого",
+        )
+
+        all_prev = to_float(all_totals.get("w_prev"))
+        all_last = to_float(all_totals.get("w_last"))
+        all_amounts = {w: 0.0 for w in weeks}
+        all_amounts[week_prev] = all_prev
+        all_amounts[week_last] = all_last
+        all_avg = (all_prev + all_last) / 2 if (all_prev or all_last) else 0.0
+        all_dyn = ((all_last - all_prev) / all_prev * 100) if all_prev else None
+        all_pct = (all_last / all_avg * 100) if all_avg else None
+        cover = (total.get("w_last", 0) / all_last * 100) if all_last else None
+        write_data_row(
+            {
+                "name": f"Итого по всем (покрытие ТОП-20: {fmt_pct(cover)})",
+                "amounts": all_amounts,
+                "dynamics": all_dyn,
+                "share": None,
+                "average": all_avg,
+                "pct_vs_avg": all_pct,
+            },
+            total_style=True,
+            label="Итого по всем",
+        )
+        ws.append([])
+
+    weeks = report["weeks"]
+    sections = [
+        ("Дефект ТОП-20, рубли", report["defects"], report["defects_total"], report["all_totals"]["defects"], True, "Дефект"),
+        ("Дефект ТОП-20, ORG 0, рубли", report["defects_org0"], report["defects_org0_total"], report["all_totals"]["defects_org0"], True, "Дефект"),
+        ("ТОП-20 категорий, рубли", report["categories"], report["categories_total"], report["all_totals"]["categories"], False, "Категория"),
+        ("ТОП-20 категорий, ORG 0, рубли", report["categories_org0"], report["categories_org0_total"], report["all_totals"]["categories_org0"], False, "Категория"),
+    ]
+
+    ws = wb.create_sheet("Дашборд")
+    ws.append(["Отчет по браку", "", "Год", year, "Пред. неделя", week_prev, "Посл. неделя", week_last])
+    for c in range(1, 9):
+        cell = ws.cell(1, c)
+        cell.font = font_bold
+        cell.fill = fill_total
+        cell.alignment = align_center
+        cell.border = border
+    ws.append([])
+
+    for sec in sections:
+        write_section(ws, *sec, weeks=weeks, week_prev=week_prev, week_last=week_last)
+
+    widths = {
+        1: 12,
+        2: 42,
+    }
+    for i in range(len(weeks)):
+        widths[3 + i] = 12
+    widths[3 + len(weeks)] = 16
+    widths[4 + len(weeks)] = 12
+    widths[5 + len(weeks)] = 14
+    widths[6 + len(weeks)] = 18
+    for col, w in widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = w
+
+    stream = BytesIO()
+    wb.save(stream)
+    return stream.getvalue()
+
+
 def fetch_available_weeks(
     year: int,
     office_id: int | None,
@@ -461,6 +786,7 @@ def render_table(
     week_prev: int,
     week_last: int,
     name_header: str = "Наименование",
+    all_totals: dict[str, float] | None = None,
 ) -> str:
     id_hdr = (
         "<th class='sticky col-id'>ИД</th>"
@@ -509,6 +835,30 @@ def render_table(
         f"<td class='n metric' style='{_e(heat_style(t['pct_vs_avg'], 'pct_vs_avg'))}'><b>{fmt_pct(t['pct_vs_avg'])}</b></td>"
         f"</tr>"
     )
+    if all_totals is not None:
+        all_prev = to_float(all_totals.get("w_prev"))
+        all_last = to_float(all_totals.get("w_last"))
+        cover = (t["w_last"] / all_last * 100) if all_last else None
+        all_amounts = {w: 0.0 for w in weeks}
+        all_amounts[week_prev] = all_prev
+        all_amounts[week_last] = all_last
+        all_week_cells = "".join(
+            f"<td class='n week-col'><b>{fmt_num(all_amounts.get(w, 0))}</b></td>"
+            for w in weeks
+        )
+        all_avg = (all_prev + all_last) / 2 if (all_prev or all_last) else 0.0
+        all_dyn = ((all_last - all_prev) / all_prev * 100) if all_prev else None
+        all_pct = (all_last / all_avg * 100) if all_avg else None
+        body.append(
+            f"<tr class='total'>"
+            f"<td colspan='2' class='sticky col-id'><b>Итого по всем</b></td>"
+            f"{all_week_cells}"
+            f"<td class='n metric'><b>{fmt_pct(all_dyn)}</b></td>"
+            f"<td class='n metric'><b>—</b></td>"
+            f"<td class='n metric'><b>{fmt_num(all_avg)}</b></td>"
+            f"<td class='n metric'><b>{fmt_pct(all_pct)} · покрытие ТОП-20: {fmt_pct(cover)}</b></td>"
+            f"</tr>"
+        )
 
     return f"""
 <section class="panel">
@@ -606,7 +956,7 @@ def build_report_data(
     c_rows = add_shares(cats, week_prev, week_last)
     c0_rows = add_shares(cats_org0, week_prev, week_last)
 
-    return {
+    report = {
         "weeks": weeks,
         "defects": d_rows,
         "defects_total": totals(d_rows, weeks, week_prev, week_last),
@@ -617,6 +967,50 @@ def build_report_data(
         "categories_org0": c0_rows,
         "categories_org0_total": totals(c0_rows, weeks, week_prev, week_last),
     }
+    all_totals = {
+        "defects": fetch_totals_all(
+            group_col="reason_descr",
+            id_col="reason_id",
+            wh_ids=wh_ids,
+            office_id=office_id,
+            org0_only=False,
+            year=year,
+            week_prev=week_prev,
+            week_last=week_last,
+        ),
+        "defects_org0": fetch_totals_all(
+            group_col="reason_descr",
+            id_col="reason_id",
+            wh_ids=wh_ids,
+            office_id=office_id,
+            org0_only=True,
+            year=year,
+            week_prev=week_prev,
+            week_last=week_last,
+        ),
+        "categories": fetch_totals_all(
+            group_col="parent_name",
+            id_col=None,
+            wh_ids=wh_ids,
+            office_id=office_id,
+            org0_only=False,
+            year=year,
+            week_prev=week_prev,
+            week_last=week_last,
+        ),
+        "categories_org0": fetch_totals_all(
+            group_col="parent_name",
+            id_col=None,
+            wh_ids=wh_ids,
+            office_id=office_id,
+            org0_only=True,
+            year=year,
+            week_prev=week_prev,
+            week_last=week_last,
+        ),
+    }
+    report["all_totals"] = all_totals
+    return enrich_coverages(report, all_totals)
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -671,6 +1065,8 @@ tr.total th.sticky { background: #1f4e79; }
 .actions button.primary:disabled { opacity: 0.6; cursor: wait; }
 .actions button.secondary { background: #217346; color: #fff; }
 .actions button.secondary:hover { background: #1a5c38; }
+.actions button.export { background: #6b7280; color: #fff; }
+.actions button.export:hover { background: #4b5563; }
 #status { padding: 8px 16px; color: #555; font-size: 12px; }
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 12px; }
 @media (max-width: 1200px) { .grid { grid-template-columns: 1fr; } }
@@ -705,6 +1101,7 @@ tr.total td { background: #d9e2f3; font-weight: 600; }
     <button type="button" id="btnRefreshData" class="primary">Обновить данные</button>
     <button type="button" id="btnApply" class="secondary">Применить</button>
     <button type="button" id="btnAllWh" class="secondary">Все WH</button>
+    <button type="button" id="btnExportXlsx" class="export">Экспорт XLSX</button>
   </div>
 </div>
 <div id="status">Загрузка…</div>
@@ -768,6 +1165,7 @@ function init() {
   document.getElementById('weekLast').addEventListener('change', loadReport);
   document.getElementById('btnApply').onclick = loadReport;
   document.getElementById('btnRefreshData').onclick = refreshData;
+  document.getElementById('btnExportXlsx').onclick = exportXlsx;
   document.getElementById('btnAllWh').onclick = async () => {
     selectedWh = new Set(ALL_WH_IDS);
     document.querySelectorAll('#whGrid input').forEach(cb => cb.checked = true);
@@ -885,8 +1283,16 @@ async function refreshData() {
   const year = document.getElementById('year').value;
   const q = new URLSearchParams({ year });
   if (wh) q.set('wh_ids', wh);
+  const rt = localStorage.getItem('refreshToken') || '';
+  const headers = rt ? { 'X-Refresh-Token': rt } : {};
   try {
-    const data = await parseApiResponse(await fetch('/api/refresh?' + q, { method: 'POST' }));
+    if (status.textContent.includes('Недостаточно прав')) {
+      const asked = prompt('Введите refresh token (если настроен):', localStorage.getItem('refreshToken') || '');
+      if (asked !== null) localStorage.setItem('refreshToken', asked.trim());
+    }
+    const rt = localStorage.getItem('refreshToken') || '';
+    const headers = rt ? { 'X-Refresh-Token': rt } : {};
+    const data = await parseApiResponse(await fetch('/api/refresh?' + q, { method: 'POST', headers }));
     if (data.weeks && data.weeks.length) {
       availableWeeks = data.weeks;
       const wp = data.week_prev ?? availableWeeks[availableWeeks.length - 2];
@@ -904,10 +1310,43 @@ async function refreshData() {
     if (data.refresh_note) parts.push(data.refresh_note);
     status.textContent = parts.join(' · ');
   } catch (e) {
+    if (String(e.message || '').includes('Недостаточно прав')) {
+      status.textContent = 'Нужен REFRESH_API_TOKEN: задайте в .env и введите в prompt.';
+    } else {
     status.textContent = 'Ошибка обновления: ' + e.message;
+    }
   } finally {
     btn.disabled = false;
     grid.classList.remove('loading');
+  }
+}
+
+async function exportXlsx() {
+  const status = document.getElementById('status');
+  const wh = selectedWh.size ? Array.from(selectedWh).join(',') : '';
+  const { wp, wl } = selectedWeeks();
+  const q = new URLSearchParams({
+    year: document.getElementById('year').value,
+    week_prev: wp,
+    week_last: wl,
+  });
+  if (wh) q.set('wh_ids', wh);
+  try {
+    status.textContent = 'Готовим XLSX...';
+    const r = await fetch('/api/export/xlsx?' + q);
+    if (!r.ok) throw new Error(await r.text());
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'write_offs_report.xlsx';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    status.textContent = 'XLSX сформирован';
+  } catch (e) {
+    status.textContent = 'Ошибка экспорта: ' + e.message;
   }
 }
 
@@ -955,7 +1394,7 @@ init();
 def register_routes(application) -> None:
     from datetime import datetime, timezone
 
-    from flask import jsonify, request
+    from flask import jsonify, request, send_file
 
     if getattr(application, "_brak_routes_registered", False):
         return
@@ -996,6 +1435,9 @@ def register_routes(application) -> None:
         env_err = check_db_env()
         if env_err:
             return jsonify({"error": env_err}), 503
+        access_err = check_refresh_access()
+        if access_err:
+            return jsonify({"error": access_err}), 403
 
         try:
             cfg = _cfg()
@@ -1066,6 +1508,7 @@ def register_routes(application) -> None:
                 week_prev=week_prev,
                 week_last=week_last,
                 name_header="Дефект",
+                all_totals=data["all_totals"]["defects"],
             )
             + render_table(
                 "Дефект ТОП-20, ORG 0, рубли",
@@ -1076,6 +1519,7 @@ def register_routes(application) -> None:
                 week_prev=week_prev,
                 week_last=week_last,
                 name_header="Дефект",
+                all_totals=data["all_totals"]["defects_org0"],
             )
             + render_table(
                 "ТОП-20 категорий, рубли",
@@ -1086,6 +1530,7 @@ def register_routes(application) -> None:
                 week_prev=week_prev,
                 week_last=week_last,
                 name_header="Категория",
+                all_totals=data["all_totals"]["categories"],
             )
             + render_table(
                 "ТОП-20 категорий, ORG 0, рубли",
@@ -1096,6 +1541,7 @@ def register_routes(application) -> None:
                 week_prev=week_prev,
                 week_last=week_last,
                 name_header="Категория",
+                all_totals=data["all_totals"]["categories_org0"],
             )
         )
 
@@ -1108,6 +1554,40 @@ def register_routes(application) -> None:
                 "week_last": week_last,
             }
         )
+
+    @application.route("/api/export/xlsx")
+    def api_export_xlsx():
+        env_err = check_db_env()
+        if env_err:
+            return jsonify({"error": env_err}), 503
+        try:
+            cfg = _cfg()
+            year = request.args.get("year", cfg.get("week_year", 2026), type=int)
+
+            def _week_arg(name: str, default: int) -> int:
+                raw = request.args.get(name, "")
+                if raw is None or str(raw).strip() == "":
+                    return default
+                try:
+                    return int(raw)
+                except (TypeError, ValueError):
+                    return default
+
+            week_prev = _week_arg("week_prev", cfg.get("week_prev", 20))
+            week_last = _week_arg("week_last", cfg.get("week_last", 21))
+            wh_ids = _resolve_wh_ids(cfg)
+            office_id = cfg.get("office_id")
+            report = build_report_data(wh_ids, office_id, year, week_prev, week_last)
+            blob = export_report_xlsx(report, year, week_prev, week_last)
+            filename = f"write_offs_{year}_{week_prev}_{week_last}.xlsx"
+            return send_file(
+                BytesIO(blob),
+                as_attachment=True,
+                download_name=filename,
+                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
 
     @application.route("/api/weeks")
     def api_weeks():
