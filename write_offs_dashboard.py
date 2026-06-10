@@ -1914,6 +1914,7 @@ tr.total td { background: #eef2ff; }
     <button type="button" id="btnAdminLogout" class="export">Выход админа</button>
     <button type="button" id="btnToggleWeeks" class="secondary">Показать все недели</button>
     <button type="button" id="btnNomenclature" class="secondary">Номенклатура</button>
+    <button type="button" id="btnClearWh" class="export">Сбросить фильтр</button>
     <button type="button" id="btnApply" class="secondary">Применить</button>
     <button type="button" id="btnAllWh" class="secondary">Все WH</button>
     <button type="button" id="btnExportXlsx" class="export">Экспорт XLSX</button>
@@ -2061,6 +2062,13 @@ function init() {
   };
   document.getElementById('btnNomenclature').onclick = () => {
     window.location.href = '/nomenclature';
+  };
+  document.getElementById('btnClearWh').onclick = () => {
+    selectedWh = new Set();
+    document.querySelectorAll('#whGrid input').forEach(cb => cb.checked = false);
+    activeBuilding = 'custom';
+    syncBuildingButtons();
+    document.getElementById('status').textContent = 'Фильтр WH сброшен. Выберите нужный блок/склады и нажмите "Применить".';
   };
   document.getElementById('tableSearch').addEventListener('input', applyTableSearch);
   document.getElementById('btnApply').onclick = loadReport;
