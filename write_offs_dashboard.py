@@ -659,6 +659,20 @@ def enrich_coverages(report: dict, all_totals: dict[str, dict[str, float]]) -> d
     return report
 
 
+def build_kpi_payload(report: dict) -> dict[str, float]:
+    d = report.get("defects_total", {}) or {}
+    d0 = report.get("defects_org0_total", {}) or {}
+    total_last = to_float(d.get("w_last"))
+    org0_last = to_float(d0.get("w_last"))
+    cover = d.get("top20_cover_last")
+    return {
+        "total_last": total_last,
+        "org0_last": org0_last,
+        "org0_share": (org0_last / total_last * 100) if total_last else 0.0,
+        "top20_cover": to_float(cover) if cover is not None else 0.0,
+    }
+
+
 def export_report_xlsx(report: dict, year: int, week_prev: int, week_last: int) -> bytes:
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -1819,9 +1833,56 @@ tr.total td { background: #eef2ff; }
   border-color: #60a5fa;
   box-shadow: 0 0 0 3px rgba(59,130,246,.16);
 }
+.topnav {
+  margin: 10px 12px 8px;
+  display: flex;
+  gap: 8px;
+}
+.topnav a {
+  text-decoration: none;
+  padding: 8px 12px;
+  border: 1px solid #bfd2ff;
+  background: #eef4ff;
+  color: #1e40af;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 12px;
+}
+.topnav a.active { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
+.kpis {
+  margin: 0 12px 10px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(180px, 1fr));
+  gap: 10px;
+}
+.kpi {
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  box-shadow: 0 3px 10px rgba(15,23,42,.06);
+}
+.kpi .k { color: #64748b; font-size: 11px; margin-bottom: 4px; }
+.kpi .v { color: #0f172a; font-size: 18px; font-weight: 700; }
+.table-tools {
+  margin: 0 12px 8px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 12px;
+}
+.table-tools input {
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 6px 8px;
+  min-width: 260px;
+}
 
 @media (max-width: 900px) {
   .toolbar { margin: 10px; padding: 10px; }
+  .topnav { margin: 10px 10px 8px; }
+  .kpis { margin: 0 10px 10px; grid-template-columns: 1fr 1fr; }
+  .table-tools { margin: 0 10px 8px; }
   #status { margin: 0 10px 10px; }
   .grid { padding: 0 10px 10px; }
   .actions { width: 100%; }
@@ -1830,6 +1891,10 @@ tr.total td { background: #eef2ff; }
 </head>
 <body>
 <header><h1>Отчёт по браку — write_offs</h1></header>
+<nav class="topnav">
+  <a href="/" class="active">Дашборд</a>
+  <a href="/nomenclature">Номенклатура</a>
+</nav>
 <div class="toolbar">
   <fieldset class="group">
     <legend>Корпус / WH</legend>
@@ -1853,6 +1918,15 @@ tr.total td { background: #eef2ff; }
     <button type="button" id="btnAllWh" class="secondary">Все WH</button>
     <button type="button" id="btnExportXlsx" class="export">Экспорт XLSX</button>
   </div>
+</div>
+<div class="kpis" id="kpis">
+  <div class="kpi"><div class="k">Итого брак (посл. нед.)</div><div class="v" id="kpiTotal">—</div></div>
+  <div class="kpi"><div class="k">ORG0 (посл. нед.)</div><div class="v" id="kpiOrg0">—</div></div>
+  <div class="kpi"><div class="k">Доля ORG0</div><div class="v" id="kpiOrg0Share">—</div></div>
+  <div class="kpi"><div class="k">Покрытие ТОП-20</div><div class="v" id="kpiCover">—</div></div>
+</div>
+<div class="table-tools">
+  <label>Поиск: <input type="text" id="tableSearch" placeholder="Дефект / категория / ID"></label>
 </div>
 <div id="status">Загрузка…</div>
 <div id="adminModal" class="modal-overlay" aria-hidden="true">
@@ -1891,6 +1965,37 @@ let isAdminSession = false;
 function whLabel(id) {
   const w = CATALOG.find(x => x.wh_id === id);
   return w ? (id + ' — ' + w.name) : String(id);
+}
+
+function fmtInt(v) {
+  return Number(v || 0).toLocaleString('ru-RU');
+}
+
+function fmtPct(v) {
+  return Number(v || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '%';
+}
+
+function updateKpis(kpis) {
+  const d = kpis || {};
+  document.getElementById('kpiTotal').textContent = fmtInt(d.total_last || 0);
+  document.getElementById('kpiOrg0').textContent = fmtInt(d.org0_last || 0);
+  document.getElementById('kpiOrg0Share').textContent = fmtPct(d.org0_share || 0);
+  document.getElementById('kpiCover').textContent = fmtPct(d.top20_cover || 0);
+}
+
+function applyTableSearch() {
+  const q = (document.getElementById('tableSearch').value || '').trim().toLowerCase();
+  document.querySelectorAll('#reportGrid tbody tr').forEach(tr => {
+    if (tr.classList.contains('total')) {
+      tr.style.display = '';
+      return;
+    }
+    if (!q) {
+      tr.style.display = '';
+      return;
+    }
+    tr.style.display = tr.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
 }
 
 function init() {
@@ -1957,6 +2062,7 @@ function init() {
   document.getElementById('btnNomenclature').onclick = () => {
     window.location.href = '/nomenclature';
   };
+  document.getElementById('tableSearch').addEventListener('input', applyTableSearch);
   document.getElementById('btnApply').onclick = loadReport;
   document.getElementById('btnRefreshData').onclick = refreshData;
   document.getElementById('btnExportXlsx').onclick = exportXlsx;
@@ -1969,10 +2075,7 @@ function init() {
     loadReport();
   };
 
-  refreshWeeks().then(() => {
-    if (CONFIG.week_prev && CONFIG.week_last && availableWeeks.length) {
-      fillWeekSelects(availableWeeks, CONFIG.week_prev, CONFIG.week_last);
-    }
+  refreshWeeks(true).then(() => {
     if (CONFIG.buildings.length) selectBuilding(CONFIG.buildings[0]);
     else loadReport();
   });
@@ -2075,7 +2178,7 @@ function fillWeekSelects(weeks, prev, last) {
   }
 }
 
-async function refreshWeeks() {
+async function refreshWeeks(forceLatest = false) {
   const year = document.getElementById('year').value;
   const wh = selectedWh.size ? Array.from(selectedWh).join(',') : '';
   const q = new URLSearchParams({ year });
@@ -2085,9 +2188,15 @@ async function refreshWeeks() {
     if (!r.ok) return;
     const data = await r.json();
     availableWeeks = data.weeks || [];
-    const prev = parseInt(document.getElementById('weekPrev').value, 10);
-    const last = parseInt(document.getElementById('weekLast').value, 10);
-    fillWeekSelects(availableWeeks, prev, last);
+    const curPrev = parseInt(document.getElementById('weekPrev').value, 10);
+    const curLast = parseInt(document.getElementById('weekLast').value, 10);
+    const hasCurPrev = Number.isFinite(curPrev) && availableWeeks.includes(curPrev);
+    const hasCurLast = Number.isFinite(curLast) && availableWeeks.includes(curLast);
+    if (forceLatest || !hasCurPrev || !hasCurLast) {
+      fillWeekSelects(availableWeeks, data.week_prev, data.week_last);
+    } else {
+      fillWeekSelects(availableWeeks, curPrev, curLast);
+    }
   } catch (_) {}
 }
 
@@ -2240,6 +2349,8 @@ async function loadReport() {
   try {
     const data = await parseApiResponse(await fetch('/api/report?' + q));
     grid.innerHTML = data.html;
+    updateKpis(data.kpis || null);
+    applyTableSearch();
     const sorted = Array.from(selectedWh).sort((a,b)=>a-b);
     const label = selectedWh.size === ALL_WH_IDS.length
       ? 'все корпуса (' + ALL_WH_IDS.length + ' WH)'
@@ -2270,6 +2381,9 @@ NOMENCLATURE_HTML = """<!DOCTYPE html>
 body { margin: 0; font: 14px/1.45 Inter, "Segoe UI", Roboto, Arial, sans-serif; background: #f3f6fb; color: #0f172a; }
 header { background: linear-gradient(100deg, #0f4c81 0%, #2563eb 55%, #1d4ed8 100%); color: #fff; padding: 12px 16px; }
 header h1 { margin: 0; font-size: 20px; font-weight: 700; }
+.topnav { margin: 10px 12px 8px; display: flex; gap: 8px; }
+.topnav a { text-decoration: none; padding: 8px 12px; border: 1px solid #bfd2ff; background: #eef4ff; color: #1e40af; border-radius: 999px; font-weight: 600; font-size: 12px; }
+.topnav a.active { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
 .wrap { padding: 14px 12px; }
 .panel { background: #fff; border: 1px solid #dbe4f0; border-radius: 12px; box-shadow: 0 10px 28px rgba(15,23,42,.08); overflow: hidden; }
 .panel h2 { margin: 0; padding: 10px 12px; font-size: 14px; border-bottom: 1px solid #e2e8f0; background: #eff6ff; color: #1e3a8a; }
@@ -2287,6 +2401,10 @@ tr.total td { background: #eef2ff; font-weight: 700; }
 </head>
 <body>
 <header><h1>Кол-во брака по номенклатуре</h1></header>
+<nav class="topnav">
+  <a href="/">Дашборд</a>
+  <a href="/nomenclature" class="active">Номенклатура</a>
+</nav>
 <div class="wrap">
   <section class="panel">
     <div class="toolbar"><a class="btn" href="/">На главную</a></div>
@@ -2573,6 +2691,7 @@ def register_routes(application) -> None:
                 "weeks": weeks,
                 "week_prev": week_prev,
                 "week_last": week_last,
+                "kpis": build_kpi_payload(data),
             }
         )
 
