@@ -86,6 +86,12 @@ def _matview_name() -> str:
     ).strip() or "brak_team.write_offs_weekly_mv"
 
 
+def _nm_matview_name() -> str:
+    return os.environ.get(
+        "WRITE_OFFS_NM_MATVIEW_NAME", "brak_team.write_offs_nm_weekly_mv"
+    ).strip() or "brak_team.write_offs_nm_weekly_mv"
+
+
 def _ensure_report_matview() -> None:
     """
     Ensures weekly aggregated materialized view exists.
@@ -109,7 +115,6 @@ def _ensure_report_matview() -> None:
             EXTRACT(WEEK FROM date)::int AS week_no,
             office_id,
             wh_id,
-            nm_id,
             cnt_org,
             reason_id,
             COALESCE(reason_descr, '—') AS reason_descr,
@@ -119,10 +124,10 @@ def _ensure_report_matview() -> None:
             MAX(date) AS max_date
         FROM brak_team.write_offs
         WHERE date IS NOT NULL
-        GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9
+        GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
     """
     idx = [
-        f"CREATE UNIQUE INDEX IF NOT EXISTS write_offs_weekly_mv_uq ON {mv} (iso_year, week_no, office_id, wh_id, nm_id, cnt_org, reason_id, reason_descr, parent_name)",
+        f"CREATE UNIQUE INDEX IF NOT EXISTS write_offs_weekly_mv_uq ON {mv} (iso_year, week_no, office_id, wh_id, cnt_org, reason_id, reason_descr, parent_name)",
         f"CREATE INDEX IF NOT EXISTS write_offs_weekly_mv_filter_idx ON {mv} (iso_year, office_id, wh_id, week_no, cnt_org)",
         f"CREATE INDEX IF NOT EXISTS write_offs_weekly_mv_week_idx ON {mv} (iso_year, week_no)",
     ]
@@ -148,7 +153,6 @@ def _ensure_report_matview() -> None:
                     "week_no",
                     "office_id",
                     "wh_id",
-                    "nm_id",
                     "cnt_org",
                     "reason_id",
                     "reason_descr",
@@ -157,7 +161,8 @@ def _ensure_report_matview() -> None:
                     "rows_cnt",
                     "max_date",
                 }
-                if not required.issubset(cols):
+                # If legacy structure contains nm_id, it's too granular for report queries.
+                if ("nm_id" in cols) or (not required.issubset(cols)):
                     cur.execute(f"DROP MATERIALIZED VIEW IF EXISTS {mv} CASCADE")
             cur.execute(ddl)
             for stmt in idx:
@@ -173,11 +178,44 @@ def _ensure_report_matview() -> None:
         raise
 
 
+def _ensure_nm_matview() -> None:
+    if not _use_report_matview():
+        return
+    mv = _nm_matview_name()
+    ddl = f"""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {mv} AS
+        SELECT
+            EXTRACT(ISOYEAR FROM date)::int AS iso_year,
+            EXTRACT(WEEK FROM date)::int AS week_no,
+            office_id,
+            wh_id,
+            nm_id,
+            COUNT(*)::bigint AS rows_cnt,
+            MAX(date) AS max_date
+        FROM brak_team.write_offs
+        WHERE date IS NOT NULL
+          AND nm_id IS NOT NULL
+        GROUP BY 1, 2, 3, 4, 5
+    """
+    idx = [
+        f"CREATE UNIQUE INDEX IF NOT EXISTS write_offs_nm_weekly_mv_uq ON {mv} (iso_year, week_no, office_id, wh_id, nm_id)",
+        f"CREATE INDEX IF NOT EXISTS write_offs_nm_weekly_mv_filter_idx ON {mv} (iso_year, office_id, week_no, wh_id)",
+    ]
+    with get_conn() as conn:
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute(ddl)
+        for stmt in idx:
+            cur.execute(stmt)
+
+
 def _refresh_report_matview() -> str | None:
     if not _use_report_matview():
         return None
     _ensure_report_matview()
     mv = _matview_name()
+    nm_mv = _nm_matview_name()
+    _ensure_nm_matview()
     use_concurrently = os.environ.get(
         "WRITE_OFFS_MATVIEW_REFRESH_CONCURRENTLY", "1"
     ).strip().lower() not in ("0", "false", "no")
@@ -187,12 +225,19 @@ def _refresh_report_matview() -> str | None:
         if use_concurrently:
             try:
                 cur.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {mv}")
-                return "Матпредставление обновлено (CONCURRENTLY)"
+                try:
+                    cur.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {nm_mv}")
+                    return "Матпредставления обновлены (CONCURRENTLY)"
+                except Exception:
+                    cur.execute(f"REFRESH MATERIALIZED VIEW {nm_mv}")
+                    return "Матпредставления обновлены"
             except Exception:
                 cur.execute(f"REFRESH MATERIALIZED VIEW {mv}")
-                return "Матпредставление обновлено"
+                cur.execute(f"REFRESH MATERIALIZED VIEW {nm_mv}")
+                return "Матпредставления обновлены"
         cur.execute(f"REFRESH MATERIALIZED VIEW {mv}")
-        return "Матпредставление обновлено"
+        cur.execute(f"REFRESH MATERIALIZED VIEW {nm_mv}")
+        return "Матпредставления обновлены"
 
 
 def _report_source() -> dict[str, str]:
@@ -912,29 +957,53 @@ def fetch_nomenclature_counts_latest_week(
         if corpus in (1, 2, 3):
             wh_to_corpus[wid] = corpus
 
-    src = _report_source()
+    use_nm_mv = _use_report_matview()
+    nm_src = {
+        "table": "brak_team.write_offs",
+        "week_expr": "EXTRACT(WEEK FROM date)::int",
+        "isoyear_expr": "EXTRACT(ISOYEAR FROM date)::int",
+        "year_clause": "date >= %s AND date < %s",
+        "base_not_null_clause": "date IS NOT NULL",
+        "rows_expr": "1",
+    }
+    if use_nm_mv:
+        try:
+            _ensure_nm_matview()
+            nm_src = {
+                "table": _nm_matview_name(),
+                "week_expr": "week_no",
+                "isoyear_expr": "iso_year",
+                "year_clause": "iso_year = %s",
+                "base_not_null_clause": "",
+                "rows_expr": "rows_cnt",
+            }
+        except Exception as exc:
+            print(
+                f"[write_offs] nm matview unavailable, fallback to base table: {exc}",
+                file=sys.stderr,
+            )
     clauses: list[str] = []
-    if src["base_not_null_clause"]:
-        clauses.append(src["base_not_null_clause"])
+    if nm_src["base_not_null_clause"]:
+        clauses.append(nm_src["base_not_null_clause"])
     clauses.append("nm_id IS NOT NULL")
     params: list[Any] = []
     if office_id is not None:
         clauses.append("office_id = %s")
         params.append(office_id)
     if year is not None:
-        if _use_report_matview() and src["table"] != "brak_team.write_offs":
-            clauses.append(src["year_clause"])
+        if use_nm_mv and nm_src["table"] != "brak_team.write_offs":
+            clauses.append(nm_src["year_clause"])
             params.append(year)
         else:
             y_start = date.fromisocalendar(year, 1, 1)
             y_end = date.fromisocalendar(year + 1, 1, 1)
-            clauses.append(src["year_clause"])
+            clauses.append(nm_src["year_clause"])
             params.extend([y_start, y_end])
 
     where = " WHERE " + " AND ".join(clauses)
-    week_expr = src["week_expr"]
-    year_expr = src.get("isoyear_expr", "EXTRACT(ISOYEAR FROM date)::int")
-    rows_expr = "rows_cnt" if src["table"] != "brak_team.write_offs" else "1"
+    week_expr = nm_src["week_expr"]
+    year_expr = nm_src["isoyear_expr"]
+    rows_expr = nm_src["rows_expr"]
     sql = f"""
         WITH base AS (
             SELECT
@@ -943,7 +1012,7 @@ def fetch_nomenclature_counts_latest_week(
                 wh_id,
                 nm_id,
                 {rows_expr}::bigint AS rows_cnt
-            FROM {src["table"]}
+            FROM {nm_src["table"]}
             {where}
         ),
         lw AS (
@@ -964,7 +1033,7 @@ def fetch_nomenclature_counts_latest_week(
             SELECT
                 {year_expr} AS iso_year,
                 {week_expr} AS week_no
-            FROM {src["table"]}
+            FROM {nm_src["table"]}
             {where}
         )
         SELECT iso_year, week_no
