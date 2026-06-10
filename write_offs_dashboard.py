@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sys
 from io import BytesIO
 from contextlib import contextmanager
@@ -35,8 +36,16 @@ if _env_file.exists():
 
 CACHE_TTL_SEC = int(os.environ.get("REPORT_CACHE_TTL_SEC", "120"))
 WEEKS_CACHE_TTL_SEC = int(os.environ.get("WEEKS_CACHE_TTL_SEC", "300"))
+MATVIEW_BOOTSTRAP_TTL_SEC = int(os.environ.get("MATVIEW_BOOTSTRAP_TTL_SEC", "600"))
 _CACHE_LOCK = RLock()
 _CACHE: dict[str, tuple[float, Any]] = {}
+_MV_LOCK = RLock()
+_MV_BOOTSTRAP_OK_AT = 0.0
+_MV_BOOTSTRAP_FAIL_AT = 0.0
+_MV_BOOTSTRAP_FAIL_MSG = ""
+_ADMIN_SESSIONS_LOCK = RLock()
+_ADMIN_SESSIONS: dict[str, float] = {}
+ADMIN_SESSION_TTL_SEC = int(os.environ.get("ADMIN_SESSION_TTL_SEC", "28800"))
 
 
 def _cache_get(key: str) -> Any | None:
@@ -60,6 +69,129 @@ def _cache_set(key: str, payload: Any, ttl_sec: int) -> None:
 def _cache_clear_all() -> None:
     with _CACHE_LOCK:
         _CACHE.clear()
+
+
+def _use_report_matview() -> bool:
+    return os.environ.get("USE_WRITE_OFFS_MATVIEW", "1").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+    )
+
+
+def _matview_name() -> str:
+    return os.environ.get(
+        "WRITE_OFFS_MATVIEW_NAME", "brak_team.write_offs_weekly_mv"
+    ).strip() or "brak_team.write_offs_weekly_mv"
+
+
+def _ensure_report_matview() -> None:
+    """
+    Ensures weekly aggregated materialized view exists.
+    Expensive DDL check is throttled by MATVIEW_BOOTSTRAP_TTL_SEC.
+    """
+    global _MV_BOOTSTRAP_OK_AT, _MV_BOOTSTRAP_FAIL_AT, _MV_BOOTSTRAP_FAIL_MSG
+    if not _use_report_matview():
+        return
+    now = monotonic()
+    with _MV_LOCK:
+        if _MV_BOOTSTRAP_OK_AT and (now - _MV_BOOTSTRAP_OK_AT) < MATVIEW_BOOTSTRAP_TTL_SEC:
+            return
+        if _MV_BOOTSTRAP_FAIL_AT and (now - _MV_BOOTSTRAP_FAIL_AT) < MATVIEW_BOOTSTRAP_TTL_SEC:
+            raise RuntimeError(_MV_BOOTSTRAP_FAIL_MSG or "matview bootstrap failed")
+
+    mv = _matview_name()
+    ddl = f"""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {mv} AS
+        SELECT
+            EXTRACT(ISOYEAR FROM date)::int AS iso_year,
+            EXTRACT(WEEK FROM date)::int AS week_no,
+            office_id,
+            wh_id,
+            cnt_org,
+            reason_id,
+            COALESCE(reason_descr, '—') AS reason_descr,
+            COALESCE(parent_name, '—') AS parent_name,
+            SUM(amount)::numeric AS amount_sum,
+            COUNT(*)::bigint AS rows_cnt,
+            MAX(date) AS max_date
+        FROM brak_team.write_offs
+        WHERE date IS NOT NULL
+        GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+    """
+    idx = [
+        f"CREATE UNIQUE INDEX IF NOT EXISTS write_offs_weekly_mv_uq ON {mv} (iso_year, week_no, office_id, wh_id, cnt_org, reason_id, reason_descr, parent_name)",
+        f"CREATE INDEX IF NOT EXISTS write_offs_weekly_mv_filter_idx ON {mv} (iso_year, office_id, wh_id, week_no, cnt_org)",
+        f"CREATE INDEX IF NOT EXISTS write_offs_weekly_mv_week_idx ON {mv} (iso_year, week_no)",
+    ]
+    try:
+        with get_conn() as conn:
+            conn.autocommit = True
+            cur = conn.cursor()
+            cur.execute(ddl)
+            for stmt in idx:
+                cur.execute(stmt)
+        with _MV_LOCK:
+            _MV_BOOTSTRAP_OK_AT = monotonic()
+            _MV_BOOTSTRAP_FAIL_AT = 0.0
+            _MV_BOOTSTRAP_FAIL_MSG = ""
+    except Exception as exc:
+        with _MV_LOCK:
+            _MV_BOOTSTRAP_FAIL_AT = monotonic()
+            _MV_BOOTSTRAP_FAIL_MSG = f"matview bootstrap failed: {exc}"
+        raise
+
+
+def _refresh_report_matview() -> str | None:
+    if not _use_report_matview():
+        return None
+    _ensure_report_matview()
+    mv = _matview_name()
+    use_concurrently = os.environ.get(
+        "WRITE_OFFS_MATVIEW_REFRESH_CONCURRENTLY", "1"
+    ).strip().lower() not in ("0", "false", "no")
+    with get_conn() as conn:
+        conn.autocommit = True
+        cur = conn.cursor()
+        if use_concurrently:
+            try:
+                cur.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {mv}")
+                return "Матпредставление обновлено (CONCURRENTLY)"
+            except Exception:
+                cur.execute(f"REFRESH MATERIALIZED VIEW {mv}")
+                return "Матпредставление обновлено"
+        cur.execute(f"REFRESH MATERIALIZED VIEW {mv}")
+        return "Матпредставление обновлено"
+
+
+def _report_source() -> dict[str, str]:
+    """
+    Returns source config for reporting SQL.
+    Falls back to base table if matview is unavailable.
+    """
+    if _use_report_matview():
+        try:
+            _ensure_report_matview()
+            return {
+                "table": _matview_name(),
+                "week_expr": "week_no",
+                "amount_expr": "amount_sum",
+                "year_clause": "iso_year = %s",
+                "base_not_null_clause": "",
+            }
+        except Exception as exc:
+            print(
+                f"[write_offs] matview unavailable, fallback to base table: {exc}",
+                file=sys.stderr,
+            )
+    return {
+        "table": "brak_team.write_offs",
+        "week_expr": "EXTRACT(WEEK FROM date)::int",
+        "amount_expr": "amount",
+        "year_clause": "date >= %s AND date < %s",
+        "base_not_null_clause": "date IS NOT NULL",
+    }
 
 
 @dataclass
@@ -257,6 +389,7 @@ def run_db_refresh() -> str | None:
     import urllib.error
     import urllib.request
 
+    notes: list[str] = []
     sql = os.environ.get("DB_REFRESH_SQL", "").strip()
     if sql:
         with get_conn() as conn:
@@ -266,28 +399,37 @@ def run_db_refresh() -> str | None:
             try:
                 row = cur.fetchone()
                 if row and row[0] is not None:
-                    return str(row[0])
+                    notes.append(str(row[0]))
+                else:
+                    notes.append("SQL обновления выполнен")
             except Exception:
-                pass
-        return "SQL обновления выполнен"
+                notes.append("SQL обновления выполнен")
 
     url = os.environ.get("DB_REFRESH_URL", "").strip()
-    if not url:
-        return None
+    if url:
+        method = os.environ.get("DB_REFRESH_METHOD", "POST").upper()
+        req = urllib.request.Request(url, method=method)
+        token = os.environ.get("DB_REFRESH_TOKEN", "").strip()
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        timeout = int(os.environ.get("DB_REFRESH_TIMEOUT", "120"))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", errors="replace")[:300]
+                notes.append(body or f"HTTP {resp.status}")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:300]
+            raise RuntimeError(f"DB_REFRESH_URL: HTTP {exc.code} {detail}") from exc
 
-    method = os.environ.get("DB_REFRESH_METHOD", "POST").upper()
-    req = urllib.request.Request(url, method=method)
-    token = os.environ.get("DB_REFRESH_TOKEN", "").strip()
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    timeout = int(os.environ.get("DB_REFRESH_TIMEOUT", "120"))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", errors="replace")[:300]
-            return body or f"HTTP {resp.status}"
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:300]
-        raise RuntimeError(f"DB_REFRESH_URL: HTTP {exc.code} {detail}") from exc
+        mv_note = _refresh_report_matview()
+        if mv_note:
+            notes.append(mv_note)
+    except Exception as exc:
+        notes.append(f"matview refresh error: {exc}")
+    if notes:
+        return " | ".join(notes)
+    return None
 
 
 def check_refresh_access() -> str | None:
@@ -306,6 +448,71 @@ def check_refresh_access() -> str | None:
     return None
 
 
+def _admin_login_password() -> tuple[str, str]:
+    login = os.environ.get("ADMIN_LOGIN", "admin").strip() or "admin"
+    password = os.environ.get("ADMIN_PASSWORD", "").strip()
+    if not password:
+        password = os.environ.get("REFRESH_API_TOKEN", "").strip()
+    return login, password
+
+
+def _admin_session_create() -> str:
+    sid = secrets.token_urlsafe(32)
+    with _ADMIN_SESSIONS_LOCK:
+        _ADMIN_SESSIONS[sid] = monotonic() + max(60, ADMIN_SESSION_TTL_SEC)
+    return sid
+
+
+def _admin_session_valid(sid: str) -> bool:
+    if not sid:
+        return False
+    now = monotonic()
+    with _ADMIN_SESSIONS_LOCK:
+        exp = _ADMIN_SESSIONS.get(sid)
+        if exp is None:
+            return False
+        if exp < now:
+            _ADMIN_SESSIONS.pop(sid, None)
+            return False
+        _ADMIN_SESSIONS[sid] = now + max(60, ADMIN_SESSION_TTL_SEC)
+        return True
+
+
+def _admin_session_delete(sid: str) -> None:
+    if not sid:
+        return
+    with _ADMIN_SESSIONS_LOCK:
+        _ADMIN_SESSIONS.pop(sid, None)
+
+
+def check_admin_session_access() -> str | None:
+    from flask import request
+
+    sid = request.headers.get("X-Admin-Session", "").strip() or request.args.get(
+        "admin_session", ""
+    ).strip()
+    if not _admin_session_valid(sid):
+        return "Требуется вход администратора"
+    return None
+
+
+def check_admin_access() -> str | None:
+    """
+    Preferred auth: admin session from /api/admin/login.
+    Backward-compatible fallback: X-Refresh-Token.
+    """
+    session_err = check_admin_session_access()
+    if session_err is None:
+        return None
+    # If legacy refresh token is not configured, do not bypass by fallback.
+    if not os.environ.get("REFRESH_API_TOKEN", "").strip():
+        return session_err
+    legacy_err = check_refresh_access()
+    if legacy_err is None:
+        return None
+    return session_err
+
+
 def fetch_totals_all(
     *,
     wh_ids: list[int] | None,
@@ -315,10 +522,19 @@ def fetch_totals_all(
     week_prev: int,
     week_last: int,
 ) -> dict[str, float]:
-    clauses: list[str] = ["date IS NOT NULL", "date >= %s", "date < %s"]
-    year_start = date.fromisocalendar(year, 1, 1)
-    year_end = date.fromisocalendar(year + 1, 1, 1)
-    params: list[Any] = [year_start, year_end]
+    src = _report_source()
+    clauses: list[str] = []
+    params: list[Any] = []
+    if src["base_not_null_clause"]:
+        clauses.append(src["base_not_null_clause"])
+    if _use_report_matview() and src["table"] != "brak_team.write_offs":
+        clauses.append(src["year_clause"])
+        params.append(year)
+    else:
+        year_start = date.fromisocalendar(year, 1, 1)
+        year_end = date.fromisocalendar(year + 1, 1, 1)
+        clauses.append(src["year_clause"])
+        params.extend([year_start, year_end])
     if office_id is not None:
         clauses.append("office_id = %s")
         params.append(office_id)
@@ -328,11 +544,13 @@ def fetch_totals_all(
     if org0_only:
         clauses.append("cnt_org = 0")
     where = " WHERE " + " AND ".join(clauses)
+    week_expr = src["week_expr"]
+    amount_expr = src["amount_expr"]
     sql = f"""
         SELECT
-            COALESCE(SUM(amount) FILTER (WHERE EXTRACT(WEEK FROM date) = %s), 0) AS total_prev,
-            COALESCE(SUM(amount) FILTER (WHERE EXTRACT(WEEK FROM date) = %s), 0) AS total_last
-        FROM brak_team.write_offs
+            COALESCE(SUM({amount_expr}) FILTER (WHERE {week_expr} = %s), 0) AS total_prev,
+            COALESCE(SUM({amount_expr}) FILTER (WHERE {week_expr} = %s), 0) AS total_last
+        FROM {src["table"]}
         {where}
     """
     qparams = [week_prev, week_last, *params]
@@ -599,10 +817,19 @@ def fetch_available_weeks(
     if cached is not None:
         return cached
 
-    clauses: list[str] = ["date IS NOT NULL", "date >= %s", "date < %s"]
-    year_start = date.fromisocalendar(year, 1, 1)
-    year_end = date.fromisocalendar(year + 1, 1, 1)
-    params: list[Any] = [year_start, year_end]
+    src = _report_source()
+    clauses: list[str] = []
+    params: list[Any] = []
+    if src["base_not_null_clause"]:
+        clauses.append(src["base_not_null_clause"])
+    if _use_report_matview() and src["table"] != "brak_team.write_offs":
+        clauses.append(src["year_clause"])
+        params.append(year)
+    else:
+        year_start = date.fromisocalendar(year, 1, 1)
+        year_end = date.fromisocalendar(year + 1, 1, 1)
+        clauses.append(src["year_clause"])
+        params.extend([year_start, year_end])
     if office_id is not None:
         clauses.append("office_id = %s")
         params.append(office_id)
@@ -610,9 +837,10 @@ def fetch_available_weeks(
         clauses.append("wh_id = ANY(%s)")
         params.append(wh_ids)
     where = " WHERE " + " AND ".join(clauses)
+    week_expr = src["week_expr"]
     sql = f"""
-        SELECT DISTINCT EXTRACT(WEEK FROM date)::int AS w
-        FROM brak_team.write_offs
+        SELECT DISTINCT {week_expr}::int AS w
+        FROM {src["table"]}
         {where}
         ORDER BY w
     """
@@ -748,10 +976,19 @@ def fetch_top_bundle(
     if not weeks:
         weeks = [week_last]
 
-    clauses: list[str] = ["date IS NOT NULL", "date >= %s", "date < %s"]
-    year_start = date.fromisocalendar(year, 1, 1)
-    year_end = date.fromisocalendar(year + 1, 1, 1)
-    params: list[Any] = [year_start, year_end]
+    src = _report_source()
+    clauses: list[str] = []
+    params: list[Any] = []
+    if src["base_not_null_clause"]:
+        clauses.append(src["base_not_null_clause"])
+    if _use_report_matview() and src["table"] != "brak_team.write_offs":
+        clauses.append(src["year_clause"])
+        params.append(year)
+    else:
+        year_start = date.fromisocalendar(year, 1, 1)
+        year_end = date.fromisocalendar(year + 1, 1, 1)
+        clauses.append(src["year_clause"])
+        params.extend([year_start, year_end])
     if office_id is not None:
         clauses.append("office_id = %s")
         params.append(office_id)
@@ -760,20 +997,23 @@ def fetch_top_bundle(
         params.append(wh_ids)
     where = " WHERE " + " AND ".join(clauses)
 
+    week_expr = src["week_expr"]
+    amount_expr = src["amount_expr"]
     week_cols = ",\n               ".join(
         f"COALESCE(SUM(amount) FILTER (WHERE week_no = %s), 0) AS w_{w}"
         for w in weeks
     )
 
+    base_week_select = "week_no" if week_expr == "week_no" else f"{week_expr} AS week_no"
     sql = f"""
 WITH base AS (
     SELECT reason_id,
            COALESCE(reason_descr, '—') AS reason_descr,
            COALESCE(parent_name, '—') AS parent_name,
-           EXTRACT(WEEK FROM date)::int AS week_no,
+           {base_week_select},
            cnt_org,
-           amount
-    FROM brak_team.write_offs
+           {amount_expr} AS amount
+    FROM {src["table"]}
     {where}
 ),
 defects_all AS (
@@ -1043,9 +1283,10 @@ def build_report_data(
     week_prev: int,
     week_last: int,
     weeks: list[int] | None = None,
+    show_all_weeks: bool = True,
 ) -> dict:
     key = (
-        f"report:{year}:{week_prev}:{week_last}:{office_id}:"
+        f"report:{year}:{week_prev}:{week_last}:{office_id}:{int(show_all_weeks)}:"
         f"{','.join(map(str, wh_ids or []))}:{','.join(map(str, weeks or []))}"
     )
     cached = _cache_get(key)
@@ -1060,6 +1301,8 @@ def build_report_data(
         weeks = sorted(set(weeks) | {week_prev})
     if week_last not in weeks:
         weeks = sorted(set(weeks) | {week_last})
+    if not show_all_weeks:
+        weeks = sorted(set([week_prev, week_last]))
 
     bundle = fetch_top_bundle(
         wh_ids=wh_ids,
@@ -1172,7 +1415,17 @@ tr.total th.sticky { background: #1f4e79; }
 .actions button.secondary:hover { background: #1a5c38; }
 .actions button.export { background: #6b7280; color: #fff; }
 .actions button.export:hover { background: #4b5563; }
+.actions .hidden { display: none; }
 #status { padding: 8px 16px; color: #555; font-size: 12px; }
+.modal-overlay { position: fixed; inset: 0; background: rgba(15,23,42,.45); display: none; align-items: center; justify-content: center; z-index: 50; }
+.modal-overlay.show { display: flex; }
+.modal { width: 360px; max-width: calc(100vw - 24px); background: #fff; border-radius: 8px; box-shadow: 0 10px 40px rgba(0,0,0,.25); border: 1px solid #cbd5e1; }
+.modal h3 { margin: 0; padding: 10px 12px; background: #1f4e79; color: #fff; font-size: 14px; }
+.modal .body { padding: 12px; display: grid; gap: 10px; }
+.modal label { display: grid; gap: 4px; font-size: 12px; color: #334155; }
+.modal input { padding: 8px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 13px; }
+.modal .row { display: flex; gap: 8px; justify-content: flex-end; }
+.modal .hint { color: #b91c1c; min-height: 16px; font-size: 12px; }
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 12px; }
 @media (max-width: 1200px) { .grid { grid-template-columns: 1fr; } }
 .panel { background: #fff; border: 1px solid #999; overflow: auto; }
@@ -1185,6 +1438,154 @@ td.name { text-align: left; }
 td.c, td.n { text-align: right; white-space: nowrap; }
 tr.total td { background: #d9e2f3; font-weight: 600; }
 .loading { opacity: 0.5; pointer-events: none; }
+
+/* Modern UI theme overrides */
+:root {
+  --bg: #f3f6fb;
+  --surface: #ffffff;
+  --surface-2: #f8fafc;
+  --text: #0f172a;
+  --muted: #64748b;
+  --line: #dbe4f0;
+  --primary: #2563eb;
+  --primary-2: #1d4ed8;
+  --accent: #0f766e;
+  --danger: #b91c1c;
+  --shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+  --radius: 12px;
+}
+body {
+  font: 14px/1.45 Inter, "Segoe UI", Roboto, Arial, sans-serif;
+  background:
+    radial-gradient(1200px 520px at 0% -10%, rgba(37, 99, 235, 0.08), transparent 60%),
+    radial-gradient(900px 420px at 100% -20%, rgba(14, 116, 144, 0.08), transparent 55%),
+    var(--bg);
+  color: var(--text);
+}
+header {
+  background: linear-gradient(100deg, #0f4c81 0%, #2563eb 55%, #1d4ed8 100%);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.25);
+  box-shadow: 0 8px 24px rgba(29, 78, 216, 0.22);
+}
+header h1 { font-size: 22px; font-weight: 700; letter-spacing: .2px; }
+.toolbar {
+  margin: 14px 12px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  padding: 14px;
+}
+.group {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+  padding: 10px 12px;
+}
+.group legend { color: #1e3a8a; font-size: 12px; text-transform: uppercase; letter-spacing: .3px; }
+.building-btns button {
+  border: 1px solid #bfd2ff;
+  background: #eef4ff;
+  color: #1e40af;
+  border-radius: 999px;
+  transition: all .16s ease;
+}
+.building-btns button:hover { background: #dbeafe; border-color: #93c5fd; }
+.building-btns button.active {
+  background: linear-gradient(180deg, #2563eb, #1d4ed8);
+  border-color: #1d4ed8;
+  color: #fff;
+}
+.wh-grid {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  padding: 8px;
+}
+.wh-grid label { font-size: 12px; color: #1f2937; padding: 2px 1px; }
+.wh-grid .corpus-hdr { color: #1d4ed8; border-bottom: 1px dashed #c7d2fe; }
+.weeks input, .weeks select {
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  padding: 6px 8px;
+}
+.weeks .hint { color: var(--muted); }
+.actions { gap: 10px; }
+.actions button {
+  border-radius: 9px;
+  font-size: 12px;
+  font-weight: 650;
+  border: 1px solid transparent;
+  box-shadow: 0 1px 0 rgba(15,23,42,.03);
+  transition: all .16s ease;
+}
+.actions button:hover { transform: translateY(-1px); box-shadow: 0 8px 18px rgba(15,23,42,.12); }
+.actions button:disabled { opacity: .55; cursor: not-allowed; transform: none; box-shadow: none; }
+.actions button.primary { background: linear-gradient(180deg, var(--primary), var(--primary-2)); color: #fff; }
+.actions button.primary:hover { background: linear-gradient(180deg, #1d4ed8, #1e40af); }
+.actions button.secondary { background: #f0f9ff; color: #075985; border-color: #bae6fd; }
+.actions button.secondary:hover { background: #e0f2fe; }
+.actions button.export { background: #f8fafc; color: #334155; border-color: #dbe4f0; }
+.actions button.export:hover { background: #f1f5f9; }
+#status {
+  margin: 0 12px 10px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  color: #334155;
+  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.06);
+}
+.grid { gap: 14px; padding: 0 12px 12px; }
+.panel {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.panel h2 {
+  background: linear-gradient(90deg, #eff6ff 0%, #f8fafc 100%);
+  color: #0f172a;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+  font-weight: 700;
+  text-align: left;
+}
+.panel .table-scroll {
+  background: #fff;
+  border-top: 1px solid #eef2f7;
+}
+th, td { border-color: #e2e8f0; }
+th {
+  background: #f8fafc;
+  color: #334155;
+  font-size: 11px;
+}
+th.metric {
+  background: #eff6ff;
+  color: #1e3a8a;
+}
+td.metric { background: #f8fafc; color: #0f172a; }
+th.sticky { background: #f8fafc; z-index: 4; }
+td.sticky { background: #fff; }
+tr.total td { background: #eef2ff; }
+.modal h3 {
+  background: linear-gradient(100deg, #1d4ed8, #2563eb);
+}
+.modal input:focus {
+  outline: none;
+  border-color: #60a5fa;
+  box-shadow: 0 0 0 3px rgba(59,130,246,.16);
+}
+
+@media (max-width: 900px) {
+  .toolbar { margin: 10px; padding: 10px; }
+  #status { margin: 0 10px 10px; }
+  .grid { padding: 0 10px 10px; }
+  .actions { width: 100%; }
+}
 </style>
 </head>
 <body>
@@ -1204,12 +1605,33 @@ tr.total td { background: #d9e2f3; font-weight: 600; }
   </fieldset>
   <div class="actions">
     <button type="button" id="btnRefreshData" class="primary">Обновить данные</button>
+    <button type="button" id="btnAdminLogin" class="secondary">Вход админа</button>
+    <button type="button" id="btnAdminLogout" class="export">Выход админа</button>
+    <button type="button" id="btnToggleWeeks" class="secondary">Показать все недели</button>
     <button type="button" id="btnApply" class="secondary">Применить</button>
     <button type="button" id="btnAllWh" class="secondary">Все WH</button>
     <button type="button" id="btnExportXlsx" class="export">Экспорт XLSX</button>
   </div>
 </div>
 <div id="status">Загрузка…</div>
+<div id="adminModal" class="modal-overlay" aria-hidden="true">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="adminModalTitle">
+    <h3 id="adminModalTitle">Вход администратора</h3>
+    <div class="body">
+      <label>Логин
+        <input id="adminLoginInput" type="text" autocomplete="username" placeholder="admin">
+      </label>
+      <label>Пароль
+        <input id="adminPasswordInput" type="password" autocomplete="current-password" placeholder="Введите пароль">
+      </label>
+      <div id="adminAuthError" class="hint"></div>
+      <div class="row">
+        <button type="button" id="btnAdminCancel" class="export">Отмена</button>
+        <button type="button" id="btnAdminSubmit" class="primary">Войти</button>
+      </div>
+    </div>
+  </div>
+</div>
 <div class="grid" id="reportGrid"></div>
 <script>
 const CONFIG = __CONFIG_JSON__;
@@ -1221,6 +1643,9 @@ const ALL_WH_IDS = CATALOG.map(w => w.wh_id);
 let selectedWh = new Set();
 let activeBuilding = 'custom';
 let availableWeeks = [];
+let showAllWeeks = false;
+let adminSessionId = '';
+let isAdminSession = false;
 
 function whLabel(id) {
   const w = CATALOG.find(x => x.wh_id === id);
@@ -1229,6 +1654,11 @@ function whLabel(id) {
 
 function init() {
   if (CONFIG.week_year) document.getElementById('year').value = CONFIG.week_year;
+  adminSessionId = (localStorage.getItem('adminSessionId') || '').trim();
+  isAdminSession = Boolean(adminSessionId);
+  applyAdminUi();
+  showAllWeeks = Boolean(CONFIG.show_all_weeks_default);
+  updateWeeksToggleLabel();
   const grid = document.getElementById('whGrid');
   let lastCorpus = null;
   CATALOG.forEach(w => {
@@ -1268,6 +1698,21 @@ function init() {
   document.getElementById('year').addEventListener('change', () => refreshWeeks().then(loadReport));
   document.getElementById('weekPrev').addEventListener('change', loadReport);
   document.getElementById('weekLast').addEventListener('change', loadReport);
+  document.getElementById('btnAdminLogin').onclick = adminLogin;
+  document.getElementById('btnAdminLogout').onclick = adminLogout;
+  document.getElementById('btnAdminCancel').onclick = closeAdminModal;
+  document.getElementById('btnAdminSubmit').onclick = submitAdminLogin;
+  document.getElementById('adminModal').addEventListener('click', (e) => {
+    if (e.target && e.target.id === 'adminModal') closeAdminModal();
+  });
+  document.getElementById('adminPasswordInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') submitAdminLogin();
+  });
+  document.getElementById('btnToggleWeeks').onclick = () => {
+    showAllWeeks = !showAllWeeks;
+    updateWeeksToggleLabel();
+    loadReport();
+  };
   document.getElementById('btnApply').onclick = loadReport;
   document.getElementById('btnRefreshData').onclick = refreshData;
   document.getElementById('btnExportXlsx').onclick = exportXlsx;
@@ -1287,6 +1732,83 @@ function init() {
     if (CONFIG.buildings.length) selectBuilding(CONFIG.buildings[0]);
     else loadReport();
   });
+}
+
+function applyAdminUi() {
+  const btnRefresh = document.getElementById('btnRefreshData');
+  const btnLogin = document.getElementById('btnAdminLogin');
+  const btnLogout = document.getElementById('btnAdminLogout');
+  const needAuth = Boolean(CONFIG.refresh_token_required);
+  btnRefresh.classList.toggle('hidden', !isAdminSession);
+  btnLogin.disabled = isAdminSession;
+  btnLogout.disabled = !isAdminSession;
+}
+
+function adminLogin() {
+  openAdminModal();
+}
+
+function adminLogout() {
+  const status = document.getElementById('status');
+  const sid = adminSessionId;
+  adminSessionId = '';
+  localStorage.removeItem('adminSessionId');
+  isAdminSession = false;
+  applyAdminUi();
+  fetch('/api/admin/logout', {
+    method: 'POST',
+    headers: sid ? { 'X-Admin-Session': sid } : {},
+  }).catch(() => {});
+  status.textContent = 'Режим администратора выключен.';
+}
+
+function openAdminModal() {
+  const modal = document.getElementById('adminModal');
+  document.getElementById('adminAuthError').textContent = '';
+  document.getElementById('adminLoginInput').value = '';
+  document.getElementById('adminPasswordInput').value = '';
+  modal.classList.add('show');
+  modal.setAttribute('aria-hidden', 'false');
+  setTimeout(() => document.getElementById('adminLoginInput').focus(), 0);
+}
+
+function closeAdminModal() {
+  const modal = document.getElementById('adminModal');
+  modal.classList.remove('show');
+  modal.setAttribute('aria-hidden', 'true');
+}
+
+async function submitAdminLogin() {
+  const login = document.getElementById('adminLoginInput').value.trim();
+  const password = document.getElementById('adminPasswordInput').value;
+  const err = document.getElementById('adminAuthError');
+  if (!login || !password) {
+    err.textContent = 'Введите логин и пароль.';
+    return;
+  }
+  try {
+    const r = await fetch('/api/admin/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ login, password }),
+    });
+    const data = await parseApiResponse(r);
+    adminSessionId = String(data.session_id || '');
+    if (!adminSessionId) throw new Error('Сессия не создана');
+    localStorage.setItem('adminSessionId', adminSessionId);
+    isAdminSession = true;
+    applyAdminUi();
+    closeAdminModal();
+    document.getElementById('status').textContent = 'Режим администратора включён.';
+  } catch (e) {
+    err.textContent = e.message || 'Ошибка авторизации';
+  }
+}
+
+function updateWeeksToggleLabel() {
+  const btn = document.getElementById('btnToggleWeeks');
+  if (!btn) return;
+  btn.textContent = showAllWeeks ? 'Скрыть лишние недели' : 'Показать все недели';
 }
 
 function fillWeekSelects(weeks, prev, last) {
@@ -1381,6 +1903,10 @@ async function refreshData() {
   const status = document.getElementById('status');
   const grid = document.getElementById('reportGrid');
   const btn = document.getElementById('btnRefreshData');
+  if (CONFIG.refresh_token_required && !isAdminSession) {
+    status.textContent = 'Сначала выполните вход администратора.';
+    return;
+  }
   btn.disabled = true;
   grid.classList.add('loading');
   status.textContent = 'Обновление базы и загрузка отчёта…';
@@ -1388,15 +1914,8 @@ async function refreshData() {
   const year = document.getElementById('year').value;
   const q = new URLSearchParams({ year });
   if (wh) q.set('wh_ids', wh);
-  const rt = localStorage.getItem('refreshToken') || '';
-  const headers = rt ? { 'X-Refresh-Token': rt } : {};
+  const headers = adminSessionId ? { 'X-Admin-Session': adminSessionId } : {};
   try {
-    if (status.textContent.includes('Недостаточно прав')) {
-      const asked = prompt('Введите refresh token (если настроен):', localStorage.getItem('refreshToken') || '');
-      if (asked !== null) localStorage.setItem('refreshToken', asked.trim());
-    }
-    const rt = localStorage.getItem('refreshToken') || '';
-    const headers = rt ? { 'X-Refresh-Token': rt } : {};
     const data = await parseApiResponse(await fetch('/api/refresh?' + q, { method: 'POST', headers }));
     if (data.weeks && data.weeks.length) {
       availableWeeks = data.weeks;
@@ -1416,7 +1935,11 @@ async function refreshData() {
     status.textContent = parts.join(' · ');
   } catch (e) {
     if (String(e.message || '').includes('Недостаточно прав')) {
-      status.textContent = 'Нужен REFRESH_API_TOKEN: задайте в .env и введите в prompt.';
+      isAdminSession = false;
+      adminSessionId = '';
+      localStorage.removeItem('adminSessionId');
+      applyAdminUi();
+      status.textContent = 'Недостаточно прав: выполните вход администратора с корректным токеном.';
     } else {
     status.textContent = 'Ошибка обновления: ' + e.message;
     }
@@ -1435,6 +1958,7 @@ async function exportXlsx() {
     week_prev: wp,
     week_last: wl,
   });
+  q.set('show_all_weeks', showAllWeeks ? '1' : '0');
   if (wh) q.set('wh_ids', wh);
   try {
     status.textContent = 'Готовим XLSX...';
@@ -1466,6 +1990,7 @@ async function loadReport() {
     week_prev: wp,
     week_last: wl,
   });
+  q.set('show_all_weeks', showAllWeeks ? '1' : '0');
   if (wh) q.set('wh_ids', wh);
   status.textContent = 'Загрузка…';
   try {
@@ -1527,6 +2052,9 @@ def register_routes(application) -> None:
                 "week_year": cfg.get("week_year", 2026),
                 "week_prev": cfg.get("week_prev", 20),
                 "week_last": cfg.get("week_last", 21),
+                "is_admin": False,
+                "refresh_token_required": True,
+                "show_all_weeks_default": False,
             }
             page = DASHBOARD_HTML.replace(
                 "__CONFIG_JSON__", json.dumps(embed, ensure_ascii=False)
@@ -1535,12 +2063,39 @@ def register_routes(application) -> None:
         except Exception as exc:
             return f"<pre>Index error: {exc}</pre>", 500
 
+    @application.route("/api/admin/login", methods=["POST"])
+    def api_admin_login():
+        _, expected_password = _admin_login_password()
+        if not expected_password:
+            sid = _admin_session_create()
+            return jsonify({"ok": True, "session_id": sid, "note": "auth disabled"})
+        try:
+            payload = request.get_json(silent=True) or {}
+            got_login = str(payload.get("login", "")).strip()
+            got_password = str(payload.get("password", "")).strip()
+        except Exception:
+            got_login = ""
+            got_password = ""
+        expected_login, expected_password = _admin_login_password()
+        if got_login != expected_login or got_password != expected_password:
+            return jsonify({"error": "Неверный логин или пароль"}), 403
+        sid = _admin_session_create()
+        return jsonify({"ok": True, "session_id": sid})
+
+    @application.route("/api/admin/logout", methods=["POST"])
+    def api_admin_logout():
+        sid = request.headers.get("X-Admin-Session", "").strip() or request.args.get(
+            "admin_session", ""
+        ).strip()
+        _admin_session_delete(sid)
+        return jsonify({"ok": True})
+
     @application.route("/api/refresh", methods=["POST"])
     def api_refresh():
         env_err = check_db_env()
         if env_err:
             return jsonify({"error": env_err}), 503
-        access_err = check_refresh_access()
+        access_err = check_admin_access()
         if access_err:
             return jsonify({"error": access_err}), 403
 
@@ -1577,6 +2132,21 @@ def register_routes(application) -> None:
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
+    @application.route("/api/matview/refresh", methods=["POST"])
+    def api_matview_refresh():
+        env_err = check_db_env()
+        if env_err:
+            return jsonify({"error": env_err}), 503
+        access_err = check_admin_access()
+        if access_err:
+            return jsonify({"error": access_err}), 403
+        try:
+            note = _refresh_report_matview()
+            _cache_clear_all()
+            return jsonify({"ok": True, "note": note or "Матпредставление обновлено"})
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
     @application.route("/api/report")
     def api_report():
         env_err = check_db_env()
@@ -1600,7 +2170,10 @@ def register_routes(application) -> None:
             week_last = _week_arg("week_last", cfg.get("week_last", 21))
             wh_ids = _resolve_wh_ids(cfg)
             office_id = cfg.get("office_id")
-            data = build_report_data(wh_ids, office_id, year, week_prev, week_last)
+            show_all_weeks = (request.args.get("show_all_weeks", "0") == "1")
+            data = build_report_data(
+                wh_ids, office_id, year, week_prev, week_last, show_all_weeks=show_all_weeks
+            )
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
@@ -1684,7 +2257,10 @@ def register_routes(application) -> None:
             week_last = _week_arg("week_last", cfg.get("week_last", 21))
             wh_ids = _resolve_wh_ids(cfg)
             office_id = cfg.get("office_id")
-            report = build_report_data(wh_ids, office_id, year, week_prev, week_last)
+            show_all_weeks = (request.args.get("show_all_weeks", "0") == "1")
+            report = build_report_data(
+                wh_ids, office_id, year, week_prev, week_last, show_all_weeks=show_all_weeks
+            )
             blob = export_report_xlsx(report, year, week_prev, week_last)
             filename = f"write_offs_{year}_{week_prev}_{week_last}.xlsx"
             return send_file(
