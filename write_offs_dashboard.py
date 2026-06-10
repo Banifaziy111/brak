@@ -36,6 +36,7 @@ if _env_file.exists():
 
 CACHE_TTL_SEC = int(os.environ.get("REPORT_CACHE_TTL_SEC", "120"))
 WEEKS_CACHE_TTL_SEC = int(os.environ.get("WEEKS_CACHE_TTL_SEC", "300"))
+NM_CACHE_TTL_SEC = int(os.environ.get("NM_CACHE_TTL_SEC", "300"))
 MATVIEW_BOOTSTRAP_TTL_SEC = int(os.environ.get("MATVIEW_BOOTSTRAP_TTL_SEC", "600"))
 _CACHE_LOCK = RLock()
 _CACHE: dict[str, tuple[float, Any]] = {}
@@ -898,6 +899,95 @@ def export_report_xlsx(report: dict, year: int, week_prev: int, week_last: int) 
     return stream.getvalue()
 
 
+def export_nomenclature_xlsx(payload: dict[str, Any]) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Номенклатура"
+
+    fill_header = PatternFill("solid", fgColor="1F4E79")
+    fill_total = PatternFill("solid", fgColor="D9E2F3")
+    border = Border(
+        left=Side(style="thin", color="B4B4B4"),
+        right=Side(style="thin", color="B4B4B4"),
+        top=Side(style="thin", color="B4B4B4"),
+        bottom=Side(style="thin", color="B4B4B4"),
+    )
+    font_header = Font(color="FFFFFF", bold=True, size=10)
+    font_bold = Font(bold=True, size=10)
+    align_center = Alignment(horizontal="center", vertical="center")
+    align_right = Alignment(horizontal="right", vertical="center")
+
+    latest_year = payload.get("latest_year")
+    latest_week = payload.get("latest_week")
+    ws.append(["Кол-во брака по номенклатуре", "", "Год", latest_year, "Неделя", latest_week])
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=2)
+    for c in range(1, 7):
+        cell = ws.cell(1, c)
+        cell.fill = fill_total
+        cell.font = font_bold
+        cell.alignment = align_center
+        cell.border = border
+
+    headers = ["Номенклатура", "1 корпус", "2 корпус", "3 корпус", "Итог"]
+    ws.append(headers)
+    hrow = ws.max_row
+    for i in range(1, len(headers) + 1):
+        cell = ws.cell(hrow, i)
+        cell.fill = fill_header
+        cell.font = font_header
+        cell.alignment = align_center
+        cell.border = border
+
+    rows = payload.get("rows") or []
+    for r in rows:
+        ws.append(
+            [
+                r.get("nomenclature"),
+                r.get("corpus_1", 0),
+                r.get("corpus_2", 0),
+                r.get("corpus_3", 0),
+                r.get("total", 0),
+            ]
+        )
+        # Keep data rows lightweight for speed on big exports.
+
+    totals = payload.get("totals") or {}
+    ws.append(
+        [
+            "Итого",
+            totals.get("corpus_1", 0),
+            totals.get("corpus_2", 0),
+            totals.get("corpus_3", 0),
+            totals.get("total", 0),
+        ]
+    )
+    tr = ws.max_row
+    for c in range(1, 6):
+        cell = ws.cell(tr, c)
+        cell.fill = fill_total
+        cell.font = font_bold
+        cell.border = border
+        if c == 1:
+            cell.alignment = align_center
+        else:
+            cell.number_format = "# ##0"
+            cell.alignment = align_right
+
+    ws.column_dimensions[get_column_letter(1)].width = 18
+    ws.column_dimensions[get_column_letter(2)].width = 14
+    ws.column_dimensions[get_column_letter(3)].width = 14
+    ws.column_dimensions[get_column_letter(4)].width = 14
+    ws.column_dimensions[get_column_letter(5)].width = 14
+
+    stream = BytesIO()
+    wb.save(stream)
+    return stream.getvalue()
+
+
 def fetch_available_weeks(
     year: int,
     office_id: int | None,
@@ -954,6 +1044,11 @@ def fetch_nomenclature_counts_latest_week(
       nomenclature (nm_id) | 1 корпус | 2 корпус | 3 корпус | итог
     Metric is quantity of defect records (COUNT(*)).
     """
+    cache_key = f"nm_latest:{office_id}:{year if year is not None else 'all'}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     cfg = load_config()
     wh_catalog = cfg.get("wh_catalog") or []
     # Map wh_id -> corpus number (1/2/3) using catalog.
@@ -1099,12 +1194,14 @@ def fetch_nomenclature_counts_latest_week(
 
     latest_year = int(wk[0]) if wk else None
     latest_week = int(wk[1]) if wk else None
-    return {
+    payload = {
         "latest_year": latest_year,
         "latest_week": latest_week,
         "rows": matrix_rows,
         "totals": totals,
     }
+    _cache_set(cache_key, payload, NM_CACHE_TTL_SEC)
+    return payload
 
 
 def fetch_top(
@@ -2415,7 +2512,10 @@ tr.total td { background: #eef2ff; font-weight: 700; }
 </nav>
 <div class="wrap">
   <section class="panel">
-    <div class="toolbar"><a class="btn" href="/">На главную</a></div>
+    <div class="toolbar">
+      <a class="btn" href="/">На главную</a>
+      <button type="button" class="btn" id="btnNmExport">Экспорт XLSX</button>
+    </div>
     <h2>Последняя неделя: Номенклатура × Корпуса</h2>
     <div class="meta" id="meta">Загрузка…</div>
     <table>
@@ -2477,6 +2577,28 @@ async function loadData() {
   }
 }
 
+async function exportNomenclatureXlsx() {
+  const meta = document.getElementById('meta');
+  try {
+    meta.textContent = 'Готовим XLSX...';
+    const r = await fetch('/api/nomenclature/export/xlsx');
+    if (!r.ok) throw new Error(await r.text());
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'nomenclature_latest_week.xlsx';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    meta.textContent = 'XLSX сформирован';
+  } catch (e) {
+    meta.textContent = 'Ошибка экспорта: ' + (e.message || e);
+  }
+}
+
+document.getElementById('btnNmExport').addEventListener('click', exportNomenclatureXlsx);
 loadData();
 </script>
 </body>
@@ -2784,6 +2906,45 @@ def register_routes(application) -> None:
                 year=year,
             )
             return jsonify(data)
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
+    @application.route("/api/nomenclature/export/xlsx")
+    def api_nomenclature_export_xlsx():
+        env_err = check_db_env()
+        if env_err:
+            return jsonify({"error": env_err}), 503
+        try:
+            cfg = _cfg()
+            year = request.args.get("year", type=int)
+            payload = fetch_nomenclature_counts_latest_week(
+                office_id=cfg.get("office_id"),
+                year=year,
+            )
+            limit = request.args.get("limit", type=int)
+            if limit and limit > 0:
+                rows = (payload.get("rows") or [])[:limit]
+                payload = {
+                    "latest_year": payload.get("latest_year"),
+                    "latest_week": payload.get("latest_week"),
+                    "rows": rows,
+                    "totals": {
+                        "corpus_1": sum(int(r.get("corpus_1", 0)) for r in rows),
+                        "corpus_2": sum(int(r.get("corpus_2", 0)) for r in rows),
+                        "corpus_3": sum(int(r.get("corpus_3", 0)) for r in rows),
+                        "total": sum(int(r.get("total", 0)) for r in rows),
+                    },
+                }
+            blob = export_nomenclature_xlsx(payload)
+            y = payload.get("latest_year") or "na"
+            w = payload.get("latest_week") or "na"
+            filename = f"nomenclature_{y}_{w}.xlsx"
+            return send_file(
+                BytesIO(blob),
+                as_attachment=True,
+                download_name=filename,
+                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
