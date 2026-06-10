@@ -109,6 +109,7 @@ def _ensure_report_matview() -> None:
             EXTRACT(WEEK FROM date)::int AS week_no,
             office_id,
             wh_id,
+            nm_id,
             cnt_org,
             reason_id,
             COALESCE(reason_descr, '—') AS reason_descr,
@@ -118,10 +119,10 @@ def _ensure_report_matview() -> None:
             MAX(date) AS max_date
         FROM brak_team.write_offs
         WHERE date IS NOT NULL
-        GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+        GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9
     """
     idx = [
-        f"CREATE UNIQUE INDEX IF NOT EXISTS write_offs_weekly_mv_uq ON {mv} (iso_year, week_no, office_id, wh_id, cnt_org, reason_id, reason_descr, parent_name)",
+        f"CREATE UNIQUE INDEX IF NOT EXISTS write_offs_weekly_mv_uq ON {mv} (iso_year, week_no, office_id, wh_id, nm_id, cnt_org, reason_id, reason_descr, parent_name)",
         f"CREATE INDEX IF NOT EXISTS write_offs_weekly_mv_filter_idx ON {mv} (iso_year, office_id, wh_id, week_no, cnt_org)",
         f"CREATE INDEX IF NOT EXISTS write_offs_weekly_mv_week_idx ON {mv} (iso_year, week_no)",
     ]
@@ -129,6 +130,35 @@ def _ensure_report_matview() -> None:
         with get_conn() as conn:
             conn.autocommit = True
             cur = conn.cursor()
+            cur.execute("SELECT to_regclass(%s)", (mv,))
+            mv_regclass = cur.fetchone()
+            if mv_regclass and mv_regclass[0]:
+                cur.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = split_part(%s, '.', 1)
+                      AND table_name = split_part(%s, '.', 2)
+                    """,
+                    (mv, mv),
+                )
+                cols = {str(r[0]) for r in cur.fetchall()}
+                required = {
+                    "iso_year",
+                    "week_no",
+                    "office_id",
+                    "wh_id",
+                    "nm_id",
+                    "cnt_org",
+                    "reason_id",
+                    "reason_descr",
+                    "parent_name",
+                    "amount_sum",
+                    "rows_cnt",
+                    "max_date",
+                }
+                if not required.issubset(cols):
+                    cur.execute(f"DROP MATERIALIZED VIEW IF EXISTS {mv} CASCADE")
             cur.execute(ddl)
             for stmt in idx:
                 cur.execute(stmt)
@@ -176,6 +206,7 @@ def _report_source() -> dict[str, str]:
             return {
                 "table": _matview_name(),
                 "week_expr": "week_no",
+                "isoyear_expr": "iso_year",
                 "amount_expr": "amount_sum",
                 "year_clause": "iso_year = %s",
                 "base_not_null_clause": "",
@@ -188,6 +219,7 @@ def _report_source() -> dict[str, str]:
     return {
         "table": "brak_team.write_offs",
         "week_expr": "EXTRACT(WEEK FROM date)::int",
+        "isoyear_expr": "EXTRACT(ISOYEAR FROM date)::int",
         "amount_expr": "amount",
         "year_clause": "date >= %s AND date < %s",
         "base_not_null_clause": "date IS NOT NULL",
@@ -851,6 +883,145 @@ def fetch_available_weeks(
     weeks = [int(r[0]) for r in rows]
     _cache_set(key, weeks, WEEKS_CACHE_TTL_SEC)
     return weeks
+
+
+def fetch_nomenclature_counts_latest_week(
+    *,
+    office_id: int | None,
+    year: int | None,
+) -> dict[str, Any]:
+    """
+    Matrix for latest week:
+      nomenclature (nm_id) | 1 корпус | 2 корпус | 3 корпус | итог
+    Metric is quantity of defect records (COUNT(*)).
+    """
+    cfg = load_config()
+    wh_catalog = cfg.get("wh_catalog") or []
+    # Map wh_id -> corpus number (1/2/3) using catalog.
+    wh_to_corpus: dict[int, int] = {}
+    for w in wh_catalog:
+        try:
+            wid = int(w.get("wh_id"))
+        except Exception:
+            continue
+        corpus_raw = w.get("corpus")
+        try:
+            corpus = int(corpus_raw) if corpus_raw is not None else 0
+        except Exception:
+            corpus = 0
+        if corpus in (1, 2, 3):
+            wh_to_corpus[wid] = corpus
+
+    src = _report_source()
+    clauses: list[str] = []
+    if src["base_not_null_clause"]:
+        clauses.append(src["base_not_null_clause"])
+    clauses.append("nm_id IS NOT NULL")
+    params: list[Any] = []
+    if office_id is not None:
+        clauses.append("office_id = %s")
+        params.append(office_id)
+    if year is not None:
+        if _use_report_matview() and src["table"] != "brak_team.write_offs":
+            clauses.append(src["year_clause"])
+            params.append(year)
+        else:
+            y_start = date.fromisocalendar(year, 1, 1)
+            y_end = date.fromisocalendar(year + 1, 1, 1)
+            clauses.append(src["year_clause"])
+            params.extend([y_start, y_end])
+
+    where = " WHERE " + " AND ".join(clauses)
+    week_expr = src["week_expr"]
+    year_expr = src.get("isoyear_expr", "EXTRACT(ISOYEAR FROM date)::int")
+    rows_expr = "rows_cnt" if src["table"] != "brak_team.write_offs" else "1"
+    sql = f"""
+        WITH base AS (
+            SELECT
+                {year_expr} AS iso_year,
+                {week_expr} AS week_no,
+                wh_id,
+                nm_id,
+                {rows_expr}::bigint AS rows_cnt
+            FROM {src["table"]}
+            {where}
+        ),
+        lw AS (
+            SELECT iso_year, week_no
+            FROM base
+            GROUP BY iso_year, week_no
+            ORDER BY iso_year DESC, week_no DESC
+            LIMIT 1
+        )
+        SELECT b.nm_id, b.wh_id, COALESCE(SUM(b.rows_cnt), 0)::bigint AS cnt
+        FROM base b
+        JOIN lw ON lw.iso_year = b.iso_year AND lw.week_no = b.week_no
+        GROUP BY b.nm_id, b.wh_id
+        ORDER BY b.nm_id, b.wh_id
+    """
+    sql_week = f"""
+        WITH base AS (
+            SELECT
+                {year_expr} AS iso_year,
+                {week_expr} AS week_no
+            FROM {src["table"]}
+            {where}
+        )
+        SELECT iso_year, week_no
+        FROM base
+        GROUP BY iso_year, week_no
+        ORDER BY iso_year DESC, week_no DESC
+        LIMIT 1
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql_week, params)
+        wk = cur.fetchone()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+    by_nm: dict[int, dict[str, int]] = {}
+    for nm_id, wh_id, cnt in rows:
+        nm = int(nm_id)
+        corpus = wh_to_corpus.get(int(wh_id), 0)
+        if nm not in by_nm:
+            by_nm[nm] = {"c1": 0, "c2": 0, "c3": 0, "total": 0}
+        if corpus == 1:
+            by_nm[nm]["c1"] += int(cnt)
+        elif corpus == 2:
+            by_nm[nm]["c2"] += int(cnt)
+        elif corpus == 3:
+            by_nm[nm]["c3"] += int(cnt)
+        by_nm[nm]["total"] += int(cnt)
+
+    matrix_rows = [
+        {
+            "nomenclature": nm,
+            "corpus_1": vals["c1"],
+            "corpus_2": vals["c2"],
+            "corpus_3": vals["c3"],
+            "total": vals["total"],
+        }
+        for nm, vals in by_nm.items()
+        if vals["total"] > 0
+    ]
+    matrix_rows.sort(key=lambda x: (-x["total"], x["nomenclature"]))
+
+    totals = {
+        "corpus_1": sum(r["corpus_1"] for r in matrix_rows),
+        "corpus_2": sum(r["corpus_2"] for r in matrix_rows),
+        "corpus_3": sum(r["corpus_3"] for r in matrix_rows),
+        "total": sum(r["total"] for r in matrix_rows),
+    }
+
+    latest_year = int(wk[0]) if wk else None
+    latest_week = int(wk[1]) if wk else None
+    return {
+        "latest_year": latest_year,
+        "latest_week": latest_week,
+        "rows": matrix_rows,
+        "totals": totals,
+    }
 
 
 def fetch_top(
@@ -1608,6 +1779,7 @@ tr.total td { background: #eef2ff; }
     <button type="button" id="btnAdminLogin" class="secondary">Вход админа</button>
     <button type="button" id="btnAdminLogout" class="export">Выход админа</button>
     <button type="button" id="btnToggleWeeks" class="secondary">Показать все недели</button>
+    <button type="button" id="btnNomenclature" class="secondary">Номенклатура</button>
     <button type="button" id="btnApply" class="secondary">Применить</button>
     <button type="button" id="btnAllWh" class="secondary">Все WH</button>
     <button type="button" id="btnExportXlsx" class="export">Экспорт XLSX</button>
@@ -1712,6 +1884,9 @@ function init() {
     showAllWeeks = !showAllWeeks;
     updateWeeksToggleLabel();
     loadReport();
+  };
+  document.getElementById('btnNomenclature').onclick = () => {
+    window.location.href = '/nomenclature';
   };
   document.getElementById('btnApply').onclick = loadReport;
   document.getElementById('btnRefreshData').onclick = refreshData;
@@ -2015,6 +2190,105 @@ init();
 """
 
 
+NOMENCLATURE_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Кол-во брака по номенклатуре</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.45 Inter, "Segoe UI", Roboto, Arial, sans-serif; background: #f3f6fb; color: #0f172a; }
+header { background: linear-gradient(100deg, #0f4c81 0%, #2563eb 55%, #1d4ed8 100%); color: #fff; padding: 12px 16px; }
+header h1 { margin: 0; font-size: 20px; font-weight: 700; }
+.wrap { padding: 14px 12px; }
+.panel { background: #fff; border: 1px solid #dbe4f0; border-radius: 12px; box-shadow: 0 10px 28px rgba(15,23,42,.08); overflow: hidden; }
+.panel h2 { margin: 0; padding: 10px 12px; font-size: 14px; border-bottom: 1px solid #e2e8f0; background: #eff6ff; color: #1e3a8a; }
+.toolbar { padding: 10px 12px; border-bottom: 1px solid #e2e8f0; background: #fff; }
+.btn { display: inline-block; padding: 8px 12px; border-radius: 8px; border: 1px solid #bfd2ff; background: #eef4ff; color: #1e40af; text-decoration: none; font-size: 12px; font-weight: 600; }
+.btn:hover { background: #dbeafe; border-color: #93c5fd; }
+.meta { padding: 10px 12px; font-size: 13px; color: #334155; border-bottom: 1px solid #e2e8f0; }
+table { width: 100%; border-collapse: collapse; }
+th, td { border: 1px solid #e2e8f0; padding: 8px 10px; }
+th { background: #f8fafc; color: #334155; text-align: left; font-size: 12px; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+tr.total td { background: #eef2ff; font-weight: 700; }
+.muted { color: #64748b; font-size: 12px; }
+</style>
+</head>
+<body>
+<header><h1>Кол-во брака по номенклатуре</h1></header>
+<div class="wrap">
+  <section class="panel">
+    <div class="toolbar"><a class="btn" href="/">На главную</a></div>
+    <h2>Последняя неделя: Номенклатура × Корпуса</h2>
+    <div class="meta" id="meta">Загрузка…</div>
+    <table>
+      <thead>
+        <tr>
+          <th>Номенклатура</th>
+          <th class="num">1 корпус</th>
+          <th class="num">2 корпус</th>
+          <th class="num">3 корпус</th>
+          <th class="num">Итог</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <div class="meta muted">Метрика: количество записей брака по `nm_id` за последнюю доступную ISO-неделю.</div>
+  </section>
+</div>
+<script>
+function fmtInt(v) { return Number(v || 0).toLocaleString('ru-RU'); }
+function fmtPct(v) { return Number(v || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+
+async function loadData() {
+  const meta = document.getElementById('meta');
+  const tbody = document.getElementById('tbody');
+  tbody.innerHTML = '';
+  try {
+    const r = await fetch('/api/nomenclature/latest');
+    const raw = await r.text();
+    if (!r.ok) throw new Error(raw || r.statusText);
+    const data = JSON.parse(raw);
+    const rows = data.rows || [];
+    rows.forEach((it) => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${it.nomenclature ?? '—'}</td>
+        <td class="num">${fmtInt(it.corpus_1)}</td>
+        <td class="num">${fmtInt(it.corpus_2)}</td>
+        <td class="num">${fmtInt(it.corpus_3)}</td>
+        <td class="num">${fmtInt(it.total)}</td>
+      `;
+      tbody.appendChild(tr);
+    });
+    const totalTr = document.createElement('tr');
+    totalTr.className = 'total';
+    const t = data.totals || {};
+    totalTr.innerHTML = `
+      <td>Итого</td>
+      <td class="num">${fmtInt(t.corpus_1)}</td>
+      <td class="num">${fmtInt(t.corpus_2)}</td>
+      <td class="num">${fmtInt(t.corpus_3)}</td>
+      <td class="num">${fmtInt(t.total)}</td>
+    `;
+    tbody.appendChild(totalTr);
+    const y = data.latest_year ?? '—';
+    const w = data.latest_week ?? '—';
+    meta.textContent = `Период: ${y}-я неделя ${w} · номенклатур: ${fmtInt(rows.length)} · записей: ${fmtInt(t.total)}`;
+  } catch (e) {
+    meta.textContent = 'Ошибка загрузки: ' + (e.message || e);
+  }
+}
+
+loadData();
+</script>
+</body>
+</html>
+"""
+
+
 def register_routes(application) -> None:
     from datetime import datetime, timezone
 
@@ -2056,6 +2330,10 @@ def register_routes(application) -> None:
             return page
         except Exception as exc:
             return f"<pre>Index error: {exc}</pre>", 500
+
+    @application.route("/nomenclature")
+    def nomenclature_page():
+        return NOMENCLATURE_HTML
 
     @application.route("/api/admin/login", methods=["POST"])
     def api_admin_login():
@@ -2296,6 +2574,22 @@ def register_routes(application) -> None:
     @application.route("/api/wh_ids")
     def api_wh_ids():
         return jsonify(fetch_wh_list(_cfg().get("office_id")))
+
+    @application.route("/api/nomenclature/latest")
+    def api_nomenclature_latest():
+        env_err = check_db_env()
+        if env_err:
+            return jsonify({"error": env_err}), 503
+        try:
+            cfg = _cfg()
+            year = request.args.get("year", type=int)
+            data = fetch_nomenclature_counts_latest_week(
+                office_id=cfg.get("office_id"),
+                year=year,
+            )
+            return jsonify(data)
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
 
     @application.route("/health")
     def health():
