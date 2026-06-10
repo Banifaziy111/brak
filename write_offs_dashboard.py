@@ -2001,12 +2001,6 @@ async function loadReport() {
       ? 'все корпуса (' + ALL_WH_IDS.length + ' WH)'
       : sorted.map(whLabel).join('; ');
     status.textContent = `WH: ${label} · расчёт нед. ${data.week_prev}→${data.week_last}, в таблице: ${(data.weeks || []).join(', ')} (${data.year})`;
-    if (data.weeks && data.weeks.length) {
-      availableWeeks = data.weeks;
-      const p = document.getElementById('weekPrev').value;
-      const l = document.getElementById('weekLast').value;
-      fillWeekSelects(data.weeks, parseInt(p, 10), parseInt(l, 10));
-    }
   } catch (e) {
     status.textContent = 'Ошибка: ' + e.message;
   } finally {
