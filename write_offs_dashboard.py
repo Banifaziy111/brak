@@ -1761,23 +1761,37 @@ header {
   background: linear-gradient(100deg, #0f4c81 0%, #2563eb 55%, #1d4ed8 100%);
   border-bottom: 1px solid rgba(255, 255, 255, 0.25);
   box-shadow: 0 8px 24px rgba(29, 78, 216, 0.22);
+  padding: 18px 20px 20px;
 }
-header h1 { font-size: 22px; font-weight: 700; letter-spacing: .2px; }
+header h1 { font-size: 24px; font-weight: 750; letter-spacing: .2px; }
+.header-subtitle {
+  margin-top: 5px;
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 13px;
+}
 .toolbar {
-  margin: 14px 12px 10px;
+  margin: 16px 14px 12px;
   border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--surface);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.92);
   box-shadow: var(--shadow);
-  padding: 14px;
+  padding: 16px;
+  backdrop-filter: blur(8px);
 }
 .group {
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 14px;
   background: var(--surface-2);
-  padding: 10px 12px;
+  padding: 12px 14px;
 }
-.group legend { color: #1e3a8a; font-size: 12px; text-transform: uppercase; letter-spacing: .3px; }
+.group legend {
+  color: #1e3a8a;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: .6px;
+  padding: 0 6px;
+}
 .building-btns button {
   border: 1px solid #bfd2ff;
   background: #eef4ff;
@@ -1793,11 +1807,18 @@ header h1 { font-size: 22px; font-weight: 700; letter-spacing: .2px; }
 }
 .wh-grid {
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 12px;
   background: #fff;
-  padding: 8px;
+  padding: 9px;
+  box-shadow: inset 0 1px 2px rgba(15,23,42,.04);
 }
-.wh-grid label { font-size: 12px; color: #1f2937; padding: 2px 1px; }
+.wh-grid label {
+  font-size: 12px;
+  color: #1f2937;
+  padding: 3px 4px;
+  border-radius: 7px;
+}
+.wh-grid label:hover { background: #f8fafc; }
 .wh-grid .corpus-hdr { color: #1d4ed8; border-bottom: 1px dashed #c7d2fe; }
 .weeks input, .weeks select {
   border: 1px solid #cbd5e1;
@@ -1808,7 +1829,7 @@ header h1 { font-size: 22px; font-weight: 700; letter-spacing: .2px; }
 .weeks .hint { color: var(--muted); }
 .actions { gap: 10px; }
 .actions button {
-  border-radius: 9px;
+  border-radius: 10px;
   font-size: 12px;
   font-weight: 650;
   border: 1px solid transparent;
@@ -1824,18 +1845,18 @@ header h1 { font-size: 22px; font-weight: 700; letter-spacing: .2px; }
 .actions button.export { background: #f8fafc; color: #334155; border-color: #dbe4f0; }
 .actions button.export:hover { background: #f1f5f9; }
 #status {
-  margin: 0 12px 10px;
+  margin: 0 14px 12px;
   background: #fff;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 12px;
   padding: 10px 12px;
   color: #334155;
   box-shadow: 0 3px 10px rgba(15, 23, 42, 0.06);
 }
-.grid { gap: 14px; padding: 0 12px 12px; }
+.grid { gap: 14px; padding: 0 14px 14px; }
 .panel {
   border: 1px solid var(--line);
-  border-radius: var(--radius);
+  border-radius: 16px;
   background: var(--surface);
   box-shadow: var(--shadow);
   overflow: hidden;
@@ -1847,16 +1868,18 @@ header h1 { font-size: 22px; font-weight: 700; letter-spacing: .2px; }
   font-size: 13px;
   font-weight: 700;
   text-align: left;
+  padding: 10px 12px;
 }
 .panel .table-scroll {
   background: #fff;
   border-top: 1px solid #eef2f7;
 }
-th, td { border-color: #e2e8f0; }
+th, td { border-color: #e2e8f0; padding: 5px 8px; }
 th {
   background: #f8fafc;
   color: #334155;
   font-size: 11px;
+  position: relative;
 }
 th.metric {
   background: #eff6ff;
@@ -1865,6 +1888,9 @@ th.metric {
 td.metric { background: #f8fafc; color: #0f172a; }
 th.sticky { background: #f8fafc; z-index: 4; }
 td.sticky { background: #fff; }
+tbody tr:not(.total):nth-child(even) td { background-color: #fbfdff; }
+tbody tr:not(.total):hover td { background-color: #eef6ff; }
+tbody tr:not(.total):hover td.sticky { background-color: #eef6ff; }
 tr.total td { background: #eef2ff; }
 .modal h3 {
   background: linear-gradient(100deg, #1d4ed8, #2563eb);
@@ -1875,7 +1901,7 @@ tr.total td { background: #eef2ff; }
   box-shadow: 0 0 0 3px rgba(59,130,246,.16);
 }
 .topnav {
-  margin: 10px 12px 8px;
+  margin: 12px 14px 10px;
   display: flex;
   gap: 8px;
 }
@@ -1886,37 +1912,51 @@ tr.total td { background: #eef2ff; }
   background: #eef4ff;
   color: #1e40af;
   border-radius: 999px;
-  font-weight: 600;
+  font-weight: 700;
   font-size: 12px;
+  box-shadow: 0 1px 0 rgba(15,23,42,.04);
 }
-.topnav a.active { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
+.topnav a:hover { background: #dbeafe; border-color: #93c5fd; }
+.topnav a.active {
+  background: linear-gradient(180deg, #2563eb, #1d4ed8);
+  color: #fff;
+  border-color: #1d4ed8;
+}
 .kpis {
-  margin: 0 12px 10px;
+  margin: 0 14px 12px;
   display: grid;
   grid-template-columns: repeat(4, minmax(180px, 1fr));
-  gap: 10px;
+  gap: 12px;
 }
 .kpi {
-  background: #fff;
+  background: linear-gradient(180deg, #ffffff, #f8fbff);
   border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 10px 12px;
-  box-shadow: 0 3px 10px rgba(15,23,42,.06);
+  border-radius: 14px;
+  padding: 12px 14px;
+  box-shadow: 0 6px 18px rgba(15,23,42,.07);
 }
-.kpi .k { color: #64748b; font-size: 11px; margin-bottom: 4px; }
-.kpi .v { color: #0f172a; font-size: 18px; font-weight: 700; }
+.kpi .k { color: #64748b; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .35px; margin-bottom: 5px; }
+.kpi .v { color: #0f172a; font-size: 22px; font-weight: 800; font-variant-numeric: tabular-nums; }
 .table-tools {
-  margin: 0 12px 8px;
+  margin: 0 14px 10px;
   background: #fff;
   border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 8px 12px;
+  border-radius: 12px;
+  padding: 10px 12px;
+  box-shadow: 0 3px 10px rgba(15,23,42,.05);
 }
 .table-tools input {
   border: 1px solid #cbd5e1;
   border-radius: 8px;
   padding: 6px 8px;
   min-width: 260px;
+}
+.table-tools input:focus,
+.weeks input:focus,
+.weeks select:focus {
+  outline: none;
+  border-color: #60a5fa;
+  box-shadow: 0 0 0 3px rgba(59,130,246,.14);
 }
 
 @media (max-width: 900px) {
@@ -1931,7 +1971,10 @@ tr.total td { background: #eef2ff; }
 </style>
 </head>
 <body>
-<header><h1>Отчёт по браку — write_offs</h1></header>
+<header>
+  <h1>Отчёт по браку — write_offs</h1>
+  <div class="header-subtitle">ТОП-20 дефектов и категорий по корпусам, неделям и динамике</div>
+</header>
 <nav class="topnav">
   <a href="/" class="active">Дашборд</a>
   <a href="/nomenclature">Номенклатура</a>
