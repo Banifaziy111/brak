@@ -31,6 +31,32 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "wh_buildings.json"
 
+DETAIL_COLUMNS = (
+    ("shk_id", "ШК"),
+    ("date", "Дата"),
+    ("type", "Тип"),
+    ("total_cost", "Стоимость"),
+    ("amount", "Сумма"),
+    ("share", "Доля"),
+    ("office_id", "Офис"),
+    ("wh_id", "Блок"),
+    ("nm_id", "nm_id"),
+    ("subject_name", "Предмет"),
+    ("parent_name", "Родитель"),
+    ("title", "Наименование"),
+    ("brand_name", "Бренд"),
+    ("state_id", "state_id"),
+    ("reason_id", "reason_id"),
+    ("reason_descr", "Причина"),
+    ("seller_id", "seller_id"),
+    ("supplier_id", "supplier_id"),
+    ("owner_product", "Владелец"),
+    ("cnt_org", "cnt_org"),
+    ("cnt_ors", "cnt_ors"),
+    ("cnt_ocr", "cnt_ocr"),
+)
+DETAIL_COL_NAMES = [c[0] for c in DETAIL_COLUMNS]
+
 _env_file = ROOT / ".env"
 if _env_file.exists():
     load_dotenv(_env_file)
@@ -502,6 +528,133 @@ def fetch_db_stats(
         "row_count": int(row[0]) if row else 0,
         "max_date": row[1] if row else None,
         "total_amount": to_float(row[2]) if row else 0.0,
+    }
+
+
+def _detail_int_arg(args: Any, name: str) -> int | None:
+    raw = args.get(name, "")
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise QueryParamError(f"Некорректный {name}: значение должно быть числом") from exc
+
+
+def _detail_positive_int_arg(
+    args: Any,
+    name: str,
+    default: int,
+    *,
+    min_value: int,
+    max_value: int,
+) -> int:
+    value = _detail_int_arg(args, name)
+    if value is None:
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+def build_detail_where(args: Any) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    office_id = _detail_int_arg(args, "office_id")
+    if office_id is not None:
+        clauses.append("office_id = %s")
+        params.append(office_id)
+
+    wh_id = _detail_int_arg(args, "wh_id")
+    wh_raw = str(args.get("wh_ids", "") or "").strip()
+    if wh_id is not None and wh_raw:
+        raise QueryParamError("Передайте только один фильтр: wh_id или wh_ids")
+    if wh_id is not None:
+        clauses.append("wh_id = %s")
+        params.append(wh_id)
+    elif wh_raw:
+        wh_ids = parse_wh_ids(wh_raw)
+        if wh_ids:
+            clauses.append("wh_id = ANY(%s)")
+            params.append(wh_ids)
+
+    row_type = str(args.get("type", "") or "").strip()
+    if row_type:
+        clauses.append("type = %s")
+        params.append(row_type)
+
+    date_from = str(args.get("date_from", "") or "").strip()
+    if date_from:
+        clauses.append("date >= %s")
+        params.append(date_from)
+
+    date_to = str(args.get("date_to", "") or "").strip()
+    if date_to:
+        clauses.append("date < %s::date + interval '1 day'")
+        params.append(date_to)
+
+    search = str(args.get("search", "") or "").strip()
+    if search:
+        like = f"%{search}%"
+        clauses.append(
+            "("
+            "title ILIKE %s OR reason_descr ILIKE %s OR brand_name ILIKE %s OR "
+            "subject_name ILIKE %s OR parent_name ILIKE %s OR "
+            "nm_id::text ILIKE %s OR shk_id::text ILIKE %s"
+            ")"
+        )
+        params.extend([like, like, like, like, like, like, like])
+
+    if not clauses:
+        return "", params
+    return " WHERE " + " AND ".join(clauses), params
+
+
+def _detail_row_to_dict(row: tuple[Any, ...]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for idx, col in enumerate(DETAIL_COL_NAMES):
+        value = row[idx]
+        if isinstance(value, Decimal):
+            value = float(value)
+        elif hasattr(value, "isoformat"):
+            value = value.isoformat()
+        out[col] = value
+    return out
+
+
+def fetch_detail_page(
+    args: Any,
+    *,
+    page: int,
+    per_page: int,
+) -> dict[str, Any]:
+    where_sql, params = build_detail_where(args)
+    cols = ", ".join(DETAIL_COL_NAMES)
+    offset = (page - 1) * per_page
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(f"SELECT COUNT(*)::bigint FROM brak_team.write_offs{where_sql}", params)
+        total_row = cur.fetchone()
+        total = int(total_row[0]) if total_row else 0
+        cur.execute(
+            f"""
+            SELECT {cols}
+            FROM brak_team.write_offs
+            {where_sql}
+            ORDER BY date DESC NULLS LAST, shk_id
+            LIMIT %s OFFSET %s
+            """,
+            [*params, per_page, offset],
+        )
+        rows = cur.fetchall()
+
+    pages = max(1, (total + per_page - 1) // per_page)
+    return {
+        "columns": [{"key": key, "label": label} for key, label in DETAIL_COLUMNS],
+        "rows": [_detail_row_to_dict(tuple(r)) for r in rows],
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "pages": pages,
     }
 
 
@@ -1017,6 +1170,99 @@ def export_nomenclature_xlsx(payload: dict[str, Any]) -> bytes:
     ws.column_dimensions[get_column_letter(4)].width = 14
     ws.column_dimensions[get_column_letter(5)].width = 14
 
+    stream = BytesIO()
+    wb.save(stream)
+    return stream.getvalue()
+
+
+def export_detail_xlsx(args: Any, *, limit: int) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    where_sql, params = build_detail_where(args)
+    cols = ", ".join(DETAIL_COL_NAMES)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT {cols}
+            FROM brak_team.write_offs
+            {where_sql}
+            ORDER BY date DESC NULLS LAST, shk_id
+            LIMIT %s
+            """,
+            [*params, limit],
+        )
+        rows = cur.fetchall()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Детализация"
+
+    fill_header = PatternFill("solid", fgColor="1F4E79")
+    border = Border(
+        left=Side(style="thin", color="D9E2F3"),
+        right=Side(style="thin", color="D9E2F3"),
+        top=Side(style="thin", color="D9E2F3"),
+        bottom=Side(style="thin", color="D9E2F3"),
+    )
+    font_header = Font(color="FFFFFF", bold=True, size=10)
+    align_header = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    align_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    align_right = Alignment(horizontal="right", vertical="center")
+
+    ws.append([label for _, label in DETAIL_COLUMNS])
+    for col in range(1, len(DETAIL_COLUMNS) + 1):
+        cell = ws.cell(1, col)
+        cell.fill = fill_header
+        cell.font = font_header
+        cell.alignment = align_header
+        cell.border = border
+
+    numeric_cols = {
+        "shk_id",
+        "total_cost",
+        "amount",
+        "share",
+        "office_id",
+        "wh_id",
+        "nm_id",
+        "state_id",
+        "reason_id",
+        "seller_id",
+        "supplier_id",
+        "cnt_org",
+        "cnt_ors",
+        "cnt_ocr",
+    }
+    for row in rows:
+        ws.append(list(row))
+        row_idx = ws.max_row
+        for col_idx, col_name in enumerate(DETAIL_COL_NAMES, start=1):
+            cell = ws.cell(row_idx, col_idx)
+            cell.border = border
+            if col_name in numeric_cols:
+                cell.alignment = align_right
+                cell.number_format = "# ##0.00" if col_name in ("amount", "total_cost", "share") else "# ##0"
+            else:
+                cell.alignment = align_left
+
+    widths = {
+        "shk_id": 14,
+        "date": 16,
+        "type": 12,
+        "title": 42,
+        "reason_descr": 34,
+        "subject_name": 24,
+        "parent_name": 24,
+        "brand_name": 22,
+        "owner_product": 24,
+    }
+    for idx, col_name in enumerate(DETAIL_COL_NAMES, start=1):
+        ws.column_dimensions[get_column_letter(idx)].width = widths.get(col_name, 14)
+
+    ws.freeze_panes = "A2"
     stream = BytesIO()
     wb.save(stream)
     return stream.getvalue()
@@ -1978,6 +2224,7 @@ tr.total td { background: #eef2ff; }
 <nav class="topnav">
   <a href="/" class="active">Дашборд</a>
   <a href="/nomenclature">Номенклатура</a>
+  <a href="/details">Детализация</a>
 </nav>
 <div class="toolbar">
   <fieldset class="group">
@@ -1998,6 +2245,7 @@ tr.total td { background: #eef2ff; }
     <button type="button" id="btnAdminLogout" class="export">Выход админа</button>
     <button type="button" id="btnToggleWeeks" class="secondary">Показать все недели</button>
     <button type="button" id="btnNomenclature" class="secondary">Номенклатура</button>
+    <button type="button" id="btnDetails" class="secondary">Детализация</button>
     <button type="button" id="btnClearWh" class="export">Сбросить фильтр</button>
     <button type="button" id="btnApply" class="secondary">Применить</button>
     <button type="button" id="btnAllWh" class="secondary">Все WH</button>
@@ -2146,6 +2394,9 @@ function init() {
   };
   document.getElementById('btnNomenclature').onclick = () => {
     window.location.href = '/nomenclature';
+  };
+  document.getElementById('btnDetails').onclick = () => {
+    window.location.href = '/details';
   };
   document.getElementById('btnClearWh').onclick = () => {
     selectedWh = new Set();
@@ -2462,6 +2713,284 @@ init();
 """
 
 
+DETAILS_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Детализация write_offs</title>
+<style>
+* { box-sizing: border-box; }
+:root {
+  --bg: #f3f6fb;
+  --surface: #ffffff;
+  --surface-2: #f8fafc;
+  --text: #0f172a;
+  --muted: #64748b;
+  --line: #dbe4f0;
+  --primary: #2563eb;
+  --primary-2: #1d4ed8;
+  --shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+}
+body {
+  margin: 0;
+  font: 14px/1.45 Inter, "Segoe UI", Roboto, Arial, sans-serif;
+  background:
+    radial-gradient(1200px 520px at 0% -10%, rgba(37, 99, 235, 0.08), transparent 60%),
+    var(--bg);
+  color: var(--text);
+}
+header {
+  background: linear-gradient(100deg, #0f4c81 0%, #2563eb 55%, #1d4ed8 100%);
+  color: #fff;
+  padding: 18px 20px 20px;
+  box-shadow: 0 8px 24px rgba(29, 78, 216, 0.22);
+}
+header h1 { margin: 0; font-size: 24px; font-weight: 750; }
+.subtitle { margin-top: 5px; color: rgba(255,255,255,.82); font-size: 13px; }
+.topnav { margin: 12px 14px 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+.topnav a {
+  text-decoration: none;
+  padding: 8px 12px;
+  border: 1px solid #bfd2ff;
+  background: #eef4ff;
+  color: #1e40af;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 12px;
+}
+.topnav a:hover { background: #dbeafe; border-color: #93c5fd; }
+.topnav a.active { background: linear-gradient(180deg, #2563eb, #1d4ed8); color: #fff; border-color: #1d4ed8; }
+.filters, .meta, .panel {
+  margin: 0 14px 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+}
+.filters {
+  padding: 14px;
+  display: flex;
+  gap: 12px;
+  align-items: end;
+  flex-wrap: wrap;
+}
+.filters label {
+  display: grid;
+  gap: 4px;
+  color: #334155;
+  font-size: 12px;
+  font-weight: 700;
+}
+.filters input, .filters select {
+  min-width: 120px;
+  border: 1px solid #cbd5e1;
+  border-radius: 9px;
+  background: #fff;
+  padding: 7px 9px;
+  font: inherit;
+}
+.filters input[name="search"] { min-width: 280px; }
+.filters input:focus, .filters select:focus {
+  outline: none;
+  border-color: #60a5fa;
+  box-shadow: 0 0 0 3px rgba(59,130,246,.14);
+}
+.btn {
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 8px 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all .16s ease;
+}
+.btn:hover { transform: translateY(-1px); box-shadow: 0 8px 18px rgba(15,23,42,.12); }
+.btn.primary { background: linear-gradient(180deg, var(--primary), var(--primary-2)); color: #fff; }
+.btn.secondary { background: #f0f9ff; color: #075985; border-color: #bae6fd; }
+.btn.export { background: #f8fafc; color: #334155; border-color: #dbe4f0; }
+.meta { padding: 10px 12px; color: #334155; }
+.panel { overflow: hidden; }
+.table-wrap {
+  overflow: auto;
+  max-height: calc(100vh - 300px);
+  background: #fff;
+}
+table { width: max-content; min-width: 100%; border-collapse: collapse; }
+th, td {
+  border-bottom: 1px solid #e2e8f0;
+  padding: 6px 10px;
+  text-align: left;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #f8fafc;
+  color: #334155;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .25px;
+}
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr:nth-child(even) td { background: #fbfdff; }
+tbody tr:hover td { background: #eef6ff; }
+.pager {
+  padding: 10px 12px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  border-top: 1px solid #e2e8f0;
+  background: #f8fafc;
+}
+.pager .spacer { flex: 1; }
+.muted { color: var(--muted); }
+@media (max-width: 900px) {
+  .filters, .meta, .panel { margin-left: 10px; margin-right: 10px; }
+  .filters input[name="search"] { min-width: 220px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Полная детализация</h1>
+  <div class="subtitle">Сырые строки `brak_team.write_offs` с фильтрами, пагинацией и экспортом</div>
+</header>
+<nav class="topnav">
+  <a href="/">Дашборд</a>
+  <a href="/nomenclature">Номенклатура</a>
+  <a href="/details" class="active">Детализация</a>
+</nav>
+<form class="filters" id="filters">
+  <label>Дата от <input name="date_from" type="date"></label>
+  <label>Дата до <input name="date_to" type="date"></label>
+  <label>Офис <input name="office_id" type="number" placeholder="office_id"></label>
+  <label>WH <input name="wh_id" type="number" placeholder="wh_id"></label>
+  <label>Тип <input name="type" placeholder="type"></label>
+  <label>Поиск <input name="search" placeholder="title, причина, бренд, nm_id, shk_id"></label>
+  <label>На стр.
+    <select name="per_page">
+      <option>25</option>
+      <option selected>50</option>
+      <option>100</option>
+      <option>250</option>
+      <option>500</option>
+    </select>
+  </label>
+  <button class="btn primary" type="submit">Применить</button>
+  <button class="btn export" type="button" id="btnReset">Сбросить</button>
+  <button class="btn secondary" type="button" id="btnExport">Экспорт XLSX</button>
+</form>
+<div class="meta" id="meta">Загрузка…</div>
+<section class="panel">
+  <div class="table-wrap">
+    <table>
+      <thead><tr id="thead"></tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+  <div class="pager">
+    <button class="btn export" type="button" id="btnPrev">Назад</button>
+    <button class="btn export" type="button" id="btnNext">Вперёд</button>
+    <span class="muted" id="pageInfo"></span>
+    <span class="spacer"></span>
+    <span class="muted">Экспорт ограничен параметром limit, по умолчанию 5000 строк.</span>
+  </div>
+</section>
+<script>
+let currentPage = 1;
+let columns = [];
+
+function fmtValue(v) {
+  if (v === null || v === undefined || v === '') return '—';
+  if (typeof v === 'number') return v.toLocaleString('ru-RU');
+  return String(v);
+}
+
+function paramsFor(page) {
+  const fd = new FormData(document.getElementById('filters'));
+  const q = new URLSearchParams();
+  for (const [k, v] of fd.entries()) {
+    const value = String(v || '').trim();
+    if (value) q.set(k, value);
+  }
+  q.set('page', String(page));
+  return q;
+}
+
+function hydrateFiltersFromUrl() {
+  const q = new URLSearchParams(window.location.search);
+  const form = document.getElementById('filters');
+  for (const [k, v] of q.entries()) {
+    const el = form.elements[k];
+    if (el) el.value = v;
+  }
+  currentPage = parseInt(q.get('page') || '1', 10) || 1;
+}
+
+async function loadDetails(page = 1, pushState = true) {
+  const meta = document.getElementById('meta');
+  const tbody = document.getElementById('tbody');
+  const thead = document.getElementById('thead');
+  meta.textContent = 'Загрузка…';
+  tbody.innerHTML = '';
+  const q = paramsFor(page);
+  try {
+    const r = await fetch('/api/details?' + q);
+    const raw = await r.text();
+    if (!r.ok) throw new Error(raw || r.statusText);
+    const data = JSON.parse(raw);
+    columns = data.columns || [];
+    currentPage = data.page || page;
+    if (pushState) history.replaceState(null, '', '/details?' + q);
+    thead.innerHTML = columns.map(c => `<th>${c.label}</th>`).join('');
+    tbody.innerHTML = (data.rows || []).map(row => {
+      return '<tr>' + columns.map(c => {
+        const cls = typeof row[c.key] === 'number' ? ' class="num"' : '';
+        const value = fmtValue(row[c.key]);
+        return `<td${cls} title="${String(value).replaceAll('"', '&quot;')}">${value}</td>`;
+      }).join('') + '</tr>';
+    }).join('');
+    meta.textContent = `Всего по фильтру: ${Number(data.total || 0).toLocaleString('ru-RU')} · показано: ${(data.rows || []).length}`;
+    document.getElementById('pageInfo').textContent = `Страница ${data.page} / ${data.pages}`;
+    document.getElementById('btnPrev').disabled = data.page <= 1;
+    document.getElementById('btnNext').disabled = data.page >= data.pages;
+  } catch (e) {
+    meta.textContent = 'Ошибка загрузки: ' + (e.message || e);
+  }
+}
+
+function exportXlsx() {
+  const q = paramsFor(currentPage);
+  q.delete('page');
+  q.set('limit', '5000');
+  window.location.href = '/api/details/export/xlsx?' + q;
+}
+
+document.getElementById('filters').addEventListener('submit', (e) => {
+  e.preventDefault();
+  loadDetails(1);
+});
+document.getElementById('btnReset').addEventListener('click', () => {
+  document.getElementById('filters').reset();
+  loadDetails(1);
+});
+document.getElementById('btnExport').addEventListener('click', exportXlsx);
+document.getElementById('btnPrev').addEventListener('click', () => loadDetails(Math.max(1, currentPage - 1)));
+document.getElementById('btnNext').addEventListener('click', () => loadDetails(currentPage + 1));
+
+hydrateFiltersFromUrl();
+loadDetails(currentPage, false);
+</script>
+</body>
+</html>
+"""
+
+
 NOMENCLATURE_HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -2496,6 +3025,7 @@ tr.total td { background: #eef2ff; font-weight: 700; }
 <nav class="topnav">
   <a href="/">Дашборд</a>
   <a href="/nomenclature" class="active">Номенклатура</a>
+  <a href="/details">Детализация</a>
 </nav>
 <div class="wrap">
   <section class="panel">
@@ -2638,6 +3168,10 @@ def register_routes(application) -> None:
     @application.route("/nomenclature")
     def nomenclature_page():
         return NOMENCLATURE_HTML
+
+    @application.route("/details")
+    def details_page():
+        return DETAILS_HTML
 
     @application.route("/api/admin/login", methods=["POST"])
     def api_admin_login():
@@ -2887,6 +3421,47 @@ def register_routes(application) -> None:
     @application.route("/api/wh_ids")
     def api_wh_ids():
         return jsonify(fetch_wh_list(_cfg().get("office_id")))
+
+    @application.route("/api/details")
+    def api_details():
+        env_err = check_db_env()
+        if env_err:
+            return jsonify({"error": env_err}), 503
+        try:
+            page = _detail_positive_int_arg(
+                request.args, "page", 1, min_value=1, max_value=100000
+            )
+            per_page = _detail_positive_int_arg(
+                request.args, "per_page", 50, min_value=5, max_value=500
+            )
+            payload = fetch_detail_page(request.args, page=page, per_page=per_page)
+            return jsonify(payload)
+        except QueryParamError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
+    @application.route("/api/details/export/xlsx")
+    def api_details_export_xlsx():
+        env_err = check_db_env()
+        if env_err:
+            return jsonify({"error": env_err}), 503
+        try:
+            limit = _detail_positive_int_arg(
+                request.args, "limit", 5000, min_value=1, max_value=20000
+            )
+            blob = export_detail_xlsx(request.args, limit=limit)
+            filename = "write_offs_details.xlsx"
+            return send_file(
+                BytesIO(blob),
+                as_attachment=True,
+                download_name=filename,
+                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except QueryParamError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
 
     @application.route("/api/nomenclature/latest")
     def api_nomenclature_latest():
