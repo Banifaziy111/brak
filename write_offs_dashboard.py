@@ -2947,6 +2947,32 @@ def register_routes(application) -> None:
     def health():
         return jsonify({"status": "ok", "config": str(CONFIG_PATH.name)})
 
+    @application.route("/health/env")
+    def health_env():
+        def _state(name: str) -> str:
+            if name not in os.environ:
+                return "missing"
+            if os.environ.get(name, "").strip() == "":
+                return "empty"
+            return "set"
+
+        return jsonify(
+            {
+                "status": "ok",
+                "vercel_env": os.environ.get("VERCEL_ENV", "local"),
+                "db_env_error": check_db_env(),
+                "env": {
+                    "DATABASE_URL": _state("DATABASE_URL"),
+                    "DB_HOST": _state("DB_HOST"),
+                    "DB_PORT": _state("DB_PORT"),
+                    "DB_NAME": _state("DB_NAME"),
+                    "DB_USER": _state("DB_USER"),
+                    "DB_PASSWORD": _state("DB_PASSWORD"),
+                    "DB_SSLMODE": _state("DB_SSLMODE"),
+                },
+            }
+        )
+
     @application.route("/health/db")
     def health_db():
         env_err = check_db_env()
