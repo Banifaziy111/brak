@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import sys
 from io import BytesIO
@@ -44,9 +45,11 @@ _MV_LOCK = RLock()
 _MV_BOOTSTRAP_OK_AT = 0.0
 _MV_BOOTSTRAP_FAIL_AT = 0.0
 _MV_BOOTSTRAP_FAIL_MSG = ""
+_MV_TEMP_SUFFIX = "__new"
 _ADMIN_SESSIONS_LOCK = RLock()
 _ADMIN_SESSIONS: dict[str, float] = {}
 ADMIN_SESSION_TTL_SEC = int(os.environ.get("ADMIN_SESSION_TTL_SEC", "28800"))
+_PG_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _cache_get(key: str) -> Any | None:
@@ -93,6 +96,20 @@ def _nm_matview_name() -> str:
     ).strip() or "brak_team.write_offs_nm_weekly_mv"
 
 
+def _quote_pg_relation_name(name: str) -> str:
+    parts = [p.strip() for p in name.split(".")]
+    if len(parts) not in (1, 2) or any(not p for p in parts):
+        raise ValueError(f"Некорректное имя PostgreSQL relation: {name!r}")
+    for part in parts:
+        if not _PG_IDENTIFIER_RE.fullmatch(part):
+            raise ValueError(f"Некорректное имя PostgreSQL identifier: {part!r}")
+    return ".".join(f'"{part}"' for part in parts)
+
+
+def _relation_basename(name: str) -> str:
+    return name.split(".")[-1].strip()
+
+
 def _ensure_report_matview() -> None:
     """
     Ensures weekly aggregated materialized view exists.
@@ -109,8 +126,12 @@ def _ensure_report_matview() -> None:
             raise RuntimeError(_MV_BOOTSTRAP_FAIL_MSG or "matview bootstrap failed")
 
     mv = _matview_name()
-    ddl = f"""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS {mv} AS
+    mv_tmp = f"{mv}{_MV_TEMP_SUFFIX}"
+    mv_sql = _quote_pg_relation_name(mv)
+    mv_tmp_sql = _quote_pg_relation_name(mv_tmp)
+    mv_basename_sql = _quote_pg_relation_name(_relation_basename(mv))
+    ddl_tmp = f"""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {mv_tmp_sql} AS
         SELECT
             EXTRACT(ISOYEAR FROM date)::int AS iso_year,
             EXTRACT(WEEK FROM date)::int AS week_no,
@@ -128,25 +149,27 @@ def _ensure_report_matview() -> None:
         GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
     """
     idx = [
-        f"CREATE UNIQUE INDEX IF NOT EXISTS write_offs_weekly_mv_uq ON {mv} (iso_year, week_no, office_id, wh_id, cnt_org, reason_id, reason_descr, parent_name)",
-        f"CREATE INDEX IF NOT EXISTS write_offs_weekly_mv_filter_idx ON {mv} (iso_year, office_id, wh_id, week_no, cnt_org)",
-        f"CREATE INDEX IF NOT EXISTS write_offs_weekly_mv_week_idx ON {mv} (iso_year, week_no)",
+        f"CREATE UNIQUE INDEX IF NOT EXISTS write_offs_weekly_mv_uq ON {mv_sql} (iso_year, week_no, office_id, wh_id, cnt_org, reason_id, reason_descr, parent_name)",
+        f"CREATE INDEX IF NOT EXISTS write_offs_weekly_mv_filter_idx ON {mv_sql} (iso_year, office_id, wh_id, week_no, cnt_org)",
+        f"CREATE INDEX IF NOT EXISTS write_offs_weekly_mv_week_idx ON {mv_sql} (iso_year, week_no)",
     ]
     try:
         with get_conn() as conn:
             conn.autocommit = True
             cur = conn.cursor()
+            cur.execute(f"DROP MATERIALIZED VIEW IF EXISTS {mv_tmp_sql} CASCADE")
             cur.execute("SELECT to_regclass(%s)", (mv,))
             mv_regclass = cur.fetchone()
             if mv_regclass and mv_regclass[0]:
                 cur.execute(
                     """
-                    SELECT column_name
-                    FROM information_schema.columns
-                    WHERE table_schema = split_part(%s, '.', 1)
-                      AND table_name = split_part(%s, '.', 2)
+                    SELECT attname
+                    FROM pg_attribute
+                    WHERE attrelid = to_regclass(%s)
+                      AND attnum > 0
+                      AND NOT attisdropped
                     """,
-                    (mv, mv),
+                    (mv,),
                 )
                 cols = {str(r[0]) for r in cur.fetchall()}
                 required = {
@@ -162,10 +185,15 @@ def _ensure_report_matview() -> None:
                     "rows_cnt",
                     "max_date",
                 }
-                # If legacy structure contains nm_id, it's too granular for report queries.
                 if ("nm_id" in cols) or (not required.issubset(cols)):
-                    cur.execute(f"DROP MATERIALIZED VIEW IF EXISTS {mv} CASCADE")
-            cur.execute(ddl)
+                    cur.execute(f"DROP MATERIALIZED VIEW IF EXISTS {mv_sql} CASCADE")
+            cur.execute("SELECT to_regclass(%s)", (mv,))
+            mv_regclass = cur.fetchone()
+            if not mv_regclass or not mv_regclass[0]:
+                cur.execute(ddl_tmp)
+                cur.execute(
+                    f"ALTER MATERIALIZED VIEW {mv_tmp_sql} RENAME TO {mv_basename_sql}"
+                )
             for stmt in idx:
                 cur.execute(stmt)
         with _MV_LOCK:
@@ -183,8 +211,9 @@ def _ensure_nm_matview() -> None:
     if not _use_report_matview():
         return
     mv = _nm_matview_name()
+    mv_sql = _quote_pg_relation_name(mv)
     ddl = f"""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS {mv} AS
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {mv_sql} AS
         SELECT
             EXTRACT(ISOYEAR FROM date)::int AS iso_year,
             EXTRACT(WEEK FROM date)::int AS week_no,
@@ -199,8 +228,8 @@ def _ensure_nm_matview() -> None:
         GROUP BY 1, 2, 3, 4, 5
     """
     idx = [
-        f"CREATE UNIQUE INDEX IF NOT EXISTS write_offs_nm_weekly_mv_uq ON {mv} (iso_year, week_no, office_id, wh_id, nm_id)",
-        f"CREATE INDEX IF NOT EXISTS write_offs_nm_weekly_mv_filter_idx ON {mv} (iso_year, office_id, week_no, wh_id)",
+        f"CREATE UNIQUE INDEX IF NOT EXISTS write_offs_nm_weekly_mv_uq ON {mv_sql} (iso_year, week_no, office_id, wh_id, nm_id)",
+        f"CREATE INDEX IF NOT EXISTS write_offs_nm_weekly_mv_filter_idx ON {mv_sql} (iso_year, office_id, week_no, wh_id)",
     ]
     with get_conn() as conn:
         conn.autocommit = True
@@ -215,7 +244,9 @@ def _refresh_report_matview() -> str | None:
         return None
     _ensure_report_matview()
     mv = _matview_name()
+    mv_sql = _quote_pg_relation_name(mv)
     nm_mv = _nm_matview_name()
+    nm_mv_sql = _quote_pg_relation_name(nm_mv)
     _ensure_nm_matview()
     use_concurrently = os.environ.get(
         "WRITE_OFFS_MATVIEW_REFRESH_CONCURRENTLY", "1"
@@ -225,27 +256,23 @@ def _refresh_report_matview() -> str | None:
         cur = conn.cursor()
         if use_concurrently:
             try:
-                cur.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {mv}")
+                cur.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {mv_sql}")
                 try:
-                    cur.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {nm_mv}")
+                    cur.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {nm_mv_sql}")
                     return "Матпредставления обновлены (CONCURRENTLY)"
                 except Exception:
-                    cur.execute(f"REFRESH MATERIALIZED VIEW {nm_mv}")
+                    cur.execute(f"REFRESH MATERIALIZED VIEW {nm_mv_sql}")
                     return "Матпредставления обновлены"
             except Exception:
-                cur.execute(f"REFRESH MATERIALIZED VIEW {mv}")
-                cur.execute(f"REFRESH MATERIALIZED VIEW {nm_mv}")
+                cur.execute(f"REFRESH MATERIALIZED VIEW {mv_sql}")
+                cur.execute(f"REFRESH MATERIALIZED VIEW {nm_mv_sql}")
                 return "Матпредставления обновлены"
-        cur.execute(f"REFRESH MATERIALIZED VIEW {mv}")
-        cur.execute(f"REFRESH MATERIALIZED VIEW {nm_mv}")
+        cur.execute(f"REFRESH MATERIALIZED VIEW {mv_sql}")
+        cur.execute(f"REFRESH MATERIALIZED VIEW {nm_mv_sql}")
         return "Матпредставления обновлены"
 
 
 def _report_source() -> dict[str, str]:
-    """
-    Returns source config for reporting SQL.
-    Falls back to base table if matview is unavailable.
-    """
     if _use_report_matview():
         try:
             _ensure_report_matview()
@@ -284,7 +311,7 @@ class Row:
     def dynamics(self, week_prev: int, week_last: int) -> float | None:
         w_prev, w_last = self.amount(week_prev), self.amount(week_last)
         if w_prev == 0:
-            return None if w_last == 0 else 100.0
+            return None  # Исправлено: рост с нуля — это None, а не 100%
         return (w_last - w_prev) / w_prev * 100
 
     def average(self, week_prev: int, week_last: int) -> float:
@@ -297,8 +324,30 @@ class Row:
         return self.amount(week_last) / avg * 100
 
 
+class QueryParamError(ValueError):
+    pass
+
+
+def parse_wh_ids(raw: str) -> list[int]:
+    wh_ids: list[int] = []
+    seen: set[int] = set()
+    for item in raw.split(","):
+        part = item.strip()
+        if not part:
+            continue
+        try:
+            wh_id = int(part)
+        except (TypeError, ValueError) as exc:
+            raise QueryParamError(
+                f"Некорректный wh_ids: значение {part!r} не является числом"
+            ) from exc
+        if wh_id not in seen:
+            seen.add(wh_id)
+            wh_ids.append(wh_id)
+    return wh_ids
+
+
 def normalize_database_url(url: str) -> str:
-    """postgresql+psycopg://… → postgresql://… для psycopg2."""
     from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
     url = url.strip()
@@ -314,7 +363,6 @@ def normalize_database_url(url: str) -> str:
 
     query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k and v]
     if not query and parsed.query:
-        # обрезанный ?sslmode без значения
         pass
     fixed = parsed._replace(query=urlencode(query))
     return urlunparse(fixed)
@@ -326,7 +374,6 @@ def db_config() -> dict[str, Any]:
     user = os.environ.get("DB_USER", "").strip()
     password = os.environ.get("DB_PASSWORD", "")
 
-    # Локально: DB_* надёжнее, если DATABASE_URL в формате SQLAlchemy
     if host and user and password:
         cfg: dict[str, Any] = {
             "host": host,
@@ -459,11 +506,6 @@ def fetch_db_stats(
 
 
 def run_db_refresh() -> str | None:
-    """
-    Опционально запускает обновление источника (ETL) перед чтением отчёта.
-    DB_REFRESH_SQL — SQL на сервере (функция/REFRESH).
-    DB_REFRESH_URL — HTTP-вызов внешней выгрузки.
-  """
     import urllib.error
     import urllib.request
 
@@ -515,7 +557,6 @@ def check_refresh_access() -> str | None:
     if not token:
         return None
 
-    # Проверка токена в заголовке или query для ручного теста.
     from flask import request
 
     got = request.headers.get("X-Refresh-Token", "").strip() or request.args.get(
@@ -575,14 +616,9 @@ def check_admin_session_access() -> str | None:
 
 
 def check_admin_access() -> str | None:
-    """
-    Preferred auth: admin session from /api/admin/login.
-    Backward-compatible fallback: X-Refresh-Token.
-    """
     session_err = check_admin_session_access()
     if session_err is None:
         return None
-    # If legacy refresh token is not configured, do not bypass by fallback.
     if not os.environ.get("REFRESH_API_TOKEN", "").strip():
         return session_err
     legacy_err = check_refresh_access()
@@ -683,7 +719,6 @@ def export_report_xlsx(report: dict, year: int, week_prev: int, week_last: int) 
     if wb.active:
         wb.remove(wb.active)
 
-    # palette close to dashboard colors
     fill_header = PatternFill("solid", fgColor="1F4E79")
     fill_prev = PatternFill("solid", fgColor="E2EFDA")
     fill_last = PatternFill("solid", fgColor="FFF2CC")
@@ -741,7 +776,6 @@ def export_report_xlsx(report: dict, year: int, week_prev: int, week_last: int) 
         week_prev: int,
         week_last: int,
     ) -> None:
-        # section title
         ws.append([title])
         row_title = ws.max_row
         ws.merge_cells(start_row=row_title, start_column=1, end_row=row_title, end_column=2 + len(weeks) + 4)
@@ -751,7 +785,8 @@ def export_report_xlsx(report: dict, year: int, week_prev: int, week_last: int) 
         c.alignment = align_center
         c.border = border
 
-        headers = [("ИД" if show_id else "№"), name_header, *[str(w) for w in weeks], f"Динамика {week_last} к {week_prev}", "Доля", "Среднее 2 нед.", "% посл. к средней"]
+        # Исправлено: заголовок "Доля в ТОП-20" соответствует логике расчёта
+        headers = [("ИД" if show_id else "№"), name_header, *[str(w) for w in weeks], f"Динамика {week_last} к {week_prev}", "Доля в ТОП-20", "Среднее 2 нед.", "% посл. к средней"]
         ws.append(headers)
         hrow = ws.max_row
         for col in range(1, len(headers) + 1):
@@ -953,7 +988,6 @@ def export_nomenclature_xlsx(payload: dict[str, Any]) -> bytes:
                 r.get("total", 0),
             ]
         )
-        # Keep data rows lightweight for speed on big exports.
 
     totals = payload.get("totals") or {}
     ws.append(
@@ -993,7 +1027,9 @@ def fetch_available_weeks(
     office_id: int | None,
     wh_ids: list[int] | None,
 ) -> list[int]:
-    key = f"weeks:{year}:{office_id}:{','.join(map(str, wh_ids or []))}"
+    # Исправлено: сортируем wh_ids для корректного кэширования
+    sorted_wh = sorted(wh_ids) if wh_ids else []
+    key = f"weeks:{year}:{office_id}:{','.join(map(str, sorted_wh))}"
     cached = _cache_get(key)
     if cached is not None:
         return cached
@@ -1039,11 +1075,6 @@ def fetch_nomenclature_counts_latest_week(
     office_id: int | None,
     year: int | None,
 ) -> dict[str, Any]:
-    """
-    Matrix for latest week:
-      nomenclature (nm_id) | 1 корпус | 2 корпус | 3 корпус | итог
-    Metric is quantity of defect records (COUNT(*)).
-    """
     cache_key = f"nm_latest:{office_id}:{year if year is not None else 'all'}"
     cached = _cache_get(cache_key)
     if cached is not None:
@@ -1051,7 +1082,6 @@ def fetch_nomenclature_counts_latest_week(
 
     cfg = load_config()
     wh_catalog = cfg.get("wh_catalog") or []
-    # Map wh_id -> corpus number (1/2/3) using catalog.
     wh_to_corpus: dict[int, int] = {}
     for w in wh_catalog:
         try:
@@ -1204,113 +1234,6 @@ def fetch_nomenclature_counts_latest_week(
     return payload
 
 
-def fetch_top(
-    *,
-    group_col: str,
-    id_col: str | None,
-    wh_ids: list[int] | None,
-    office_id: int | None,
-    org0_only: bool,
-    year: int,
-    weeks: list[int],
-    week_last: int,
-    limit: int = 20,
-) -> list[Row]:
-    if group_col not in ("reason_descr", "parent_name"):
-        raise ValueError("invalid group_col")
-
-    clauses: list[str] = []
-    params: list[Any] = []
-
-    if office_id is not None:
-        clauses.append("office_id = %s")
-        params.append(office_id)
-    if wh_ids:
-        clauses.append("wh_id = ANY(%s)")
-        params.append(wh_ids)
-    if org0_only:
-        clauses.append("cnt_org = 0")
-
-    year_start = date.fromisocalendar(year, 1, 1)
-    year_end = date.fromisocalendar(year + 1, 1, 1)
-    clauses.append("date IS NOT NULL")
-    clauses.append("date >= %s")
-    clauses.append("date < %s")
-    params.extend([year_start, year_end])
-
-    where = " WHERE " + " AND ".join(clauses) if clauses else ""
-    if not weeks:
-        weeks = [week_last]
-
-    week_cols = ",\n            ".join(
-        f"COALESCE(SUM(amount) FILTER (WHERE EXTRACT(WEEK FROM date) = %s), 0) AS w_{w}"
-        for w in weeks
-    )
-
-    if id_col:
-        # Один ИД — одна строка (в БД reason_descr может отличаться при том же reason_id)
-        sql = f"""
-        SELECT
-            {id_col} AS row_id,
-            COALESCE(MAX({group_col}), '—') AS name,
-            {week_cols}
-        FROM brak_team.write_offs
-        {where}
-        GROUP BY {id_col}
-        ORDER BY w_{week_last} DESC NULLS LAST
-        LIMIT %s
-    """
-    else:
-        sql = f"""
-        SELECT
-            NULL::int AS row_id,
-            COALESCE({group_col}, '—') AS name,
-            {week_cols}
-        FROM brak_team.write_offs
-        {where}
-        GROUP BY {group_col}
-        ORDER BY w_{week_last} DESC NULLS LAST
-        LIMIT %s
-    """
-    qparams = [*weeks, *params, limit]
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(sql, qparams)
-        raw = cur.fetchall()
-
-    out: list[Row] = []
-    for r in raw:
-        amounts = {w: to_float(r[2 + i]) for i, w in enumerate(weeks)}
-        out.append(
-            Row(
-                row_id=int(r[0]) if r[0] is not None else None,
-                name=str(r[1]),
-                amounts=amounts,
-            )
-        )
-    return out
-
-
-def warm_report_cache_async(
-    wh_ids: list[int] | None,
-    office_id: int | None,
-    year: int,
-    week_prev: int,
-    week_last: int,
-) -> None:
-    import threading
-
-    def _worker() -> None:
-        try:
-            build_report_data(wh_ids, office_id, year, week_prev, week_last)
-        except Exception:
-            # warm-up best effort
-            pass
-
-    threading.Thread(target=_worker, daemon=True).start()
-
-
 def fetch_top_bundle(
     *,
     wh_ids: list[int] | None,
@@ -1320,10 +1243,6 @@ def fetch_top_bundle(
     week_last: int,
     limit: int = 20,
 ) -> dict[str, list[Row]]:
-    """
-    One SQL pass for all 4 report blocks:
-      defects / defects_org0 / categories / categories_org0
-    """
     if not weeks:
         weeks = [week_last]
 
@@ -1429,7 +1348,28 @@ ORDER BY bucket, rn
     return buckets
 
 
+def warm_report_cache_async(
+    wh_ids: list[int] | None,
+    office_id: int | None,
+    year: int,
+    week_prev: int,
+    week_last: int,
+) -> None:
+    import threading
+
+    def _worker() -> None:
+        try:
+            build_report_data(wh_ids, office_id, year, week_prev, week_last)
+        except Exception:
+            pass
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def add_shares(rows: list[Row], week_prev: int, week_last: int) -> list[dict]:
+    """
+    Доля считается от суммы ТОП-20. Сумма всех долей в таблице = 100%.
+    """
     total_last = sum(r.amount(week_last) for r in rows)
     out: list[dict] = []
     for i, r in enumerate(rows, start=1):
@@ -1452,6 +1392,9 @@ def add_shares(rows: list[Row], week_prev: int, week_last: int) -> list[dict]:
 
 
 def totals(rows: list[dict], weeks: list[int], week_prev: int, week_last: int) -> dict:
+    """
+    Для итоговой строки ТОП-20 доля всегда 100%.
+    """
     amounts = {w: sum(x["amounts"].get(w, 0) for x in rows) for w in weeks}
     w_prev = amounts.get(week_prev, 0)
     w_last = amounts.get(week_last, 0)
@@ -1463,7 +1406,7 @@ def totals(rows: list[dict], weeks: list[int], week_prev: int, week_last: int) -
         "w_prev": w_prev,
         "w_last": w_last,
         "dynamics": dyn,
-        "share": 100.0,
+        "share": 100.0,  # Всегда 100% для итога ТОП-20
         "average": avg,
         "pct_vs_avg": pct_avg,
     }
@@ -1483,7 +1426,6 @@ def heat_style(value: float | None, mode: str) -> str:
     if value is None:
         return ""
     if mode == "dynamics":
-        # рост брака — краснее
         v = max(-50, min(50, value))
         if v <= 0:
             return "background:#d4edda;color:#155724" if v < -2 else "background:#fff3cd"
@@ -1492,7 +1434,6 @@ def heat_style(value: float | None, mode: str) -> str:
         v = max(0, min(20, value))
         alpha = v / 20
         return f"background:rgba(255,199,206,{0.15 + alpha * 0.5})"
-    # pct_vs_avg
     v = value - 100
     v = max(-30, min(30, v))
     if v < -2:
@@ -1594,6 +1535,7 @@ def render_table(
             f"</tr>"
         )
 
+    # Исправлено: заголовок "Доля в ТОП-20" соответствует логике расчёта
     return f"""
 <section class="panel">
   <h2>{_e(title)}</h2>
@@ -1609,7 +1551,7 @@ def render_table(
         <th class="sticky col-name">{_e(name_header)}</th>
         {week_hdrs}
         <th class="metric">Динамика {week_last} к {week_prev}</th>
-        <th class="metric">Доля от общего брака</th>
+        <th class="metric">Доля в ТОП-20</th>
         <th class="metric">Среднее за 2 нед.</th>
         <th class="metric">% посл. к средней</th>
       </tr>
@@ -1636,9 +1578,12 @@ def build_report_data(
     weeks: list[int] | None = None,
     show_all_weeks: bool = True,
 ) -> dict:
+    # Исправлено: сортируем wh_ids и weeks для корректного кэширования
+    sorted_wh = sorted(wh_ids) if wh_ids else []
+    sorted_weeks = sorted(weeks) if weeks else []
     key = (
         f"report:{year}:{week_prev}:{week_last}:{office_id}:{int(show_all_weeks)}:"
-        f"{','.join(map(str, wh_ids or []))}:{','.join(map(str, weeks or []))}"
+        f"{','.join(map(str, sorted_wh))}:{','.join(map(str, sorted_weeks))}"
     )
     cached = _cache_get(key)
     if cached is not None:
@@ -1790,7 +1735,6 @@ td.c, td.n { text-align: right; white-space: nowrap; }
 tr.total td { background: #d9e2f3; font-weight: 600; }
 .loading { opacity: 0.5; pointer-events: none; }
 
-/* Modern UI theme overrides */
 :root {
   --bg: #f3f6fb;
   --surface: #ffffff;
@@ -2622,7 +2566,7 @@ def register_routes(application) -> None:
         wh_raw = request.args.get("wh_ids", "")
         catalog_ids = catalog_wh_ids(cfg)
         if wh_raw.strip():
-            return [int(x) for x in wh_raw.split(",") if x.strip()]
+            return parse_wh_ids(wh_raw)
         if catalog_ids:
             return catalog_ids
         return None
@@ -2718,6 +2662,8 @@ def register_routes(application) -> None:
                     "week_last": week_last,
                 }
             )
+        except QueryParamError as exc:
+            return jsonify({"error": str(exc)}), 400
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
@@ -2763,6 +2709,8 @@ def register_routes(application) -> None:
             data = build_report_data(
                 wh_ids, office_id, year, week_prev, week_last, show_all_weeks=show_all_weeks
             )
+        except QueryParamError as exc:
+            return jsonify({"error": str(exc)}), 400
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
@@ -2859,6 +2807,8 @@ def register_routes(application) -> None:
                 download_name=filename,
                 mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+        except QueryParamError as exc:
+            return jsonify({"error": str(exc)}), 400
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
@@ -2886,6 +2836,8 @@ def register_routes(application) -> None:
                     "week_last": week_last,
                 }
             )
+        except QueryParamError as exc:
+            return jsonify({"error": str(exc)}), 400
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
