@@ -3935,11 +3935,180 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: rgba(
   .toolbar.main-toolbar { grid-template-columns: 1fr; }
 }
 @media print {
-  .topnav, .toolbar, .no-print, .app-top { display: none !important; }
+  .topnav, .toolbar, .no-print, .app-top, .scrolldown, .hero-band { display: none !important; }
   body { background: #fff; color: #111; }
   .card, .kpi, .panel, .toolbar, .insight-card { background: #fff; color: #111; border-color: #ccc; }
   .card, .kpi, .panel { break-inside: avoid; }
+  [data-reveal] { opacity: 1 !important; transform: none !important; filter: none !important; }
 }
+
+/* —— Cocos-like motion / reveal —— */
+.text-accent { color: var(--primary); }
+.hero-band {
+  position: relative;
+  padding: 28px 0 36px;
+  margin: 0 0 18px;
+  border-bottom: 1px solid var(--line-soft);
+  overflow: hidden;
+}
+.hero-band::before {
+  content: "";
+  position: absolute; inset: -20% -10% auto auto;
+  width: 420px; height: 420px;
+  background: radial-gradient(circle, rgba(246,0,94,.22), transparent 65%);
+  pointer-events: none;
+  animation: heroGlow 6s ease-in-out infinite alternate;
+}
+.hero-kicker {
+  font-family: var(--display); font-size: 12px; font-weight: 500;
+  letter-spacing: .18em; text-transform: uppercase; color: var(--primary);
+  margin-bottom: 8px;
+}
+.hero-band h2 {
+  margin: 0; font-family: var(--display); font-weight: 500;
+  font-size: clamp(28px, 4vw, 42px); line-height: 1.05;
+  text-transform: uppercase; letter-spacing: .02em; color: #fff;
+}
+.hero-band .hero-lead {
+  margin: 10px 0 0; max-width: 52ch; color: var(--muted); font-size: 14px; font-weight: 400;
+}
+.scrolldown {
+  --color: #fff;
+  display: inline-flex; flex-direction: column; align-items: center; gap: 6px;
+  margin-top: 22px; color: var(--muted); text-decoration: none; font-size: 11px;
+  text-transform: uppercase; letter-spacing: .08em;
+}
+.scrolldown .chev {
+  width: 10px; height: 10px; border: solid var(--color);
+  border-width: 0 2px 2px 0; transform: rotate(45deg);
+  animation: chevronBounce 1.6s infinite;
+}
+.mod-section {
+  position: relative;
+  padding: 8px 0 22px;
+  margin: 0 0 8px;
+}
+.mod-section::after {
+  content: "";
+  display: block; width: min(50%, 520px); height: 2px;
+  margin: 22px auto 0; background: rgba(255,255,255,.55);
+}
+.mod-section.no-rule::after { display: none; }
+.section-title {
+  margin: 0 0 14px; font-family: var(--display); font-size: clamp(22px, 3vw, 32px);
+  font-weight: 500; line-height: 1; text-transform: uppercase; letter-spacing: .03em; color: #fff;
+}
+.section-title .text-accent { color: var(--primary); }
+.section-sub {
+  margin: -6px 0 14px; color: var(--muted); font-size: 13px;
+}
+.insight-card, .card, .panel, .kpi, .col, .board .card {
+  will-change: transform, opacity;
+}
+.insight-card:hover, .card:hover, .panel:hover {
+  border-color: rgba(246,0,94,.4);
+  box-shadow: 0 12px 40px rgba(246,0,94,.12);
+  transform: translateY(-2px);
+}
+.kpi:hover, .kpis .kpi:hover {
+  box-shadow: 0 10px 28px rgba(246,0,94,.16);
+}
+[data-reveal] {
+  opacity: 0;
+  transform: translateY(28px);
+  filter: blur(2px);
+  transition: opacity .7s ease, transform .7s ease, filter .7s ease;
+  transition-delay: var(--reveal-delay, 0ms);
+}
+[data-reveal="fade-down"] { transform: translateY(-28px); }
+[data-reveal="fade-left"] { transform: translateX(36px); }
+[data-reveal="fade-right"] { transform: translateX(-36px); }
+[data-reveal="flip-left"] {
+  transform: perspective(900px) rotateY(18deg) translateY(16px);
+  transform-origin: left center;
+}
+[data-reveal="zoom-in"] { transform: scale(.92); }
+[data-reveal].is-in {
+  opacity: 1;
+  transform: none;
+  filter: none;
+}
+.stagger > [data-reveal]:nth-child(1) { --reveal-delay: 0ms; }
+.stagger > [data-reveal]:nth-child(2) { --reveal-delay: 80ms; }
+.stagger > [data-reveal]:nth-child(3) { --reveal-delay: 160ms; }
+.stagger > [data-reveal]:nth-child(4) { --reveal-delay: 240ms; }
+.stagger > [data-reveal]:nth-child(5) { --reveal-delay: 320ms; }
+.stagger > [data-reveal]:nth-child(6) { --reveal-delay: 400ms; }
+.stagger > [data-reveal]:nth-child(7) { --reveal-delay: 480ms; }
+.stagger > [data-reveal]:nth-child(8) { --reveal-delay: 560ms; }
+@keyframes heroGlow {
+  from { opacity: .55; transform: translate(0,0) scale(1); }
+  to { opacity: 1; transform: translate(-24px, 18px) scale(1.08); }
+}
+@keyframes chevronBounce {
+  0%, 100% { transform: rotate(45deg) translate(0,0); opacity: .4; }
+  50% { transform: rotate(45deg) translate(4px, 4px); opacity: 1; }
+}
+@keyframes pulsePink {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(246,0,94,.35); }
+  50% { box-shadow: 0 0 0 8px rgba(246,0,94,0); }
+}
+.btn.primary { animation: pulsePink 2.8s ease-in-out infinite; }
+.btn.primary:hover { animation: none; }
+.app-top { animation: fadeDownSoft .55s ease both; }
+@keyframes fadeDownSoft {
+  from { opacity: 0; transform: translateY(-12px); }
+  to { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important; transition: none !important;
+  }
+  [data-reveal] { opacity: 1 !important; transform: none !important; filter: none !important; }
+}
+"""
+
+
+SHARED_JS = r"""
+<script>
+(function () {
+  const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let io = null;
+  function observeAll(root) {
+    const scope = root || document;
+    const nodes = scope.querySelectorAll('[data-reveal]:not(.is-in)');
+    if (reduced) {
+      nodes.forEach((el) => el.classList.add('is-in'));
+      return;
+    }
+    if (!io) {
+      io = new IntersectionObserver((entries) => {
+        entries.forEach((entry) => {
+          if (!entry.isIntersecting) return;
+          entry.target.classList.add('is-in');
+          io.unobserve(entry.target);
+        });
+      }, { threshold: 0.12, rootMargin: '0px 0px -6% 0px' });
+    }
+    nodes.forEach((el) => io.observe(el));
+  }
+  window.revealRefresh = function (root) { observeAll(root); };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => observeAll());
+  } else {
+    observeAll();
+  }
+  document.addEventListener('click', (e) => {
+    const a = e.target.closest('a.scrolldown[href^="#"]');
+    if (!a) return;
+    const id = a.getAttribute('href').slice(1);
+    const t = document.getElementById(id);
+    if (!t) return;
+    e.preventDefault();
+    t.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'start' });
+  });
+})();
+</script>
 """
 
 
@@ -3973,7 +4142,16 @@ __SHARED_CSS__
 </div></div>
 <div class="page-body">
 
-<div class="toolbar main-toolbar">
+<section class="hero-band" data-reveal="fade-down">
+  <div class="hero-kicker">Write-offs · live</div>
+  <h2>ТОП-20 <span class="text-accent">брака</span></h2>
+  <p class="hero-lead">Дефекты и категории по корпусам, динамика недель, алерты роста и покрытие — тот же отчёт, новый ритм интерфейса.</p>
+  <a class="scrolldown" href="#filters">К фильтрам <span class="chev" aria-hidden="true"></span></a>
+</section>
+
+<section class="mod-section" id="filters">
+  <h2 class="section-title" data-reveal="fade-right">Фильтры <span class="text-accent">и недели</span></h2>
+  <div class="toolbar main-toolbar" data-reveal="fade-up">
   <fieldset class="group">
     <legend>Корпус / WH</legend>
     <div class="building-btns" id="buildingBtns"></div>
@@ -4003,22 +4181,30 @@ __SHARED_CSS__
       <button type="button" id="btnRefreshData" class="secondary">Обновить данные</button>
     </div>
   </div>
-</div>
-<div class="kpis" id="kpis">
-  <div class="kpi"><div class="k">Всего брак (посл. нед.)</div><div class="v" id="kpiTotal">—</div></div>
-  <div class="kpi"><div class="k">ТОП-20 (посл. нед.)</div><div class="v" id="kpiTop20">—</div></div>
-  <div class="kpi"><div class="k">ORG0 от общего</div><div class="v" id="kpiOrg0Share">—</div><div class="spark" id="org0Spark"></div></div>
-  <div class="kpi"><div class="k">Покрытие ТОП-20</div><div class="v" id="kpiCover">—</div></div>
-  <div class="kpi"><div class="k">ТОП-20 vs ср. 4 нед.</div><div class="v" id="kpiVsAvg4">—</div></div>
-  <div class="kpi"><div class="k">YoY (та же неделя)</div><div class="v" id="kpiYoy">—</div></div>
-</div>
-<div class="freshness" id="freshnessBar">Свежесть данных: загрузка…</div>
-<div class="insight-grid">
-  <section class="insight-card">
+  </div>
+</section>
+
+<section class="mod-section" id="kpisSection">
+  <h2 class="section-title" data-reveal="fade-right">Ключевые <span class="text-accent">показатели</span></h2>
+  <div class="kpis stagger" id="kpis">
+  <div class="kpi" data-reveal="flip-left"><div class="k">Всего брак (посл. нед.)</div><div class="v" id="kpiTotal">—</div></div>
+  <div class="kpi" data-reveal="flip-left"><div class="k">ТОП-20 (посл. нед.)</div><div class="v" id="kpiTop20">—</div></div>
+  <div class="kpi" data-reveal="flip-left"><div class="k">ORG0 от общего</div><div class="v" id="kpiOrg0Share">—</div><div class="spark" id="org0Spark"></div></div>
+  <div class="kpi" data-reveal="flip-left"><div class="k">Покрытие ТОП-20</div><div class="v" id="kpiCover">—</div></div>
+  <div class="kpi" data-reveal="flip-left"><div class="k">ТОП-20 vs ср. 4 нед.</div><div class="v" id="kpiVsAvg4">—</div></div>
+  <div class="kpi" data-reveal="flip-left"><div class="k">YoY (та же неделя)</div><div class="v" id="kpiYoy">—</div></div>
+  </div>
+  <div class="freshness" id="freshnessBar" data-reveal="fade-up">Свежесть данных: загрузка…</div>
+</section>
+
+<section class="mod-section" id="insights">
+  <h2 class="section-title" data-reveal="fade-right">Аналитика <span class="text-accent">среза</span></h2>
+  <div class="insight-grid stagger">
+  <section class="insight-card" data-reveal="flip-left">
     <h3>Сравнение корпусов</h3>
     <div class="body" id="corpusCompare"><div class="muted-box">Загрузка…</div></div>
   </section>
-  <section class="insight-card">
+  <section class="insight-card" data-reveal="flip-left">
     <h3>Алерты роста</h3>
     <div class="body">
       <div class="thresholds">
@@ -4030,28 +4216,32 @@ __SHARED_CSS__
       <div id="growthAlerts"><div class="muted-box">Загрузка…</div></div>
     </div>
   </section>
-</div>
-<div class="insight-grid">
-  <section class="insight-card">
+  </div>
+  <div class="insight-grid stagger">
+  <section class="insight-card" data-reveal="fade-left">
     <h3>Сравнение недель</h3>
     <div class="body" id="periodCompare"><div class="muted-box">Загрузка…</div></div>
   </section>
-  <section class="insight-card">
+  <section class="insight-card" data-reveal="fade-left">
     <h3>Что изменило ТОП-20</h3>
     <div class="body" id="top20Churn"><div class="muted-box">Загрузка…</div></div>
   </section>
-</div>
-<div class="insight-grid">
-  <section class="insight-card">
+  </div>
+  <div class="insight-grid stagger">
+  <section class="insight-card" data-reveal="fade-up">
     <h3>Watchlist причин</h3>
     <div class="body" id="watchlistBox"><div class="muted-box">Пусто — добавьте из карточки причины</div></div>
   </section>
-  <section class="insight-card">
+  <section class="insight-card" data-reveal="fade-up">
     <h3>Корпус: ТОП причин</h3>
     <div class="body" id="corpusDrill"><div class="muted-box">Кликните по корпусу слева сверху</div></div>
   </section>
-</div>
-<div class="presets" id="presetsBar">
+  </div>
+</section>
+
+<section class="mod-section no-rule" id="reportSection">
+  <h2 class="section-title" data-reveal="fade-right">Таблица <span class="text-accent">ТОП-20</span></h2>
+  <div class="presets" id="presetsBar" data-reveal="fade-up">
   <span class="label">Пресеты:</span>
   <button type="button" data-preset="all">Все корпуса</button>
   <button type="button" data-preset="korpus_1">1 корпус</button>
@@ -4063,16 +4253,16 @@ __SHARED_CSS__
   <select id="reasonBookmarks" style="margin-left:8px;font:12px var(--font);padding:4px 8px;border:1px solid var(--line);border-radius:8px">
     <option value="">Закладки / недавние…</option>
   </select>
-</div>
-<div class="table-tools">
+  </div>
+  <div class="table-tools" data-reveal="fade-up">
   <label>Фильтр таблицы: <input type="text" id="tableSearch" placeholder="Дефект / категория / ID"></label>
   <div class="search-box" style="margin-left:12px">
     <label>Поиск в БД: <input type="text" id="globalSearch" placeholder="причина / категория / nm" autocomplete="off"></label>
     <div class="search-drop" id="searchDrop"></div>
   </div>
-</div>
-<div id="status">Загрузка…</div>
-<div id="adminModal" class="modal-overlay" aria-hidden="true">
+  </div>
+  <div id="status" data-reveal="fade-up">Загрузка…</div>
+  <div id="adminModal" class="modal-overlay" aria-hidden="true">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="adminModalTitle">
     <h3 id="adminModalTitle">Вход администратора</h3>
     <div class="body">
@@ -4089,8 +4279,9 @@ __SHARED_CSS__
       </div>
     </div>
   </div>
-</div>
-<div class="report-grid" id="reportGrid"></div>
+  </div>
+  <div class="report-grid" id="reportGrid" data-reveal="zoom-in"></div>
+</section>
 <script>
 const CONFIG = __CONFIG_JSON__;
 const CATALOG = CONFIG.wh_catalog && CONFIG.wh_catalog.length
@@ -5089,6 +5280,7 @@ async function loadReport() {
   try {
     const data = await parseApiResponse(await fetch('/api/report?' + q));
     grid.innerHTML = data.html;
+    if (typeof revealRefresh === 'function') revealRefresh(grid);
     updateKpis(data.kpis || null, data.yoy || null);
     updateOrg0Spark(data.org0_series || []);
     updateCorpusCompare(data.corpus_compare || []);
@@ -5166,7 +5358,13 @@ __SHARED_CSS__
 </div></div>
 <div class="page-body">
 
-<form class="filters" id="filters">
+<section class="hero-band" data-reveal="fade-down">
+  <div class="hero-kicker">Details · raw</div>
+  <h2>Детализация <span class="text-accent">write_offs</span></h2>
+  <p class="hero-lead">Сырые строки: клик по ячейке фильтрует, клик по заголовку сортирует.</p>
+</section>
+
+<form class="filters" id="filters" data-reveal="fade-up">
   <label>Дата от <input name="date_from" type="date"></label>
   <label>Дата до <input name="date_to" type="date"></label>
   <label>Офис <input name="office_id" type="number" placeholder="office_id"></label>
@@ -5195,9 +5393,9 @@ __SHARED_CSS__
   <button class="btn export" type="button" id="btnReset">Сбросить</button>
   <button class="btn secondary" type="button" id="btnExport">Экспорт XLSX</button>
 </form>
-<div class="chips" id="activeFilters"></div>
-<div class="meta" id="meta">Загрузка…</div>
-<section class="panel">
+<div class="chips" id="activeFilters" data-reveal="fade-up"></div>
+<div class="meta" id="meta" data-reveal="fade-up">Загрузка…</div>
+<section class="panel" data-reveal="zoom-in">
   <div class="table-wrap">
     <table>
       <thead><tr id="thead"></tr></thead>
@@ -5420,7 +5618,16 @@ __SHARED_CSS__
 </div></div>
 <div class="page-body">
 
-<div class="toolbar">
+<section class="hero-band" data-reveal="fade-down">
+  <div class="hero-kicker">Weekly · trend</div>
+  <h2>Динамика <span class="text-accent">по неделям</span></h2>
+  <p class="hero-lead">Сумма брака, доля ORG0, топ причин и heatmap — тот же срез, с появлением блоков при скролле.</p>
+  <a class="scrolldown" href="#weeklyFilters">К фильтрам <span class="chev" aria-hidden="true"></span></a>
+</section>
+
+<section class="mod-section" id="weeklyFilters">
+  <h2 class="section-title" data-reveal="fade-right">Фильтры</h2>
+  <div class="toolbar" data-reveal="fade-up">
   <label>Год <input id="year" type="number" value="2026"></label>
   <label>WH ids <input id="wh_ids" placeholder="пусто = все"></label>
   <label>Топ причин
@@ -5432,9 +5639,13 @@ __SHARED_CSS__
   </label>
   <button class="btn primary" id="btnLoad" type="button">Загрузить</button>
   <button class="btn secondary" id="btnExport" type="button">Экспорт XLSX</button>
-</div>
-<div class="meta" id="meta">Загрузка…</div>
-<section class="panel">
+  </div>
+  <div class="meta" id="meta" data-reveal="fade-up">Загрузка…</div>
+</section>
+
+<section class="mod-section">
+  <h2 class="section-title" data-reveal="fade-right">График <span class="text-accent">и таблица</span></h2>
+<section class="panel" data-reveal="zoom-in">
   <div class="chart">
     <div class="bars" id="bars"></div>
   </div>
@@ -5454,9 +5665,10 @@ __SHARED_CSS__
     </table>
   </div>
 </section>
-<section class="panel" style="margin-top:12px">
+<section class="panel" style="margin-top:12px" data-reveal="fade-up">
   <div style="padding:12px 14px 4px;font-weight:700">Heatmap: причины × недели</div>
   <div class="heatmap-wrap" style="padding:0 14px 14px" id="heatmapBox"><div class="muted">Загрузка…</div></div>
+</section>
 </section>
 <script>
 function fmt(n) { return Number(n || 0).toLocaleString('ru-RU', { maximumFractionDigits: 0 }); }
@@ -5555,6 +5767,7 @@ async function loadWeekly() {
     }).join('');
     const t = data.totals || {};
     meta.textContent = `Год ${data.year} · источник ${data.source} · всего ${fmt(t.amount_all)} ₽ · ORG0 ${fmt(t.amount_org0)} ₽ · недель ${weeks.length}`;
+    if (typeof revealRefresh === 'function') revealRefresh();
     loadHeatmap();
   } catch (e) {
     meta.textContent = 'Ошибка: ' + (e.message || e);
@@ -5611,10 +5824,16 @@ __SHARED_CSS__
 </div></div>
 <div class="page-body">
 
-<div class="meta" id="meta">Загрузка…</div>
-<div class="kpis" id="kpis"></div>
-<div class="grid">
-  <section class="card">
+<section class="hero-band" data-reveal="fade-down">
+  <div class="hero-kicker">Reason · card</div>
+  <h2>Карточка <span class="text-accent">причины</span></h2>
+  <p class="hero-lead">Тренд, топ WH / nm_id / бренды и ORG0 — данные те же, появление блоков при скролле.</p>
+</section>
+
+<div class="meta" id="meta" data-reveal="fade-up">Загрузка…</div>
+<div class="kpis stagger" id="kpis"></div>
+<div class="grid stagger">
+  <section class="card" data-reveal="flip-left">
     <h3>Динамика по неделям</h3>
     <div class="body">
       <div class="bars" id="bars"></div>
@@ -5625,15 +5844,15 @@ __SHARED_CSS__
       </div>
     </div>
   </section>
-  <section class="card">
+  <section class="card" data-reveal="flip-left">
     <h3>Топ WH (посл. нед.)</h3>
     <div class="body" id="topWh"></div>
   </section>
-  <section class="card">
+  <section class="card" data-reveal="fade-left">
     <h3>Топ nm_id</h3>
     <div class="body" id="topNm"></div>
   </section>
-  <section class="card">
+  <section class="card" data-reveal="fade-left">
     <h3>Топ бренды</h3>
     <div class="body" id="topBrands"></div>
   </section>
@@ -5714,7 +5933,7 @@ async function load(){
       ['vs ср. 4', dyn(k.vs_avg4)],
       ['Топ-3 WH', pct(c.top3_wh_share)],
       ['Топ-5 nm', pct(c.top5_nm_share)],
-    ].map(([a,b])=>`<div class="kpi"><div class="k">${a}</div><div class="v">${b}</div></div>`).join('');
+    ].map(([a,b])=>`<div class="kpi" data-reveal="flip-left"><div class="k">${a}</div><div class="v">${b}</div></div>`).join('');
     const weeks = d.weeks || [];
     const maxA = Math.max(1, ...weeks.map(w=>w.amount_all||0));
     document.getElementById('bars').innerHTML = weeks.map(w=>{
@@ -5749,6 +5968,7 @@ async function load(){
       const added = toggleWatchlist(d);
       document.getElementById('btnWatch').textContent = added ? 'В watchlist ✓' : 'В watchlist';
     };
+    if (typeof revealRefresh === 'function') revealRefresh();
   }catch(e){
     meta.textContent = 'Ошибка: ' + (e.message||e);
   }
@@ -5792,7 +6012,15 @@ __SHARED_CSS__
 </nav>
 </div></div>
 <div class="page-body">
-<div class="toolbar no-print">
+<section class="hero-band no-print" data-reveal="fade-down">
+  <div class="hero-kicker">Digest · weekly</div>
+  <h2>Дайджест <span class="text-accent">брака</span></h2>
+  <p class="hero-lead">Еженедельный срез KPI, алертов и сдвига ТОП-20 — смысл отчёта прежний.</p>
+  <a class="scrolldown" href="#digestBody">К срезу <span class="chev" aria-hidden="true"></span></a>
+</section>
+<section class="mod-section no-print" id="digestFilters">
+  <h2 class="section-title" data-reveal="fade-right">Параметры</h2>
+  <div class="toolbar no-print" data-reveal="fade-up">
   <label>Год <input id="year" type="number" value="2026"></label>
   <label>Пред. нед. <input id="week_prev" type="number"></label>
   <label>Посл. нед. <input id="week_last" type="number"></label>
@@ -5803,15 +6031,19 @@ __SHARED_CSS__
     <button class="btn" id="btnPrint" type="button">Печать / PDF</button>
     <button class="btn" id="btnDownload" type="button">Скачать HTML</button>
   </div>
-</div>
-<div class="kpis" id="kpis"></div>
-<div class="grid" id="content">
-  <section class="card"><h3>Алерты роста</h3><div class="body" id="alerts"><div class="empty">Загрузка…</div></div></section>
-  <section class="card"><h3>Сдвиг ТОП-20</h3><div class="body" id="churn"><div class="empty">Загрузка…</div></div></section>
-  <section class="card"><h3>Корпуса</h3><div class="body" id="corpus"><div class="empty">Загрузка…</div></div></section>
-  <section class="card"><h3>Крупнейшие дельты</h3><div class="body" id="compare"><div class="empty">Загрузка…</div></div></section>
-  <section class="card" style="grid-column:1 / -1"><h3>Снимок: тогда vs сейчас</h3><div class="body" id="snapshotBox"><div class="empty">Загрузка…</div></div></section>
-</div>
+  </div>
+</section>
+<section class="mod-section no-rule" id="digestBody">
+  <h2 class="section-title" data-reveal="fade-right">Срез <span class="text-accent">недели</span></h2>
+  <div class="kpis stagger" id="kpis"></div>
+  <div class="grid stagger" id="content">
+  <section class="card" data-reveal="flip-left"><h3>Алерты роста</h3><div class="body" id="alerts"><div class="empty">Загрузка…</div></div></section>
+  <section class="card" data-reveal="flip-left"><h3>Сдвиг ТОП-20</h3><div class="body" id="churn"><div class="empty">Загрузка…</div></div></section>
+  <section class="card" data-reveal="fade-left"><h3>Корпуса</h3><div class="body" id="corpus"><div class="empty">Загрузка…</div></div></section>
+  <section class="card" data-reveal="fade-left"><h3>Крупнейшие дельты</h3><div class="body" id="compare"><div class="empty">Загрузка…</div></div></section>
+  <section class="card" style="grid-column:1 / -1" data-reveal="zoom-in"><h3>Снимок: тогда vs сейчас</h3><div class="body" id="snapshotBox"><div class="empty">Загрузка…</div></div></section>
+  </div>
+</section>
 <script>
 function fmt(n){ return Number(n||0).toLocaleString('ru-RU',{maximumFractionDigits:0}); }
 function pct(n){ if(n==null) return '—'; return Number(n).toLocaleString('ru-RU',{maximumFractionDigits:1})+'%'; }
@@ -5861,7 +6093,8 @@ async function load(){
     ['ORG0 %', pct(k.org0_share), ''],
     ['vs ср.4', dyn(k.top20_vs_avg4), dynClass(k.top20_vs_avg4)],
     ['YoY', yoyVal, y.yoy_pct==null ? '' : dynClass(y.yoy_pct)],
-  ].map(([a,b,c])=>`<div class="kpi"><div class="k">${a}</div><div class="v ${c}">${b}</div></div>`).join('');
+  ].map(([a,b,c])=>`<div class="kpi" data-reveal="flip-left"><div class="k">${a}</div><div class="v ${c}">${b}</div></div>`).join('');
+  if (typeof revealRefresh === 'function') revealRefresh(document.getElementById('kpis'));
 
   const alerts = d.growth_alerts||[];
   document.getElementById('alerts').innerHTML = alerts.length
@@ -6013,14 +6246,21 @@ __SHARED_CSS__
 </nav>
 </div></div>
 <div class="page-body">
-<div class="toolbar">
+<section class="hero-band" data-reveal="fade-down">
+  <div class="hero-kicker">Actions · board</div>
+  <h2>Доска <span class="text-accent">действий</span></h2>
+  <p class="hero-lead">Алерты роста со статусами из localStorage — колонки появляются каскадом.</p>
+</section>
+<section class="mod-section no-rule">
+  <div class="toolbar" data-reveal="fade-up">
   <label>Год <input id="year" type="number" value="2026"></label>
   <label>Пред. нед. <input id="week_prev" type="number"></label>
   <label>Посл. нед. <input id="week_last" type="number"></label>
   <label>WH ids <input id="wh_ids" placeholder="пусто = каталог"></label>
   <button class="btn primary" id="btnLoad" type="button">Обновить</button>
-</div>
-<div class="board" id="board"></div>
+  </div>
+  <div class="board stagger" id="board"></div>
+</section>
 <script>
 const STATUSES = ['new','watching','escalated','closed'];
 function fmt(n){ return Number(n||0).toLocaleString('ru-RU',{maximumFractionDigits:0}); }
@@ -6053,7 +6293,7 @@ function render(alerts){
   const titles={new:'New',watching:'Watching',escalated:'Escalated',closed:'Closed'};
   document.getElementById('board').innerHTML = STATUSES.map(st=>{
     const list=groups[st]||[];
-    return `<section class="col"><h3>${titles[st]} <span class="n">${list.length}</span></h3>
+    return `<section class="col" data-reveal="flip-left"><h3>${titles[st]} <span class="n">${list.length}</span></h3>
       ${list.length?list.map(a=>`<div class="card" data-key="${a._key}">
         <div class="t">${a.label}: ${a.name}</div>
         <div class="m"><span class="dyn">${dyn(a.vs_avg4!=null?a.vs_avg4:a.dynamics)}</span> · ${fmt(a.w_prev)} → ${fmt(a.w_last)}</div>
@@ -6062,6 +6302,7 @@ function render(alerts){
       </div>`).join(''):'<div class="empty">Пусто</div>'}
     </section>`;
   }).join('');
+  if (typeof revealRefresh === 'function') revealRefresh(document.getElementById('board'));
   document.querySelectorAll('.card').forEach(card=>{
     const key=card.dataset.key;
     const persist=()=>{
@@ -6141,9 +6382,14 @@ __SHARED_CSS__
 </div></div>
 <div class="page-body">
 
-<div class="meta" id="meta">Загрузка…</div>
-<button class="btn secondary" id="btnReload" type="button">Обновить</button>
-<div class="grid" id="grid"></div>
+<section class="hero-band" data-reveal="fade-down">
+  <div class="hero-kicker">System · status</div>
+  <h2>Статус <span class="text-accent">системы</span></h2>
+  <p class="hero-lead">Окружение, база, matview и кэш — без изменения смысла проверок.</p>
+</section>
+<div class="meta" id="meta" data-reveal="fade-up">Загрузка…</div>
+<button class="btn secondary" id="btnReload" type="button" data-reveal="fade-up">Обновить</button>
+<div class="grid stagger" id="grid"></div>
 <script>
 function cls(v) {
   if (v === 'ok' || v === 'set' || v === true) return 'ok';
@@ -6155,7 +6401,7 @@ function row(k, v, c='') {
   return `<div class="row"><span class="k">${k}</span><span class="v ${c}">${v ?? '—'}</span></div>`;
 }
 function card(title, body) {
-  return `<section class="card"><h2>${title}</h2><div class="body">${body}</div></section>`;
+  return `<section class="card" data-reveal="flip-left"><h2>${title}</h2><div class="body">${body}</div></section>`;
 }
 async function loadStatus() {
   const meta = document.getElementById('meta');
@@ -6178,6 +6424,7 @@ async function loadStatus() {
       card('Matview', row('enabled', String(mv.enabled), cls(mv.enabled)) + row('available', String(mv.available), cls(mv.available)) + row('name', mv.name) + row('row_count', mv.row_count) + row('max_year/week', `${mv.max_year ?? '—'} / ${mv.max_week ?? '—'}`) + row('last_refresh_age_sec', mv.last_refresh_age_sec) + row('last_refresh_note', mv.last_refresh_note || '—') + row('bootstrap_ok_age_sec', mv.bootstrap_ok_age_sec) + row('bootstrap_fail', mv.bootstrap_fail_msg || 'нет', mv.bootstrap_fail_msg ? 'err' : 'ok')),
       card('Cache / Admin', row('cache_entries', cache.entries) + row('report_ttl_sec', cache.report_ttl_sec) + row('weeks_ttl_sec', cache.weeks_ttl_sec) + row('refresh_token_required', String(admin.refresh_token_required)) + row('active_sessions', admin.active_sessions)),
     ].join('');
+    if (typeof revealRefresh === 'function') revealRefresh(grid);
   } catch (e) {
     meta.textContent = 'Ошибка: ' + (e.message || e);
   }
@@ -6223,7 +6470,13 @@ __SHARED_CSS__
 </div></div>
 <div class="page-body">
 
-  <section class="panel">
+<section class="hero-band" data-reveal="fade-down">
+  <div class="hero-kicker">Nomenclature · week</div>
+  <h2>Номенклатура <span class="text-accent">× корпуса</span></h2>
+  <p class="hero-lead">Количество брака по nm_id за последнюю неделю — таблица та же.</p>
+</section>
+
+  <section class="panel" data-reveal="zoom-in">
     <div class="toolbar">
       <a class="btn secondary" href="/">На главную</a>
       <button type="button" class="btn primary" id="btnNmExport">Экспорт XLSX</button>
@@ -6323,20 +6576,30 @@ loadData();
 
 
 
-def _materialize_shared_css() -> None:
+def _materialize_shared_assets() -> None:
     global DASHBOARD_HTML, DETAILS_HTML, WEEKLY_HTML, REASON_HTML
     global DIGEST_HTML, ACTIONS_HTML, STATUS_HTML, NOMENCLATURE_HTML
-    DASHBOARD_HTML = DASHBOARD_HTML.replace("__SHARED_CSS__", SHARED_CSS)
-    DETAILS_HTML = DETAILS_HTML.replace("__SHARED_CSS__", SHARED_CSS)
-    WEEKLY_HTML = WEEKLY_HTML.replace("__SHARED_CSS__", SHARED_CSS)
-    REASON_HTML = REASON_HTML.replace("__SHARED_CSS__", SHARED_CSS)
-    DIGEST_HTML = DIGEST_HTML.replace("__SHARED_CSS__", SHARED_CSS)
-    ACTIONS_HTML = ACTIONS_HTML.replace("__SHARED_CSS__", SHARED_CSS)
-    STATUS_HTML = STATUS_HTML.replace("__SHARED_CSS__", SHARED_CSS)
-    NOMENCLATURE_HTML = NOMENCLATURE_HTML.replace("__SHARED_CSS__", SHARED_CSS)
+    pages = [
+        "DASHBOARD_HTML",
+        "DETAILS_HTML",
+        "WEEKLY_HTML",
+        "REASON_HTML",
+        "DIGEST_HTML",
+        "ACTIONS_HTML",
+        "STATUS_HTML",
+        "NOMENCLATURE_HTML",
+    ]
+    g = globals()
+    for name in pages:
+        html = g[name].replace("__SHARED_CSS__", SHARED_CSS)
+        if "__SHARED_JS__" in html:
+            html = html.replace("__SHARED_JS__", SHARED_JS)
+        elif "</body>" in html:
+            html = html.replace("</body>", SHARED_JS + "\n</body>", 1)
+        g[name] = html
 
 
-_materialize_shared_css()
+_materialize_shared_assets()
 
 def register_routes(application) -> None:
     from datetime import datetime, timezone
