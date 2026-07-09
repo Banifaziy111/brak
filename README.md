@@ -15,7 +15,7 @@ python write_offs_dashboard.py
 
 Страницы: `/` дашборд, `/digest` дайджест, `/actions` доска, `/reason` карточка, `/weekly`, `/details`, `/status`, `/nomenclature`.
 
-UI: единый операционный (BI) дизайн — `SHARED_CSS` в `brak_dashboard/dashboard.py`.
+UI: тёмный control-room дизайн — `SHARED_CSS` в `brak_dashboard/dashboard.py`.
 
 ## Тесты
 
