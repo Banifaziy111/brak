@@ -13,7 +13,9 @@ python write_offs_dashboard.py
 
 Откройте http://127.0.0.1:8080/
 
-Страницы: `/` дашборд, `/digest` дайджест, `/reason` карточка, `/weekly`, `/details`, `/status`.
+Страницы: `/` дашборд, `/digest` дайджест, `/actions` доска, `/reason` карточка, `/weekly`, `/details`, `/status`, `/nomenclature`.
+
+UI: единый операционный (BI) дизайн — `SHARED_CSS` в `brak_dashboard/dashboard.py`.
 
 ## Тесты
 
