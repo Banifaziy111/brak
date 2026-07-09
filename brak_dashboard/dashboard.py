@@ -51,7 +51,7 @@ DETAIL_COLUMNS = (
     ("date", "Дата"),
     ("type", "Тип"),
     ("total_cost", "Стоимость"),
-    ("amount", "Сумма"),
+    ("amount", "Сумма факт"),
     ("share", "Доля"),
     ("office_id", "Офис"),
     ("wh_id", "Блок"),
@@ -69,11 +69,17 @@ DETAIL_COLUMNS = (
     ("cnt_org", "cnt_org"),
     ("cnt_ors", "cnt_ors"),
     ("cnt_ocr", "cnt_ocr"),
+    ("amount_obsh", "Общая ст-ть"),
+    ("summa_obshay", "summa_obshay"),
+    ("wh_name", "WH"),
+    ("source_file", "Файл"),
 )
 DETAIL_COL_NAMES = [c[0] for c in DETAIL_COLUMNS]
 DETAIL_SORTABLE = {
     "date",
     "amount",
+    "amount_obsh",
+    "summa_obshay",
     "total_cost",
     "share",
     "office_id",
@@ -90,6 +96,10 @@ DETAIL_SORTABLE = {
     "title",
     "brand_name",
     "subject_name",
+    "owner_product",
+    "state_id",
+    "wh_name",
+    "source_file",
 }
 DETAIL_CLICK_FILTERS = {
     "wh_id",
@@ -101,6 +111,11 @@ DETAIL_CLICK_FILTERS = {
     "type",
     "cnt_org",
     "brand_name",
+    "subject_name",
+    "owner_product",
+    "state_id",
+    "wh_name",
+    "source_file",
 }
 
 _env_file = ROOT / ".env"
@@ -687,6 +702,31 @@ def build_detail_where(args: Any) -> tuple[str, list[Any]]:
         clauses.append("COALESCE(brand_name, '') = %s")
         params.append(brand_name)
 
+    subject_name = str(args.get("subject_name", "") or "").strip()
+    if subject_name:
+        clauses.append("COALESCE(subject_name, '—') = %s")
+        params.append(subject_name)
+
+    owner_product = str(args.get("owner_product", "") or "").strip()
+    if owner_product:
+        clauses.append("COALESCE(owner_product, '—') = %s")
+        params.append(owner_product)
+
+    state_id = str(args.get("state_id", "") or "").strip()
+    if state_id:
+        clauses.append("COALESCE(state_id, '—') = %s")
+        params.append(state_id)
+
+    wh_name = str(args.get("wh_name", "") or "").strip()
+    if wh_name:
+        clauses.append("COALESCE(wh_name, '') = %s")
+        params.append(wh_name)
+
+    source_file = str(args.get("source_file", "") or "").strip()
+    if source_file:
+        clauses.append("COALESCE(source_file, '') = %s")
+        params.append(source_file)
+
     search = str(args.get("search", "") or "").strip()
     if search:
         like = f"%{search}%"
@@ -694,10 +734,12 @@ def build_detail_where(args: Any) -> tuple[str, list[Any]]:
             "("
             "title ILIKE %s OR reason_descr ILIKE %s OR brand_name ILIKE %s OR "
             "subject_name ILIKE %s OR parent_name ILIKE %s OR "
+            "owner_product ILIKE %s OR state_id ILIKE %s OR wh_name ILIKE %s OR "
+            "source_file ILIKE %s OR "
             "nm_id::text ILIKE %s OR shk_id::text ILIKE %s"
             ")"
         )
-        params.extend([like, like, like, like, like, like, like])
+        params.extend([like, like, like, like, like, like, like, like, like, like, like])
 
     if not clauses:
         return "", params
@@ -1090,6 +1132,103 @@ def fetch_top_wh_amounts(
         for r in raw
         if r[0] is not None
     ]
+
+
+_DIM_BREAKDOWN_SPECS: dict[str, tuple[str, str]] = {
+    "subject": ("COALESCE(NULLIF(BTRIM(subject_name), ''), '—')", "Предмет"),
+    "owner": ("COALESCE(NULLIF(BTRIM(owner_product), ''), '—')", "Владелец"),
+    "state": ("COALESCE(NULLIF(BTRIM(state_id), ''), '—')", "Статус"),
+}
+
+
+def fetch_dimension_breakdowns(
+    *,
+    wh_ids: list[int] | None,
+    office_id: int | None,
+    year: int,
+    week_prev: int,
+    week_last: int,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """TOP slices by subject / owner / state for the selected week pair (from norm view)."""
+    cache_key = (
+        f"dim_brk_v1:{year}:{week_prev}:{week_last}:{office_id}:"
+        f"{','.join(map(str, wh_ids or []))}:{limit}"
+    )
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    _ensure_brak_data_norm()
+    year_start = date.fromisocalendar(year, 1, 1)
+    year_end = date.fromisocalendar(year + 1, 1, 1)
+    clauses = ["date IS NOT NULL", "date >= %s", "date < %s"]
+    params: list[Any] = [year_start, year_end]
+    if office_id is not None:
+        clauses.append("office_id = %s")
+        params.append(office_id)
+    if wh_ids:
+        clauses.append("wh_id = ANY(%s)")
+        params.append(wh_ids)
+    where = " WHERE " + " AND ".join(clauses)
+    week_expr = "EXTRACT(WEEK FROM date)::int"
+    lim = max(3, min(20, int(limit)))
+
+    out: dict[str, Any] = {"week_prev": week_prev, "week_last": week_last, "dims": {}}
+    with get_conn() as conn:
+        cur = conn.cursor()
+        for key, (dim_expr, label) in _DIM_BREAKDOWN_SPECS.items():
+            sql = f"""
+                WITH base AS (
+                    SELECT
+                        {dim_expr} AS name,
+                        {week_expr} AS week_no,
+                        amount
+                    FROM {NORM_VIEW}
+                    {where}
+                      AND {week_expr} IN (%s, %s)
+                ),
+                agg AS (
+                    SELECT
+                        name,
+                        COALESCE(SUM(amount) FILTER (WHERE week_no = %s), 0) AS amount_prev,
+                        COALESCE(SUM(amount) FILTER (WHERE week_no = %s), 0) AS amount_last
+                    FROM base
+                    GROUP BY name
+                ),
+                tot AS (
+                    SELECT COALESCE(SUM(amount_last), 0) AS total_last FROM agg
+                )
+                SELECT
+                    a.name,
+                    a.amount_prev,
+                    a.amount_last,
+                    CASE WHEN a.amount_prev > 0
+                         THEN (a.amount_last - a.amount_prev) / a.amount_prev * 100
+                         ELSE NULL END AS dynamics,
+                    CASE WHEN t.total_last > 0
+                         THEN a.amount_last / t.total_last * 100
+                         ELSE 0 END AS share
+                FROM agg a
+                CROSS JOIN tot t
+                ORDER BY a.amount_last DESC NULLS LAST, a.name
+                LIMIT %s
+            """
+            cur.execute(sql, [*params, week_prev, week_last, week_prev, week_last, lim])
+            rows = [
+                {
+                    "name": str(r[0]),
+                    "amount_prev": to_float(r[1]),
+                    "amount_last": to_float(r[2]),
+                    "dynamics": None if r[3] is None else to_float(r[3]),
+                    "share": to_float(r[4]),
+                }
+                for r in cur.fetchall()
+            ]
+            out["dims"][key] = {"label": label, "rows": rows}
+
+    _cache_set(cache_key, out, CACHE_TTL_SEC)
+    return out
 
 
 def fetch_corpus_comparison(
@@ -1801,7 +1940,7 @@ def export_report_xlsx(report: dict, year: int, week_prev: int, week_last: int) 
     fill_heat_red = PatternFill("solid", fgColor="F8D7DA")
     fill_heat_green = PatternFill("solid", fgColor="D4EDDA")
     fill_heat_yellow = PatternFill("solid", fgColor="FFF3CD")
-    fill_heat_share = PatternFill("solid", fgColor="FAD9DE")
+    fill_heat_share = PatternFill("solid", fgColor="D5EBEA")
     fill_pct_green = PatternFill("solid", fgColor="C6EFCE")
     fill_pct_red = PatternFill("solid", fgColor="FFC7CE")
     fill_pct_yellow = PatternFill("solid", fgColor="FFEB9C")
@@ -2273,11 +2412,12 @@ def export_detail_xlsx(args: Any, *, limit: int) -> bytes:
         "shk_id",
         "total_cost",
         "amount",
+        "amount_obsh",
+        "summa_obshay",
         "share",
         "office_id",
         "wh_id",
         "nm_id",
-        "state_id",
         "reason_id",
         "seller_id",
         "supplier_id",
@@ -2293,7 +2433,11 @@ def export_detail_xlsx(args: Any, *, limit: int) -> bytes:
             cell.border = border
             if col_name in numeric_cols:
                 cell.alignment = align_right
-                cell.number_format = "# ##0.00" if col_name in ("amount", "total_cost", "share") else "# ##0"
+                cell.number_format = (
+                    "# ##0.00"
+                    if col_name in ("amount", "amount_obsh", "summa_obshay", "total_cost", "share")
+                    else "# ##0"
+                )
             else:
                 cell.alignment = align_left
 
@@ -2307,6 +2451,10 @@ def export_detail_xlsx(args: Any, *, limit: int) -> bytes:
         "parent_name": 24,
         "brand_name": 22,
         "owner_product": 24,
+        "wh_name": 22,
+        "source_file": 22,
+        "amount_obsh": 14,
+        "summa_obshay": 14,
     }
     for idx, col_name in enumerate(DETAIL_COL_NAMES, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = widths.get(col_name, 14)
@@ -3242,33 +3390,33 @@ def heat_style(value: float | None, mode: str) -> str:
         v = max(-50, min(50, value))
         if v <= 0:
             return (
-                "background:rgba(164,182,150,.18);color:#A4B696"
+                "background:rgba(63,143,107,.14);color:#3F8F6B"
                 if v < -2
-                else "background:rgba(230,192,123,.16);color:#e6c07b"
+                else "background:rgba(196,138,42,.12);color:#C48A2A"
             )
         return (
-            "background:rgba(246,0,94,.18);color:#ff4d8d"
+            "background:rgba(196,75,90,.14);color:#C44B5A"
             if v > 2
-            else "background:rgba(230,192,123,.16);color:#e6c07b"
+            else "background:rgba(196,138,42,.12);color:#C48A2A"
         )
     if mode == "share":
         v = max(0, min(20, value))
         alpha = v / 20
-        return f"background:rgba(246,0,94,{0.08 + alpha * 0.28})"
+        return f"background:rgba(47,125,122,{0.08 + alpha * 0.28})"
     v = value - 100
     v = max(-30, min(30, v))
     if v < -2:
-        return "background:rgba(164,182,150,.18);color:#A4B696"
+        return "background:rgba(63,143,107,.14);color:#3F8F6B"
     if v > 2:
-        return "background:rgba(246,0,94,.18);color:#ff4d8d"
-    return "background:rgba(230,192,123,.16);color:#e6c07b"
+        return "background:rgba(196,75,90,.14);color:#C44B5A"
+    return "background:rgba(196,138,42,.12);color:#C48A2A"
 
 
 def _week_cell_style(week: int, week_prev: int, week_last: int) -> str:
     if week == week_last:
-        return "background:rgba(246,0,94,.16);font-weight:600"
+        return "background:rgba(47,125,122,.14);font-weight:600"
     if week == week_prev:
-        return "background:rgba(164,182,150,.14)"
+        return "background:rgba(63,143,107,.10)"
     return ""
 
 
@@ -3537,47 +3685,49 @@ def build_report_data(
 
 
 SHARED_CSS = r"""
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Montserrat:wght@300;400;500;600;700&family=Oswald:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap');
 :root {
-  --bg: #000000;
-  --bg-soft: #141414;
-  --surface: #3A3A3A;
-  --surface-2: #2a2a2a;
-  --text: #ffffff;
-  --muted: #bdbdbd;
-  --line: #4a4a4a;
-  --line-soft: #2f2f2f;
-  --primary: #F6005E;
-  --primary-2: #ff4d8d;
-  --primary-soft: rgba(246, 0, 94, 0.16);
-  --ok: #A4B696;
-  --ok-soft: rgba(164, 182, 150, 0.16);
-  --warn: #e6c07b;
-  --warn-soft: rgba(230, 192, 123, 0.16);
-  --danger: #F6005E;
-  --danger-soft: rgba(246, 0, 94, 0.14);
-  --radius: 20px;
-  --radius-sm: 8px;
+  --bg: #F3F6F8;
+  --bg-soft: #EEF2F5;
+  --surface: #FFFFFF;
+  --surface-2: #F7FAFC;
+  --text: #1E2A32;
+  --muted: #6B7A86;
+  --line: #D8E0E6;
+  --line-soft: #E8EEF2;
+  --primary: #2F7D7A;
+  --primary-2: #3A9591;
+  --primary-soft: rgba(47, 125, 122, 0.12);
+  --ok: #3F8F6B;
+  --ok-soft: rgba(63, 143, 107, 0.12);
+  --warn: #C48A2A;
+  --warn-soft: rgba(196, 138, 42, 0.12);
+  --danger: #C44B5A;
+  --danger-soft: rgba(196, 75, 90, 0.10);
+  --shadow: 0 8px 28px rgba(30, 42, 50, 0.06);
+  --shadow-sm: 0 2px 10px rgba(30, 42, 50, 0.04);
+  --radius: 18px;
+  --radius-sm: 10px;
   --pad: 16px;
-  --font: "Montserrat", sans-serif;
-  --display: "Oswald", sans-serif;
+  --font: "Manrope", sans-serif;
+  --display: "Source Serif 4", Georgia, serif;
   --mono: "IBM Plex Mono", ui-monospace, monospace;
   --max: 1440px;
-  --ease: .3s ease;
+  --ease: .25s ease;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; }
 body {
-  font: 13.5px/1.45 var(--font);
+  font: 13.5px/1.5 var(--font);
   color: var(--text);
   background:
-    radial-gradient(900px 420px at 12% -10%, rgba(246,0,94,.18), transparent 55%),
-    radial-gradient(700px 360px at 90% 0%, rgba(164,182,150,.08), transparent 50%),
-    var(--bg);
+    radial-gradient(900px 420px at 8% -8%, rgba(47,125,122,.10), transparent 55%),
+    radial-gradient(720px 380px at 96% 0%, rgba(196,138,42,.07), transparent 50%),
+    linear-gradient(180deg, #F7FAFC 0%, var(--bg) 40%, #EEF3F6 100%);
   min-height: 100vh;
 }
-a { color: var(--primary-2); text-decoration: none; transition: color var(--ease); }
-a:hover { color: #fff; text-decoration: none; }
+a { color: var(--primary); text-decoration: none; transition: color var(--ease); }
+a:hover { color: var(--primary-2); text-decoration: underline; }
 .app-shell { min-height: 100vh; display: flex; flex-direction: column; width: 100%; }
 .app-frame,
 .app-top-inner,
@@ -3602,11 +3752,12 @@ a:hover { color: #fff; text-decoration: none; }
   padding-right: 0;
 }
 .app-top {
-  background: rgba(0,0,0,.88);
+  background: rgba(255,255,255,.88);
   border-bottom: 1px solid var(--line-soft);
   position: sticky; top: 0; z-index: 40;
-  backdrop-filter: blur(10px);
+  backdrop-filter: blur(12px);
   width: 100%;
+  box-shadow: var(--shadow-sm);
 }
 .app-top-inner { padding-top: 12px; padding-bottom: 0; }
 .brand-row {
@@ -3614,8 +3765,8 @@ a:hover { color: #fff; text-decoration: none; }
   gap: 12px; flex-wrap: wrap; padding-bottom: 10px; width: 100%;
 }
 .brand-row h1 {
-  margin: 0; font-family: var(--display); font-size: 22px; font-weight: 500;
-  letter-spacing: .02em; text-transform: uppercase; color: #fff;
+  margin: 0; font-family: var(--display); font-size: 22px; font-weight: 600;
+  letter-spacing: .01em; color: var(--text);
 }
 .brand-row .subtitle, .brand-row .header-subtitle {
   margin: 0; color: var(--muted); font-size: 12.5px; font-weight: 400;
@@ -3627,7 +3778,7 @@ a:hover { color: #fff; text-decoration: none; }
   width: 100%;
 }
 .topnav a {
-  color: #fff; text-decoration: none; font-weight: 400; font-size: 13px;
+  color: var(--muted); text-decoration: none; font-weight: 500; font-size: 13px;
   padding: 10px 12px; border-bottom: 2px solid transparent; border-radius: 0;
   background: transparent; transition: color var(--ease), border-color var(--ease);
 }
@@ -3638,8 +3789,8 @@ a:hover { color: #fff; text-decoration: none; }
 .page-body { padding-top: 16px; padding-bottom: 32px; flex: 1 1 auto; }
 header.app-header { background: transparent; border: 0; padding: 0 0 12px; width: 100%; }
 header.app-header h1 {
-  margin: 0; font-family: var(--display); font-size: 26px; font-weight: 500;
-  letter-spacing: .02em; text-transform: uppercase; color: #fff;
+  margin: 0; font-family: var(--display); font-size: 26px; font-weight: 600;
+  letter-spacing: .01em; color: var(--text);
 }
 header.app-header .subtitle, header.app-header .header-subtitle {
   margin-top: 4px; color: var(--muted); font-size: 13px; font-weight: 400;
@@ -3648,9 +3799,10 @@ header.app-header .subtitle, header.app-header .header-subtitle {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
   width: 100%;
   box-sizing: border-box;
-  transition: background var(--ease), border-color var(--ease), transform var(--ease);
+  transition: background var(--ease), border-color var(--ease), transform var(--ease), box-shadow var(--ease);
 }
 .toolbar, .filters {
   display: flex; flex-wrap: wrap; gap: 12px; align-items: end;
@@ -3660,6 +3812,11 @@ header.app-header .subtitle, header.app-header .header-subtitle {
   display: grid;
   grid-template-columns: minmax(280px, 2.2fr) minmax(220px, 1fr) minmax(180px, auto);
   align-items: stretch;
+  gap: 14px;
+  padding: 16px;
+  background:
+    linear-gradient(180deg, #FFFFFF 0%, #F9FBFC 100%);
+  box-shadow: var(--shadow);
 }
 .toolbar.main-toolbar .actions { justify-content: flex-start; }
 .toolbar > label, .toolbar .actions label, .filters > label, .filters label:not(.wh-grid label) {
@@ -3676,39 +3833,42 @@ header.app-header .subtitle, header.app-header .header-subtitle {
 input[type=text], input[type=number], select, textarea {
   height: 36px; border: 1px solid var(--line); border-radius: var(--radius-sm);
   padding: 0 10px; font: 13px var(--font); color: var(--text);
-  background: var(--bg-soft);
-  transition: border-color var(--ease), background var(--ease);
+  background: #fff;
+  transition: border-color var(--ease), background var(--ease), box-shadow var(--ease);
 }
 .toolbar input:focus, .toolbar select:focus, .filters input:focus, .filters select:focus,
 input[type=text]:focus, input[type=number]:focus, select:focus, textarea:focus {
   outline: none; border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
 }
-textarea { height: auto; min-height: 56px; padding: 8px 10px; color: var(--text); background: var(--bg-soft); }
+textarea { height: auto; min-height: 56px; padding: 8px 10px; color: var(--text); background: #fff; }
 .btn, .actions button, .presets button, .building-btns button, button {
-  height: 36px; border: 1px solid var(--line); background: var(--surface-2); color: var(--text);
+  height: 36px; border: 1px solid var(--line); background: #fff; color: var(--text);
   border-radius: var(--radius-sm); padding: 0 12px; font: 600 12.5px/1 var(--font);
-  cursor: pointer; white-space: nowrap; transition: background var(--ease), color var(--ease), border-color var(--ease);
+  cursor: pointer; white-space: nowrap;
+  transition: background var(--ease), color var(--ease), border-color var(--ease), box-shadow var(--ease);
 }
 .btn:hover, .actions button:hover, .presets button:hover, .building-btns button:hover, button:hover {
-  background: #444; border-color: #666;
+  background: var(--bg-soft); border-color: #C5D0D8;
 }
 .btn.primary, .actions button.primary, button.primary {
   background: var(--primary); border-color: var(--primary); color: #fff;
+  box-shadow: 0 4px 14px rgba(47,125,122,.22);
 }
 .btn.primary:hover, .actions button.primary:hover, button.primary:hover {
-  background: #fff; border-color: #fff; color: var(--primary);
+  background: var(--primary-2); border-color: var(--primary-2); color: #fff;
 }
 .btn.secondary, .actions button.secondary, button.secondary {
-  background: var(--primary-soft); border-color: rgba(246,0,94,.45); color: var(--primary-2);
+  background: var(--primary-soft); border-color: rgba(47,125,122,.28); color: var(--primary);
 }
 .btn.secondary:hover, .actions button.secondary:hover, button.secondary:hover {
-  background: #fff; border-color: #fff; color: var(--primary);
+  background: rgba(47,125,122,.18); border-color: var(--primary); color: var(--primary);
 }
 .btn.export, .actions button.export, button.export {
-  background: transparent; border-color: var(--line); color: var(--muted);
+  background: #fff; border-color: var(--line); color: var(--muted);
 }
 .btn.export:hover, .actions button.export:hover, button.export:hover {
-  border-color: var(--primary); color: var(--primary);
+  border-color: var(--primary); color: var(--primary); background: var(--primary-soft);
 }
 .kpis {
   display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
@@ -3722,14 +3882,14 @@ textarea { height: auto; min-height: 56px; padding: 8px 10px; color: var(--text)
   display: flex; flex-direction: column; justify-content: space-between;
   transition: transform var(--ease), border-color var(--ease);
 }
-.kpi:hover, .kpis .kpi:hover { border-color: rgba(246,0,94,.45); transform: translateY(-1px); }
+.kpi:hover, .kpis .kpi:hover { border-color: rgba(47,125,122,.35); transform: translateY(-1px); }
 .kpi .k {
   font-size: 10.5px; color: var(--muted); font-weight: 600;
   text-transform: uppercase; letter-spacing: .05em; line-height: 1.25;
 }
 .kpi .v {
   margin-top: 8px; font-size: 22px; font-weight: 600; font-family: var(--mono);
-  letter-spacing: -0.02em; line-height: 1.1; word-break: break-word; color: #fff;
+  letter-spacing: -0.02em; line-height: 1.1; word-break: break-word; color: var(--text);
 }
 .kpi .v.up, .dyn, .alert-item .dyn, .board .card .dyn { color: var(--danger); }
 .kpi .v.down { color: var(--ok); }
@@ -3748,9 +3908,9 @@ textarea { height: auto; min-height: 56px; padding: 8px 10px; color: var(--text)
 .pager .spacer { flex: 1 1 auto; }
 .row .val { font-family: var(--mono); font-weight: 700; white-space: nowrap; }
 .insight-card h3, .card h3, .panel h3, .card h2, .panel h2 {
-  margin: 0 0 10px; font-family: var(--display); font-size: 15px; font-weight: 500;
-  letter-spacing: .04em; text-transform: uppercase;
-  padding-bottom: 8px; border-bottom: 1px solid var(--line-soft); color: #fff;
+  margin: 0 0 10px; font-family: var(--display); font-size: 17px; font-weight: 600;
+  letter-spacing: .01em;
+  padding-bottom: 8px; border-bottom: 1px solid var(--line-soft); color: var(--text);
 }
 .insight-card .body, .card .body { min-width: 0; }
 .muted, .muted-box, .empty, .hint, .note { color: var(--muted); font-size: 12.5px; }
@@ -3786,11 +3946,11 @@ th, td {
 }
 th {
   color: var(--muted); font-size: 11px; font-weight: 600;
-  text-transform: uppercase; letter-spacing: .03em; background: rgba(0,0,0,.28);
+  text-transform: uppercase; letter-spacing: .03em; background: var(--bg-soft);
 }
 td.num, th.num, .num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
 tr.drill-row { cursor: pointer; }
-tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: rgba(246,0,94,.10); }
+tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: var(--primary-soft); }
 .delta-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .delta-table th, .delta-table td { padding: 6px 7px; border-bottom: 1px solid var(--line-soft); }
 .alert-list, .watch-list, .list { display: grid; gap: 0; width: 100%; }
@@ -3825,14 +3985,23 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: rgba(
   display:grid; grid-template-columns:110px 1fr 110px; gap:10px; align-items:center;
   padding:7px 4px; cursor:pointer; border-radius: 8px; transition: background var(--ease);
 }
-.corpus-row:hover { background: rgba(246,0,94,.10); }
+.corpus-row:hover { background: var(--primary-soft); }
 .corpus-track { height: 8px; background: var(--line-soft); border-radius: 99px; overflow:hidden; }
-.corpus-fill { height:100%; background: linear-gradient(90deg, #b00045, var(--primary)); border-radius:99px; }
+.corpus-fill { height:100%; background: linear-gradient(90deg, #5AA8A4, var(--primary)); border-radius:99px; }
 .corpus-meta { text-align:right; font-family:var(--mono); font-size:12px; font-weight:600; }
 .corpus-stats { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:10px; }
 .corpus-stat { border:1px solid var(--line); border-radius:var(--radius-sm); padding:8px; background:var(--bg-soft); }
 .corpus-stat .k { font-size:10px; color:var(--muted); font-weight:700; text-transform:uppercase; }
-.corpus-stat .v { margin-top:2px; font-size:14px; font-weight:700; font-family:var(--mono); color:#fff; }
+.corpus-stat .v { margin-top:2px; font-size:14px; font-weight:700; font-family:var(--mono); color:var(--text); }
+.dim-list { display:grid; gap:0; }
+.dim-row {
+  display:grid; grid-template-columns:1fr auto auto; gap:10px; align-items:center;
+  padding:7px 0; border-bottom:1px solid var(--line-soft); font-size:13px;
+}
+.dim-row .name { font-weight:600; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dim-row .amt { font-family:var(--mono); font-weight:700; text-align:right; white-space:nowrap; }
+.dim-row .dyn { font-family:var(--mono); font-size:12px; text-align:right; min-width:64px; }
+.dim-row .share { color:var(--muted); font-size:11px; font-weight:600; }
 .top-wh { margin-top:4px; font-size:11px; color:var(--muted); line-height:1.35; }
 .search-box { position:relative; }
 .search-drop {
@@ -3848,9 +4017,10 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: rgba(
 .building-btns { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; }
 .building-btns button.active, .presets button.active {
   background: var(--primary); color:#fff; border-color:var(--primary);
+  box-shadow: 0 3px 10px rgba(47,125,122,.2);
 }
 .building-btns button.active:hover, .presets button.active:hover {
-  background: #fff; color: var(--primary); border-color: #fff;
+  background: var(--primary-2); color: #fff; border-color: var(--primary-2);
 }
 .wh-grid {
   display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
@@ -3883,29 +4053,58 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: rgba(
   accent-color: var(--primary);
 }
 .group {
-  border:1px solid var(--line); border-radius:var(--radius-sm); padding:10px; margin:0;
-  min-width:0; flex:1 1 280px; background:var(--bg-soft); width:100%;
+  border:1px solid var(--line); border-radius:14px; padding:12px; margin:0;
+  min-width:0; flex:1 1 280px; background: rgba(255,255,255,.72); width:100%;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.8);
 }
 .toolbar.main-toolbar .group { flex: none; }
-.group legend { padding:0 4px; font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; }
+.group legend {
+  padding:0 6px; font-size:11px; font-weight:700; color: var(--primary);
+  text-transform:uppercase; letter-spacing: .04em;
+}
 .group.weeks label {
   display: flex; flex-direction: column; gap: 5px;
   font-size: 11px; font-weight: 700; color: var(--muted);
   text-transform: uppercase; letter-spacing: .04em;
 }
-.actions { display:flex; flex-direction:column; gap:8px; min-width:0; }
+.weeks-fields {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.group.weeks .hint {
+  display: block;
+  padding: 8px 10px;
+  background: var(--bg-soft);
+  border-radius: 8px;
+  border: 1px solid var(--line-soft);
+  line-height: 1.4;
+}
+.actions {
+  display:flex; flex-direction:column; gap:10px; min-width:0;
+  padding: 4px 2px;
+  justify-content: space-between;
+}
 .actions-row { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+.actions-row.admin {
+  margin-top: auto;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line);
+}
 .actions-row .label { font-size:11px; color:var(--muted); font-weight:700; text-transform:uppercase; }
 .modal-overlay {
-  position:fixed; inset:0; background:rgba(0,0,0,.72); display:none;
+  position:fixed; inset:0; background:rgba(30,42,50,.35); display:none;
   align-items:center; justify-content:center; z-index:80;
+  backdrop-filter: blur(4px);
 }
 .modal-overlay.open { display:flex; }
 .modal {
   width:min(420px,92vw); background:var(--surface); border:1px solid var(--line);
   border-radius:var(--radius); padding:16px; color: var(--text);
+  box-shadow: var(--shadow);
 }
-.modal h3 { margin:0 0 10px; font-family: var(--display); font-size:18px; font-weight:500; text-transform:uppercase; color:#fff; }
+.modal h3 { margin:0 0 10px; font-family: var(--display); font-size:18px; font-weight:600; color:var(--text); }
 .modal .body { display:grid; gap:8px; }
 .modal .row { border: 0; padding: 0; justify-content: flex-end; }
 .bars { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(18px,1fr); gap:3px; align-items:end; height:140px; }
@@ -3924,8 +4123,8 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: rgba(
 .board { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; width:100%; }
 .col { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:12px; min-height:280px; }
 .col h3 {
-  margin:0 0 10px; font-family: var(--display); font-size:13px; font-weight:500;
-  display:flex; justify-content:space-between; border:0; padding:0; color:#fff; text-transform:uppercase;
+  margin:0 0 10px; font-family: var(--display); font-size:15px; font-weight:600;
+  display:flex; justify-content:space-between; border:0; padding:0; color:var(--text);
 }
 .col h3 .n { font-family:var(--mono); color:var(--muted); }
 .board .card {
@@ -3933,7 +4132,7 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: rgba(
   padding:10px; margin-bottom:8px; cursor:pointer; background:var(--bg-soft);
   transition: background var(--ease), border-color var(--ease);
 }
-.board .card:hover { background: #222; border-color: rgba(246,0,94,.45); }
+.board .card:hover { background: #fff; border-color: rgba(47,125,122,.35); }
 .board .card .t { font-weight:700; font-size:13px; color: var(--text); }
 .board .card .m { margin-top:4px; font-size:12px; color:var(--muted); }
 .board .card select, .board .card textarea {
@@ -3978,25 +4177,25 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: rgba(
   content: "";
   position: absolute; inset: -20% -10% auto auto;
   width: 420px; height: 420px;
-  background: radial-gradient(circle, rgba(246,0,94,.22), transparent 65%);
+  background: radial-gradient(circle, rgba(47,125,122,.16), transparent 65%);
   pointer-events: none;
   animation: heroGlow 6s ease-in-out infinite alternate;
 }
 .hero-kicker {
-  font-family: var(--display); font-size: 12px; font-weight: 500;
-  letter-spacing: .18em; text-transform: uppercase; color: var(--primary);
+  font-family: var(--font); font-size: 11px; font-weight: 700;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--primary);
   margin-bottom: 8px;
 }
 .hero-band h2 {
-  margin: 0; font-family: var(--display); font-weight: 500;
-  font-size: clamp(28px, 4vw, 42px); line-height: 1.05;
-  text-transform: uppercase; letter-spacing: .02em; color: #fff;
+  margin: 0; font-family: var(--display); font-weight: 600;
+  font-size: clamp(28px, 4vw, 42px); line-height: 1.08;
+  letter-spacing: .01em; color: var(--text);
 }
 .hero-band .hero-lead {
   margin: 10px 0 0; max-width: 52ch; color: var(--muted); font-size: 14px; font-weight: 400;
 }
 .scrolldown {
-  --color: #fff;
+  --color: var(--primary);
   display: inline-flex; flex-direction: column; align-items: center; gap: 6px;
   margin-top: 22px; color: var(--muted); text-decoration: none; font-size: 11px;
   text-transform: uppercase; letter-spacing: .08em;
@@ -4014,12 +4213,12 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: rgba(
 .mod-section::after {
   content: "";
   display: block; width: min(50%, 520px); height: 2px;
-  margin: 22px auto 0; background: rgba(255,255,255,.55);
+  margin: 22px auto 0; background: linear-gradient(90deg, transparent, var(--line), transparent);
 }
 .mod-section.no-rule::after { display: none; }
 .section-title {
   margin: 0 0 14px; font-family: var(--display); font-size: clamp(22px, 3vw, 32px);
-  font-weight: 500; line-height: 1; text-transform: uppercase; letter-spacing: .03em; color: #fff;
+  font-weight: 600; line-height: 1.1; letter-spacing: .01em; color: var(--text);
 }
 .section-title .text-accent { color: var(--primary); }
 .section-sub {
@@ -4029,12 +4228,12 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: rgba(
   will-change: transform, opacity;
 }
 .insight-card:hover, .card:hover, .panel:hover {
-  border-color: rgba(246,0,94,.4);
-  box-shadow: 0 12px 40px rgba(246,0,94,.12);
+  border-color: rgba(47,125,122,.28);
+  box-shadow: 0 12px 32px rgba(30,42,50,.08);
   transform: translateY(-2px);
 }
 .kpi:hover, .kpis .kpi:hover {
-  box-shadow: 0 10px 28px rgba(246,0,94,.16);
+  box-shadow: 0 10px 24px rgba(30,42,50,.08);
 }
 [data-reveal] {
   opacity: 0;
@@ -4072,11 +4271,11 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: rgba(
   0%, 100% { transform: rotate(45deg) translate(0,0); opacity: .4; }
   50% { transform: rotate(45deg) translate(4px, 4px); opacity: 1; }
 }
-@keyframes pulsePink {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(246,0,94,.35); }
-  50% { box-shadow: 0 0 0 8px rgba(246,0,94,0); }
+@keyframes pulseAccent {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(47,125,122,.28); }
+  50% { box-shadow: 0 0 0 8px rgba(47,125,122,0); }
 }
-.btn.primary { animation: pulsePink 2.8s ease-in-out infinite; }
+.btn.primary { animation: pulseAccent 2.8s ease-in-out infinite; }
 .btn.primary:hover { animation: none; }
 .app-top { animation: fadeDownSoft .55s ease both; }
 @keyframes fadeDownSoft {
@@ -4174,6 +4373,7 @@ __SHARED_CSS__
 
 <section class="mod-section" id="filters">
   <h2 class="section-title" data-reveal="fade-right">Фильтры <span class="text-accent">и недели</span></h2>
+  <p class="section-sub" data-reveal="fade-up">Выберите корпуса и две недели для расчёта динамики — остальное подтянется автоматически.</p>
   <div class="toolbar main-toolbar" data-reveal="fade-up">
   <fieldset class="group">
     <legend>Корпус / WH</legend>
@@ -4182,10 +4382,12 @@ __SHARED_CSS__
   </fieldset>
   <fieldset class="group weeks">
     <legend>Недели (ISO)</legend>
-    <label>Год <input type="number" id="year" value="2026"></label>
-    <label>Расчёт: пред. <select id="weekPrev"></select></label>
-    <label>посл. <select id="weekLast"></select></label>
-    <span class="hint">Все недели года — в таблице (прокрутка). Динамика, доля и среднее — только по двум выбранным неделям.</span>
+    <div class="weeks-fields">
+      <label>Год <input type="number" id="year" value="2026"></label>
+      <label>Пред. неделя <select id="weekPrev"></select></label>
+      <label>Посл. неделя <select id="weekLast"></select></label>
+    </div>
+    <span class="hint">В таблице — все недели года. Динамика, доля и среднее считаются только по двум выбранным.</span>
   </fieldset>
   <div class="actions">
     <div class="actions-row">
@@ -4258,6 +4460,16 @@ __SHARED_CSS__
   <section class="insight-card" data-reveal="fade-up">
     <h3>Корпус: ТОП причин</h3>
     <div class="body" id="corpusDrill"><div class="muted-box">Кликните по корпусу слева сверху</div></div>
+  </section>
+  </div>
+  <div class="insight-grid stagger">
+  <section class="insight-card" data-reveal="fade-up">
+    <h3>ТОП предметов</h3>
+    <div class="body" id="dimSubject"><div class="muted-box">Загрузка…</div></div>
+  </section>
+  <section class="insight-card" data-reveal="fade-up">
+    <h3>Владелец / статус</h3>
+    <div class="body" id="dimOwnerState"><div class="muted-box">Загрузка…</div></div>
   </section>
   </div>
 </section>
@@ -4437,6 +4649,31 @@ function updateFreshness(f) {
   `;
 }
 
+function renderDimRows(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (!list.length) return '<div class="muted-box">Нет данных</div>';
+  return `<div class="dim-list">${list.map(r => {
+    const dyn = r.dynamics;
+    const dynCls = dyn == null ? '' : (dyn > 2 ? 'color:var(--danger)' : (dyn < -2 ? 'color:var(--ok)' : ''));
+    return `<div class="dim-row">
+      <div class="name" title="${String(r.name||'').replaceAll('"','&quot;')}">${r.name || '—'}
+        <div class="share">${fmtPct(r.share || 0)} доли</div></div>
+      <div class="amt">${fmtInt(r.amount_last)}</div>
+      <div class="dyn" style="${dynCls}">${dynText(dyn)}</div>
+    </div>`;
+  }).join('')}</div>`;
+}
+function updateDimBreakdowns(payload) {
+  const sub = document.getElementById('dimSubject');
+  const own = document.getElementById('dimOwnerState');
+  if (!sub || !own) return;
+  const dims = (payload && payload.dims) || {};
+  sub.innerHTML = renderDimRows((dims.subject || {}).rows);
+  const ownerHtml = renderDimRows((dims.owner || {}).rows);
+  const stateHtml = renderDimRows((dims.state || {}).rows);
+  own.innerHTML = `<div class="muted" style="margin-bottom:6px;font-weight:700">Владелец (FBO/FBS/1P)</div>${ownerHtml}
+    <div class="muted" style="margin:12px 0 6px;font-weight:700">Статус (state_id)</div>${stateHtml}`;
+}
 function updateCorpusCompare(rows) {
   const box = document.getElementById('corpusCompare');
   const list = Array.isArray(rows) ? rows : [];
@@ -5307,6 +5544,7 @@ async function loadReport() {
     updateKpis(data.kpis || null, data.yoy || null);
     updateOrg0Spark(data.org0_series || []);
     updateCorpusCompare(data.corpus_compare || []);
+    updateDimBreakdowns(data.dim_breakdowns || null);
     updatePeriodCompare(data.compare || null);
     updateTop20Churn(data.top20_churn || null);
     updateGrowthAlerts(data.growth_alerts || [], data.alert_thresholds || thr);
@@ -5333,6 +5571,10 @@ async function loadReport() {
   } catch (e) {
     status.textContent = 'Ошибка: ' + e.message;
     document.getElementById('corpusCompare').innerHTML = '<div class="muted-box">Не удалось загрузить сравнение</div>';
+    const dimSub = document.getElementById('dimSubject');
+    const dimOwn = document.getElementById('dimOwnerState');
+    if (dimSub) dimSub.innerHTML = '<div class="muted-box">Не удалось загрузить предметы</div>';
+    if (dimOwn) dimOwn.innerHTML = '<div class="muted-box">Не удалось загрузить владельца/статус</div>';
     document.getElementById('growthAlerts').innerHTML = '<div class="muted-box">Не удалось загрузить алерты</div>';
     document.getElementById('periodCompare').innerHTML = '<div class="muted-box">Не удалось загрузить сравнение недель</div>';
     document.getElementById('top20Churn').innerHTML = '<div class="muted-box">Не удалось загрузить сдвиг ТОП-20</div>';
@@ -5396,6 +5638,11 @@ __SHARED_CSS__
   <label>Тип <input name="type" placeholder="type"></label>
   <label>reason_id <input name="reason_id" type="number"></label>
   <label>Категория <input name="parent_name" placeholder="parent_name"></label>
+  <label>Предмет <input name="subject_name" placeholder="subject_name"></label>
+  <label>Владелец <input name="owner_product" placeholder="FBO / FBS / 1P"></label>
+  <label>Статус <input name="state_id" placeholder="SDO / UDG"></label>
+  <label>WH name <input name="wh_name" placeholder="wh_name"></label>
+  <label>Файл <input name="source_file" placeholder="source_file"></label>
   <label>nm_id <input name="nm_id" type="number"></label>
   <label>shk_id <input name="shk_id" type="number"></label>
   <label>cnt_org <input name="cnt_org" type="number"></label>
@@ -5436,8 +5683,8 @@ __SHARED_CSS__
 <script>
 let currentPage = 1;
 let columns = [];
-let clickFilters = new Set(['wh_id','office_id','nm_id','shk_id','reason_id','parent_name','type','cnt_org','brand_name']);
-const SORTABLE = new Set(['date','amount','total_cost','share','office_id','wh_id','nm_id','shk_id','reason_id','cnt_org','cnt_ors','cnt_ocr','type','parent_name','reason_descr','title','brand_name','subject_name']);
+let clickFilters = new Set(['wh_id','office_id','nm_id','shk_id','reason_id','parent_name','type','cnt_org','brand_name','subject_name','owner_product','state_id','wh_name','source_file']);
+const SORTABLE = new Set(['date','amount','amount_obsh','summa_obshay','total_cost','share','office_id','wh_id','nm_id','shk_id','reason_id','cnt_org','cnt_ors','cnt_ocr','type','parent_name','reason_descr','title','brand_name','subject_name','owner_product','state_id','wh_name','source_file']);
 
 function fmtValue(v) {
   if (v === null || v === undefined || v === '') return '—';
@@ -5706,8 +5953,8 @@ function hydrate() {
 
 function heatColor(intensity) {
   const t = Math.max(0, Math.min(1, Number(intensity || 0)));
-  const a = 0.12 + t * 0.70;
-  return `rgba(246, 0, 94, ${a.toFixed(3)})`;
+  const a = 0.10 + t * 0.55;
+  return `rgba(47, 125, 122, ${a.toFixed(3)})`;
 }
 
 async function loadHeatmap() {
@@ -6855,6 +7102,14 @@ def register_routes(application) -> None:
                 week_last=week_last,
                 cfg=cfg,
             )
+            dim_breakdowns = fetch_dimension_breakdowns(
+                wh_ids=wh_ids,
+                office_id=office_id,
+                year=year,
+                week_prev=week_prev,
+                week_last=week_last,
+                limit=10,
+            )
             growth_alerts = build_growth_alerts(
                 data,
                 min_dynamics=alert_wow,
@@ -6946,6 +7201,7 @@ def register_routes(application) -> None:
             "week_last": week_last,
             "kpis": build_kpi_payload(data),
             "corpus_compare": corpus_compare,
+            "dim_breakdowns": dim_breakdowns,
             "growth_alerts": growth_alerts,
             "alert_thresholds": {
                 "wow": alert_wow,
@@ -6972,6 +7228,7 @@ def register_routes(application) -> None:
                 "alert_min_amount": alert_min_amount,
                 "kpis": payload["kpis"],
                 "growth_alerts": growth_alerts,
+                "dim_breakdowns": dim_breakdowns,
                 "compare": extras["compare"],
                 "top20_churn": extras["top20_churn"],
                 "yoy": yoy,
