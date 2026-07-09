@@ -21,7 +21,7 @@ import sys
 from io import BytesIO
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 from threading import RLock
@@ -126,6 +126,8 @@ CACHE_TTL_SEC = int(os.environ.get("REPORT_CACHE_TTL_SEC", "120"))
 WEEKS_CACHE_TTL_SEC = int(os.environ.get("WEEKS_CACHE_TTL_SEC", "300"))
 NM_CACHE_TTL_SEC = int(os.environ.get("NM_CACHE_TTL_SEC", "300"))
 MATVIEW_BOOTSTRAP_TTL_SEC = int(os.environ.get("MATVIEW_BOOTSTRAP_TTL_SEC", "600"))
+FRESHNESS_CACHE_TTL_SEC = int(os.environ.get("FRESHNESS_CACHE_TTL_SEC", "90"))
+NORM_VIEW_BOOTSTRAP_TTL_SEC = int(os.environ.get("NORM_VIEW_BOOTSTRAP_TTL_SEC", "600"))
 _CACHE_LOCK = RLock()
 _CACHE: dict[str, tuple[float, Any]] = {}
 _MV_LOCK = RLock()
@@ -135,6 +137,10 @@ _MV_BOOTSTRAP_FAIL_MSG = ""
 _MV_LAST_REFRESH_AT = 0.0
 _MV_LAST_REFRESH_NOTE = ""
 _MV_TEMP_SUFFIX = "__new"
+_NORM_VIEW_LOCK = RLock()
+_NORM_VIEW_OK_AT = 0.0
+_NORM_VIEW_FAIL_AT = 0.0
+_NORM_VIEW_FAIL_MSG = ""
 _ADMIN_SESSIONS_LOCK = RLock()
 _ADMIN_SESSIONS: dict[str, float] = {}
 ADMIN_SESSION_TTL_SEC = int(os.environ.get("ADMIN_SESSION_TTL_SEC", "28800"))
@@ -517,12 +523,27 @@ def get_conn():
 
 
 def _ensure_brak_data_norm() -> None:
-    """Create/replace typed VIEW over brak_team.brak_data."""
-    ddl = NORM_VIEW_SQL_PATH.read_text(encoding="utf-8")
-    with get_conn() as conn:
-        conn.autocommit = True
-        cur = conn.cursor()
-        cur.execute(ddl)
+    """Create/replace typed VIEW over brak_team.brak_data (DDL throttled)."""
+    global _NORM_VIEW_OK_AT, _NORM_VIEW_FAIL_AT, _NORM_VIEW_FAIL_MSG
+    with _NORM_VIEW_LOCK:
+        now = monotonic()
+        if _NORM_VIEW_OK_AT and (now - _NORM_VIEW_OK_AT) < NORM_VIEW_BOOTSTRAP_TTL_SEC:
+            return
+        if _NORM_VIEW_FAIL_AT and (now - _NORM_VIEW_FAIL_AT) < NORM_VIEW_BOOTSTRAP_TTL_SEC:
+            raise RuntimeError(_NORM_VIEW_FAIL_MSG or "norm view bootstrap failed")
+        try:
+            ddl = NORM_VIEW_SQL_PATH.read_text(encoding="utf-8")
+            with get_conn() as conn:
+                conn.autocommit = True
+                cur = conn.cursor()
+                cur.execute(ddl)
+            _NORM_VIEW_OK_AT = monotonic()
+            _NORM_VIEW_FAIL_AT = 0.0
+            _NORM_VIEW_FAIL_MSG = ""
+        except Exception as exc:
+            _NORM_VIEW_FAIL_AT = monotonic()
+            _NORM_VIEW_FAIL_MSG = f"norm view bootstrap failed: {exc}"
+            raise
 
 
 def load_config() -> dict:
@@ -1152,7 +1173,7 @@ def fetch_dimension_breakdowns(
 ) -> dict[str, Any]:
     """TOP slices by subject / owner / state for the selected week pair (from norm view)."""
     cache_key = (
-        f"dim_brk_v1:{year}:{week_prev}:{week_last}:{office_id}:"
+        f"dim_brk_v2:{year}:{week_prev}:{week_last}:{office_id}:"
         f"{','.join(map(str, wh_ids or []))}:{limit}"
     )
     cached = _cache_get(cache_key)
@@ -1160,10 +1181,12 @@ def fetch_dimension_breakdowns(
         return cached
 
     _ensure_brak_data_norm()
-    year_start = date.fromisocalendar(year, 1, 1)
-    year_end = date.fromisocalendar(year + 1, 1, 1)
+    # Bound scan to the two ISO weeks only (not the whole year).
+    w_lo, w_hi = sorted((int(week_prev), int(week_last)))
+    range_start = date.fromisocalendar(year, w_lo, 1)
+    range_end = date.fromisocalendar(year, w_hi, 7) + timedelta(days=1)
     clauses = ["date IS NOT NULL", "date >= %s", "date < %s"]
-    params: list[Any] = [year_start, year_end]
+    params: list[Any] = [range_start, range_end]
     if office_id is not None:
         clauses.append("office_id = %s")
         params.append(office_id)
@@ -1174,58 +1197,75 @@ def fetch_dimension_breakdowns(
     week_expr = "EXTRACT(WEEK FROM date)::int"
     lim = max(3, min(20, int(limit)))
 
-    out: dict[str, Any] = {"week_prev": week_prev, "week_last": week_last, "dims": {}}
+    union_parts: list[str] = []
+    union_params: list[Any] = []
+    for key, (dim_expr, _label) in _DIM_BREAKDOWN_SPECS.items():
+        union_parts.append(
+            f"""
+            SELECT
+                %s::text AS dim_key,
+                {dim_expr} AS name,
+                COALESCE(SUM(amount) FILTER (WHERE {week_expr} = %s), 0) AS amount_prev,
+                COALESCE(SUM(amount) FILTER (WHERE {week_expr} = %s), 0) AS amount_last
+            FROM {NORM_VIEW}
+            {where}
+              AND {week_expr} IN (%s, %s)
+            GROUP BY 2
+            """
+        )
+        union_params.extend([key, week_prev, week_last, *params, week_prev, week_last])
+
+    sql = f"""
+        WITH agg AS (
+            {" UNION ALL ".join(union_parts)}
+        ),
+        ranked AS (
+            SELECT
+                dim_key,
+                name,
+                amount_prev,
+                amount_last,
+                CASE WHEN amount_prev > 0
+                     THEN (amount_last - amount_prev) / amount_prev * 100
+                     ELSE NULL END AS dynamics,
+                CASE WHEN SUM(amount_last) OVER (PARTITION BY dim_key) > 0
+                     THEN amount_last / SUM(amount_last) OVER (PARTITION BY dim_key) * 100
+                     ELSE 0 END AS share,
+                ROW_NUMBER() OVER (
+                    PARTITION BY dim_key
+                    ORDER BY amount_last DESC NULLS LAST, name
+                ) AS rn
+            FROM agg
+        )
+        SELECT dim_key, name, amount_prev, amount_last, dynamics, share
+        FROM ranked
+        WHERE rn <= %s
+        ORDER BY dim_key, rn
+    """
+    out: dict[str, Any] = {
+        "week_prev": week_prev,
+        "week_last": week_last,
+        "dims": {
+            key: {"label": label, "rows": []}
+            for key, (_expr, label) in _DIM_BREAKDOWN_SPECS.items()
+        },
+    }
     with get_conn() as conn:
         cur = conn.cursor()
-        for key, (dim_expr, label) in _DIM_BREAKDOWN_SPECS.items():
-            sql = f"""
-                WITH base AS (
-                    SELECT
-                        {dim_expr} AS name,
-                        {week_expr} AS week_no,
-                        amount
-                    FROM {NORM_VIEW}
-                    {where}
-                      AND {week_expr} IN (%s, %s)
-                ),
-                agg AS (
-                    SELECT
-                        name,
-                        COALESCE(SUM(amount) FILTER (WHERE week_no = %s), 0) AS amount_prev,
-                        COALESCE(SUM(amount) FILTER (WHERE week_no = %s), 0) AS amount_last
-                    FROM base
-                    GROUP BY name
-                ),
-                tot AS (
-                    SELECT COALESCE(SUM(amount_last), 0) AS total_last FROM agg
-                )
-                SELECT
-                    a.name,
-                    a.amount_prev,
-                    a.amount_last,
-                    CASE WHEN a.amount_prev > 0
-                         THEN (a.amount_last - a.amount_prev) / a.amount_prev * 100
-                         ELSE NULL END AS dynamics,
-                    CASE WHEN t.total_last > 0
-                         THEN a.amount_last / t.total_last * 100
-                         ELSE 0 END AS share
-                FROM agg a
-                CROSS JOIN tot t
-                ORDER BY a.amount_last DESC NULLS LAST, a.name
-                LIMIT %s
-            """
-            cur.execute(sql, [*params, week_prev, week_last, week_prev, week_last, lim])
-            rows = [
+        cur.execute(sql, [*union_params, lim])
+        for r in cur.fetchall():
+            key = str(r[0])
+            if key not in out["dims"]:
+                continue
+            out["dims"][key]["rows"].append(
                 {
-                    "name": str(r[0]),
-                    "amount_prev": to_float(r[1]),
-                    "amount_last": to_float(r[2]),
-                    "dynamics": None if r[3] is None else to_float(r[3]),
-                    "share": to_float(r[4]),
+                    "name": str(r[1]),
+                    "amount_prev": to_float(r[2]),
+                    "amount_last": to_float(r[3]),
+                    "dynamics": None if r[4] is None else to_float(r[4]),
+                    "share": to_float(r[5]),
                 }
-                for r in cur.fetchall()
-            ]
-            out["dims"][key] = {"label": label, "rows": rows}
+            )
 
     _cache_set(cache_key, out, CACHE_TTL_SEC)
     return out
@@ -1871,6 +1911,17 @@ def fetch_reason_card(
 
 
 def fetch_freshness_payload() -> dict[str, Any]:
+    cache_key = "freshness_payload_v2"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        out = dict(cached)
+        now = monotonic()
+        with _MV_LOCK:
+            if _MV_LAST_REFRESH_AT:
+                out["matview_refresh_age_sec"] = round(now - _MV_LAST_REFRESH_AT, 1)
+                out["matview_refresh_note"] = _MV_LAST_REFRESH_NOTE
+        return out
+
     env_err = check_db_env()
     out: dict[str, Any] = {
         "ok": not bool(env_err),
@@ -1884,6 +1935,7 @@ def fetch_freshness_payload() -> dict[str, Any]:
         "matview_refresh_age_sec": None,
         "matview_refresh_note": "",
         "cache_ttl_sec": CACHE_TTL_SEC,
+        "source": "none",
     }
     now = monotonic()
     with _MV_LOCK:
@@ -1893,10 +1945,6 @@ def fetch_freshness_payload() -> dict[str, Any]:
     if env_err:
         return out
     try:
-        cfg = load_config()
-        stats = fetch_db_stats(cfg.get("office_id"), None)
-        out["max_date"] = stats.get("max_date")
-        out["row_count"] = stats.get("row_count")
         if _use_report_matview():
             try:
                 _ensure_report_matview()
@@ -1904,7 +1952,11 @@ def fetch_freshness_payload() -> dict[str, Any]:
                     cur = conn.cursor()
                     cur.execute(
                         f"""
-                        SELECT MAX(iso_year)::int, MAX(week_no)::int, MAX(max_date)::text
+                        SELECT
+                            MAX(iso_year)::int,
+                            MAX(week_no)::int,
+                            MAX(max_date)::text,
+                            COALESCE(SUM(rows_cnt), 0)::bigint
                         FROM {_matview_name()}
                         """
                     )
@@ -1912,11 +1964,20 @@ def fetch_freshness_payload() -> dict[str, Any]:
                 out["matview_available"] = True
                 out["matview_max_year"] = int(row[0]) if row and row[0] is not None else None
                 out["matview_max_week"] = int(row[1]) if row and row[1] is not None else None
-                if row and row[2]:
-                    out["max_date"] = out["max_date"] or row[2]
+                out["max_date"] = row[2] if row else None
+                out["row_count"] = int(row[3]) if row and row[3] is not None else 0
+                out["source"] = "matview"
             except Exception as exc:
                 out["matview_available"] = False
                 out["matview_error"] = str(exc)
+        if out["max_date"] is None or out["row_count"] is None:
+            cfg = load_config()
+            stats = fetch_db_stats(cfg.get("office_id"), None)
+            out["max_date"] = out["max_date"] or stats.get("max_date")
+            if out["row_count"] is None:
+                out["row_count"] = stats.get("row_count")
+            out["source"] = "norm" if out["source"] == "none" else out["source"]
+        _cache_set(cache_key, out, FRESHNESS_CACHE_TTL_SEC)
     except Exception as exc:
         out["ok"] = False
         out["error"] = str(exc)
@@ -3582,8 +3643,11 @@ def build_report_data(
     # Keep full history for 4-week average even when UI shows only 2 weeks.
     available_all = list(weeks)
     avg_weeks = _avg4_weeks(sorted(set(available_all) | {week_prev, week_last}), week_last)
-    query_weeks = sorted(set(available_all) | set(avg_weeks))
-    if not show_all_weeks:
+    if show_all_weeks:
+        query_weeks = sorted(set(available_all) | set(avg_weeks))
+    else:
+        # Fast path: only the two compare weeks + avg4 window (not the whole year).
+        query_weeks = sorted(set(avg_weeks) | {week_prev, week_last})
         weeks = sorted({week_prev, week_last})
 
     bundle = fetch_top_bundle(
@@ -5632,6 +5696,29 @@ async function loadFreshness() {
   } catch (_) {}
 }
 
+async function loadDimBreakdowns() {
+  const sub = document.getElementById('dimSubject');
+  const own = document.getElementById('dimOwnerState');
+  if (sub) sub.innerHTML = '<div class="muted-box">Загрузка…</div>';
+  if (own) own.innerHTML = '<div class="muted-box">Загрузка…</div>';
+  const wh = selectedWh.size ? Array.from(selectedWh).join(',') : '';
+  const { wp, wl } = selectedWeeks();
+  const q = new URLSearchParams({
+    year: document.getElementById('year').value,
+    week_prev: wp,
+    week_last: wl,
+    limit: '10',
+  });
+  if (wh) q.set('wh_ids', wh);
+  try {
+    const data = await parseApiResponse(await fetch('/api/dim-breakdowns?' + q));
+    updateDimBreakdowns(data || null);
+  } catch (e) {
+    if (sub) sub.innerHTML = `<div class="muted-box">Не удалось загрузить предметы: ${e.message || e}</div>`;
+    if (own) own.innerHTML = '<div class="muted-box">Не удалось загрузить владельца/статус</div>';
+  }
+}
+
 async function loadReport() {
   const status = document.getElementById('status');
   const grid = document.getElementById('reportGrid');
@@ -5661,13 +5748,14 @@ async function loadReport() {
     updateKpis(data.kpis || null, data.yoy || null);
     updateOrg0Spark(data.org0_series || []);
     updateCorpusCompare(data.corpus_compare || []);
-    updateDimBreakdowns(data.dim_breakdowns || null);
     updatePeriodCompare(data.compare || null);
     updateTop20Churn(data.top20_churn || null);
     updateGrowthAlerts(data.growth_alerts || [], data.alert_thresholds || thr);
     loadWatchlist();
     if (data.freshness) updateFreshness(data.freshness);
     else loadFreshness();
+    // Dim slices load after the main grid so TOP-20 appears sooner.
+    loadDimBreakdowns();
     syncDashboardUrl();
     applyTableSearch();
     grid.querySelectorAll('tr.drill-row').forEach(tr => {
@@ -7220,14 +7308,6 @@ def register_routes(application) -> None:
                 week_last=week_last,
                 cfg=cfg,
             )
-            dim_breakdowns = fetch_dimension_breakdowns(
-                wh_ids=wh_ids,
-                office_id=office_id,
-                year=year,
-                week_prev=week_prev,
-                week_last=week_last,
-                limit=10,
-            )
             growth_alerts = build_growth_alerts(
                 data,
                 min_dynamics=alert_wow,
@@ -7319,7 +7399,6 @@ def register_routes(application) -> None:
             "week_last": week_last,
             "kpis": build_kpi_payload(data),
             "corpus_compare": corpus_compare,
-            "dim_breakdowns": dim_breakdowns,
             "growth_alerts": growth_alerts,
             "alert_thresholds": {
                 "wow": alert_wow,
@@ -7346,7 +7425,6 @@ def register_routes(application) -> None:
                 "alert_min_amount": alert_min_amount,
                 "kpis": payload["kpis"],
                 "growth_alerts": growth_alerts,
-                "dim_breakdowns": dim_breakdowns,
                 "compare": extras["compare"],
                 "top20_churn": extras["top20_churn"],
                 "yoy": yoy,
@@ -7358,6 +7436,43 @@ def register_routes(application) -> None:
         resp.headers["ETag"] = etag
         resp.headers["Cache-Control"] = "private, max-age=30"
         return resp
+
+    @application.route("/api/dim-breakdowns")
+    def api_dim_breakdowns():
+        env_err = check_db_env()
+        if env_err:
+            return jsonify({"error": env_err}), 503
+        try:
+            cfg = _cfg()
+            year = _year_arg(cfg.get("week_year", 2026))
+
+            def _week_arg(name: str, default: int) -> int:
+                raw = request.args.get(name, "")
+                if raw is None or str(raw).strip() == "":
+                    return default
+                try:
+                    return int(raw)
+                except (TypeError, ValueError):
+                    return default
+
+            week_prev = _week_arg("week_prev", cfg.get("week_prev", 20))
+            week_last = _week_arg("week_last", cfg.get("week_last", 21))
+            wh_ids = _resolve_wh_ids(cfg)
+            office_id = cfg.get("office_id")
+            limit = int(_int_arg("limit", 10) or 10)
+            payload = fetch_dimension_breakdowns(
+                wh_ids=wh_ids,
+                office_id=office_id,
+                year=year,
+                week_prev=week_prev,
+                week_last=week_last,
+                limit=limit,
+            )
+            return jsonify(payload)
+        except QueryParamError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
 
     @application.route("/api/export/xlsx")
     def api_export_xlsx():
