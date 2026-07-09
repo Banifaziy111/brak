@@ -102,6 +102,8 @@ _MV_LOCK = RLock()
 _MV_BOOTSTRAP_OK_AT = 0.0
 _MV_BOOTSTRAP_FAIL_AT = 0.0
 _MV_BOOTSTRAP_FAIL_MSG = ""
+_MV_LAST_REFRESH_AT = 0.0
+_MV_LAST_REFRESH_NOTE = ""
 _MV_TEMP_SUFFIX = "__new"
 _ADMIN_SESSIONS_LOCK = RLock()
 _ADMIN_SESSIONS: dict[str, float] = {}
@@ -297,6 +299,7 @@ def _ensure_nm_matview() -> None:
 
 
 def _refresh_report_matview() -> str | None:
+    global _MV_LAST_REFRESH_AT, _MV_LAST_REFRESH_NOTE
     if not _use_report_matview():
         return None
     _ensure_report_matview()
@@ -308,6 +311,7 @@ def _refresh_report_matview() -> str | None:
     use_concurrently = os.environ.get(
         "WRITE_OFFS_MATVIEW_REFRESH_CONCURRENTLY", "1"
     ).strip().lower() not in ("0", "false", "no")
+    note = "Матпредставления обновлены"
     with get_conn() as conn:
         conn.autocommit = True
         cur = conn.cursor()
@@ -316,17 +320,19 @@ def _refresh_report_matview() -> str | None:
                 cur.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {mv_sql}")
                 try:
                     cur.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {nm_mv_sql}")
-                    return "Матпредставления обновлены (CONCURRENTLY)"
+                    note = "Матпредставления обновлены (CONCURRENTLY)"
                 except Exception:
                     cur.execute(f"REFRESH MATERIALIZED VIEW {nm_mv_sql}")
-                    return "Матпредставления обновлены"
             except Exception:
                 cur.execute(f"REFRESH MATERIALIZED VIEW {mv_sql}")
                 cur.execute(f"REFRESH MATERIALIZED VIEW {nm_mv_sql}")
-                return "Матпредставления обновлены"
-        cur.execute(f"REFRESH MATERIALIZED VIEW {mv_sql}")
-        cur.execute(f"REFRESH MATERIALIZED VIEW {nm_mv_sql}")
-        return "Матпредставления обновлены"
+        else:
+            cur.execute(f"REFRESH MATERIALIZED VIEW {mv_sql}")
+            cur.execute(f"REFRESH MATERIALIZED VIEW {nm_mv_sql}")
+    with _MV_LOCK:
+        _MV_LAST_REFRESH_AT = monotonic()
+        _MV_LAST_REFRESH_NOTE = note
+    return note
 
 
 def _report_source() -> dict[str, str]:
@@ -944,13 +950,32 @@ def build_kpi_payload(report: dict) -> dict[str, float]:
     cover = d.get("top20_cover_last")
     if cover is None and total_last:
         cover = top20_last / total_last * 100
+    avg4 = to_float(d.get("avg4"))
+    vs_avg4 = None
+    if avg4:
+        vs_avg4 = (top20_last / avg4 - 1.0) * 100
     return {
         "total_last": total_last,
         "top20_last": top20_last,
         "org0_last": org0_last,
         "org0_share": (org0_last / total_last * 100) if total_last else 0.0,
         "top20_cover": to_float(cover) if cover is not None else 0.0,
+        "top20_avg4": avg4,
+        "top20_vs_avg4": to_float(vs_avg4) if vs_avg4 is not None else 0.0,
     }
+
+
+def _avg4_weeks(weeks: list[int], week_last: int) -> list[int]:
+    prior = sorted(w for w in weeks if w <= week_last)
+    if not prior:
+        return [week_last]
+    return prior[-4:]
+
+
+def _row_avg4(amounts: dict[int, float], avg_weeks: list[int]) -> float:
+    if not avg_weeks:
+        return 0.0
+    return sum(to_float(amounts.get(w, 0)) for w in avg_weeks) / len(avg_weeks)
 
 
 def _corpus_wh_map(cfg: dict | None = None) -> dict[int, list[int]]:
@@ -988,6 +1013,56 @@ def _corpus_wh_map(cfg: dict | None = None) -> dict[int, list[int]]:
     return out
 
 
+def fetch_top_wh_amounts(
+    *,
+    wh_ids: list[int],
+    office_id: int | None,
+    year: int,
+    week_no: int,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    if not wh_ids:
+        return []
+    src = _report_source()
+    clauses: list[str] = []
+    params: list[Any] = []
+    if src["base_not_null_clause"]:
+        clauses.append(src["base_not_null_clause"])
+    if _use_report_matview() and src["table"] != "brak_team.write_offs":
+        clauses.append(src["year_clause"])
+        params.append(year)
+    else:
+        year_start = date.fromisocalendar(year, 1, 1)
+        year_end = date.fromisocalendar(year + 1, 1, 1)
+        clauses.append(src["year_clause"])
+        params.extend([year_start, year_end])
+    if office_id is not None:
+        clauses.append("office_id = %s")
+        params.append(office_id)
+    clauses.append("wh_id = ANY(%s)")
+    params.append(wh_ids)
+    clauses.append(f"{src['week_expr']} = %s")
+    params.append(week_no)
+    where = " WHERE " + " AND ".join(clauses)
+    sql = f"""
+        SELECT wh_id, COALESCE(SUM({src['amount_expr']}), 0) AS amount
+        FROM {src['table']}
+        {where}
+        GROUP BY wh_id
+        ORDER BY amount DESC
+        LIMIT %s
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, [*params, max(1, min(10, limit))])
+        raw = cur.fetchall()
+    return [
+        {"wh_id": int(r[0]), "amount": to_float(r[1])}
+        for r in raw
+        if r[0] is not None
+    ]
+
+
 def fetch_corpus_comparison(
     *,
     office_id: int | None,
@@ -1001,11 +1076,16 @@ def fetch_corpus_comparison(
     corpus_sig = ";".join(
         f"{c}:{','.join(map(str, ids))}" for c, ids in sorted(corpus_map.items())
     )
-    cache_key = f"corpus_cmp:{year}:{week_prev}:{week_last}:{office_id}:{corpus_sig}"
+    cache_key = f"corpus_cmp_v2:{year}:{week_prev}:{week_last}:{office_id}:{corpus_sig}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
+    wh_names = {
+        int(w["wh_id"]): str(w.get("name") or w["wh_id"])
+        for w in (cfg.get("wh_catalog") or [])
+        if w.get("wh_id") is not None
+    }
     rows: list[dict[str, Any]] = []
     for corpus in (1, 2, 3):
         wh_ids = corpus_map.get(corpus) or []
@@ -1021,6 +1101,7 @@ def fetch_corpus_comparison(
                     "dynamics": None,
                     "org0_share": 0.0,
                     "share_of_total": 0.0,
+                    "top_wh": [],
                 }
             )
             continue
@@ -1044,6 +1125,16 @@ def fetch_corpus_comparison(
         last = to_float(totals_all.get("w_last"))
         org0_last = to_float(totals_org0.get("w_last"))
         dyn = ((last - prev) / prev * 100) if prev else None
+        top_wh = fetch_top_wh_amounts(
+            wh_ids=wh_ids,
+            office_id=office_id,
+            year=year,
+            week_no=week_last,
+            limit=3,
+        )
+        for item in top_wh:
+            item["name"] = wh_names.get(item["wh_id"], str(item["wh_id"]))
+            item["share"] = (item["amount"] / last * 100) if last else 0.0
         rows.append(
             {
                 "corpus": corpus,
@@ -1055,6 +1146,7 @@ def fetch_corpus_comparison(
                 "dynamics": dyn,
                 "org0_share": (org0_last / last * 100) if last else 0.0,
                 "share_of_total": 0.0,
+                "top_wh": top_wh,
             }
         )
 
@@ -1070,6 +1162,7 @@ def build_growth_alerts(
     report: dict,
     *,
     min_dynamics: float = 15.0,
+    min_vs_avg4: float = 20.0,
     min_amount: float = 50000.0,
     limit: int = 8,
 ) -> list[dict[str, Any]]:
@@ -1082,7 +1175,16 @@ def build_growth_alerts(
             dyn = row.get("dynamics")
             last = to_float(row.get("w_last"))
             prev = to_float(row.get("w_prev"))
-            if dyn is None or dyn < min_dynamics or last < min_amount:
+            avg4 = to_float(row.get("avg4"))
+            vs_avg4 = row.get("vs_avg4")
+            wow_hit = dyn is not None and dyn >= min_dynamics and last >= min_amount
+            avg_hit = (
+                vs_avg4 is not None
+                and to_float(vs_avg4) >= min_vs_avg4
+                and last >= min_amount
+                and avg4 > 0
+            )
+            if not (wow_hit or avg_hit):
                 continue
             alerts.append(
                 {
@@ -1092,13 +1194,286 @@ def build_growth_alerts(
                     "name": row.get("name") or "—",
                     "w_prev": prev,
                     "w_last": last,
-                    "dynamics": to_float(dyn),
+                    "dynamics": to_float(dyn) if dyn is not None else None,
+                    "avg4": avg4,
+                    "vs_avg4": to_float(vs_avg4) if vs_avg4 is not None else None,
                     "delta": last - prev,
                     "share": to_float(row.get("share")),
+                    "trigger": "vs_avg4" if avg_hit and not wow_hit else "wow",
                 }
             )
-    alerts.sort(key=lambda a: (-a["dynamics"], -a["w_last"]))
+    alerts.sort(
+        key=lambda a: (
+            -(a["vs_avg4"] if a.get("vs_avg4") is not None else a.get("dynamics") or 0),
+            -a["w_last"],
+        )
+    )
     return alerts[: max(1, min(20, limit))]
+
+
+def fetch_reason_card(
+    *,
+    reason_id: int | None = None,
+    parent_name: str | None = None,
+    office_id: int | None = None,
+    wh_ids: list[int] | None = None,
+    year: int,
+    week_last: int | None = None,
+    top_n: int = 5,
+) -> dict[str, Any]:
+    if reason_id is None and not (parent_name or "").strip():
+        raise QueryParamError("Укажите reason_id или parent_name")
+
+    sorted_wh = sorted(wh_ids) if wh_ids else []
+    cache_key = (
+        f"reason_card:{year}:{week_last}:{office_id}:{reason_id}:"
+        f"{parent_name or ''}:{','.join(map(str, sorted_wh))}:{top_n}"
+    )
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    src = _report_source()
+    clauses: list[str] = []
+    params: list[Any] = []
+    if src["base_not_null_clause"]:
+        clauses.append(src["base_not_null_clause"])
+    if _use_report_matview() and src["table"] != "brak_team.write_offs":
+        clauses.append(src["year_clause"])
+        params.append(year)
+    else:
+        year_start = date.fromisocalendar(year, 1, 1)
+        year_end = date.fromisocalendar(year + 1, 1, 1)
+        clauses.append(src["year_clause"])
+        params.extend([year_start, year_end])
+    if office_id is not None:
+        clauses.append("office_id = %s")
+        params.append(office_id)
+    if wh_ids:
+        clauses.append("wh_id = ANY(%s)")
+        params.append(wh_ids)
+    if reason_id is not None:
+        clauses.append("reason_id = %s")
+        params.append(reason_id)
+    if parent_name:
+        clauses.append("COALESCE(parent_name, '—') = %s")
+        params.append(parent_name.strip())
+    where = " WHERE " + " AND ".join(clauses)
+    week_expr = src["week_expr"]
+    amount_expr = src["amount_expr"]
+
+    sql_weeks = f"""
+        SELECT {week_expr}::int AS week_no,
+               COALESCE(SUM({amount_expr}), 0) AS amount_all,
+               COALESCE(SUM({amount_expr}) FILTER (WHERE cnt_org = 0), 0) AS amount_org0
+        FROM {src['table']}
+        {where}
+        GROUP BY 1
+        ORDER BY 1
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql_weeks, params)
+        week_rows = cur.fetchall()
+        weeks_payload = [
+            {
+                "week": int(r[0]),
+                "amount_all": to_float(r[1]),
+                "amount_org0": to_float(r[2]),
+                "org0_share": (to_float(r[2]) / to_float(r[1]) * 100) if to_float(r[1]) else 0.0,
+            }
+            for r in week_rows
+        ]
+        if week_last is None and weeks_payload:
+            week_last = weeks_payload[-1]["week"]
+        if week_last is None:
+            week_last = 1
+
+        title = parent_name or f"reason_id={reason_id}"
+        if reason_id is not None:
+            cur.execute(
+                f"""
+                SELECT MAX(COALESCE(reason_descr, '—'))
+                FROM {src['table']}
+                {where}
+                """,
+                params,
+            )
+            title_row = cur.fetchone()
+            if title_row and title_row[0]:
+                title = str(title_row[0])
+
+        # Top WH from matview/source for selected week.
+        wh_clauses = [*clauses, f"{week_expr} = %s"]
+        wh_params = [*params, week_last]
+        cur.execute(
+            f"""
+            SELECT wh_id, COALESCE(SUM({amount_expr}), 0) AS amount
+            FROM {src['table']}
+            WHERE {' AND '.join(wh_clauses)}
+            GROUP BY wh_id
+            ORDER BY amount DESC
+            LIMIT %s
+            """,
+            [*wh_params, max(1, min(20, top_n))],
+        )
+        top_wh = [
+            {"wh_id": int(r[0]), "amount": to_float(r[1])}
+            for r in cur.fetchall()
+            if r[0] is not None
+        ]
+
+        # nm_id / brand from base table (richer dimensions).
+        base_clauses = ["date IS NOT NULL"]
+        base_params: list[Any] = []
+        year_start = date.fromisocalendar(year, 1, 1)
+        year_end = date.fromisocalendar(year + 1, 1, 1)
+        base_clauses.append("date >= %s AND date < %s")
+        base_params.extend([year_start, year_end])
+        if office_id is not None:
+            base_clauses.append("office_id = %s")
+            base_params.append(office_id)
+        if wh_ids:
+            base_clauses.append("wh_id = ANY(%s)")
+            base_params.append(wh_ids)
+        if reason_id is not None:
+            base_clauses.append("reason_id = %s")
+            base_params.append(reason_id)
+        if parent_name:
+            base_clauses.append("COALESCE(parent_name, '—') = %s")
+            base_params.append(parent_name.strip())
+        base_clauses.append("EXTRACT(WEEK FROM date)::int = %s")
+        base_params.append(week_last)
+        base_where = " WHERE " + " AND ".join(base_clauses)
+        cur.execute(
+            f"""
+            SELECT nm_id, COALESCE(MAX(title), '—') AS title,
+                   COALESCE(SUM(amount), 0) AS amount
+            FROM brak_team.write_offs
+            {base_where}
+            GROUP BY nm_id
+            ORDER BY amount DESC NULLS LAST
+            LIMIT %s
+            """,
+            [*base_params, max(1, min(20, top_n))],
+        )
+        top_nm = [
+            {
+                "nm_id": int(r[0]) if r[0] is not None else None,
+                "title": r[1] or "—",
+                "amount": to_float(r[2]),
+            }
+            for r in cur.fetchall()
+        ]
+        cur.execute(
+            f"""
+            SELECT COALESCE(brand_name, '—') AS brand,
+                   COALESCE(SUM(amount), 0) AS amount
+            FROM brak_team.write_offs
+            {base_where}
+            GROUP BY 1
+            ORDER BY amount DESC
+            LIMIT %s
+            """,
+            [*base_params, max(1, min(20, top_n))],
+        )
+        top_brands = [
+            {"brand_name": r[0] or "—", "amount": to_float(r[1])}
+            for r in cur.fetchall()
+        ]
+
+    last_amt = next((w["amount_all"] for w in weeks_payload if w["week"] == week_last), 0.0)
+    last_org0 = next((w["amount_org0"] for w in weeks_payload if w["week"] == week_last), 0.0)
+    avg_weeks = _avg4_weeks([w["week"] for w in weeks_payload], week_last)
+    avg4 = (
+        sum(w["amount_all"] for w in weeks_payload if w["week"] in avg_weeks) / len(avg_weeks)
+        if avg_weeks
+        else 0.0
+    )
+    cfg = load_config()
+    wh_names = {
+        int(w["wh_id"]): str(w.get("name") or w["wh_id"])
+        for w in (cfg.get("wh_catalog") or [])
+        if w.get("wh_id") is not None
+    }
+    for item in top_wh:
+        item["name"] = wh_names.get(item["wh_id"], str(item["wh_id"]))
+        item["share"] = (item["amount"] / last_amt * 100) if last_amt else 0.0
+
+    payload = {
+        "year": year,
+        "week_last": week_last,
+        "reason_id": reason_id,
+        "parent_name": parent_name,
+        "title": title,
+        "weeks": weeks_payload,
+        "kpis": {
+            "amount_last": last_amt,
+            "amount_org0_last": last_org0,
+            "org0_share": (last_org0 / last_amt * 100) if last_amt else 0.0,
+            "avg4": avg4,
+            "vs_avg4": ((last_amt / avg4 - 1.0) * 100) if avg4 else None,
+        },
+        "top_wh": top_wh,
+        "top_nm": top_nm,
+        "top_brands": top_brands,
+        "source": src["table"],
+    }
+    _cache_set(cache_key, payload, CACHE_TTL_SEC)
+    return payload
+
+
+def fetch_freshness_payload() -> dict[str, Any]:
+    env_err = check_db_env()
+    out: dict[str, Any] = {
+        "ok": not bool(env_err),
+        "db_env_error": env_err,
+        "max_date": None,
+        "row_count": None,
+        "matview_enabled": _use_report_matview(),
+        "matview_available": False,
+        "matview_max_year": None,
+        "matview_max_week": None,
+        "matview_refresh_age_sec": None,
+        "matview_refresh_note": "",
+        "cache_ttl_sec": CACHE_TTL_SEC,
+    }
+    now = monotonic()
+    with _MV_LOCK:
+        if _MV_LAST_REFRESH_AT:
+            out["matview_refresh_age_sec"] = round(now - _MV_LAST_REFRESH_AT, 1)
+            out["matview_refresh_note"] = _MV_LAST_REFRESH_NOTE
+    if env_err:
+        return out
+    try:
+        cfg = load_config()
+        stats = fetch_db_stats(cfg.get("office_id"), None)
+        out["max_date"] = stats.get("max_date")
+        out["row_count"] = stats.get("row_count")
+        if _use_report_matview():
+            try:
+                _ensure_report_matview()
+                with get_conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        f"""
+                        SELECT MAX(iso_year)::int, MAX(week_no)::int, MAX(max_date)::text
+                        FROM {_matview_name()}
+                        """
+                    )
+                    row = cur.fetchone()
+                out["matview_available"] = True
+                out["matview_max_year"] = int(row[0]) if row and row[0] is not None else None
+                out["matview_max_week"] = int(row[1]) if row and row[1] is not None else None
+                if row and row[2]:
+                    out["max_date"] = out["max_date"] or row[2]
+            except Exception as exc:
+                out["matview_available"] = False
+                out["matview_error"] = str(exc)
+    except Exception as exc:
+        out["ok"] = False
+        out["error"] = str(exc)
+    return out
 
 
 def export_report_xlsx(report: dict, year: int, week_prev: int, week_last: int) -> bytes:
@@ -1649,6 +2024,8 @@ def fetch_status_payload() -> dict[str, Any]:
         "bootstrap_ok_age_sec": None,
         "bootstrap_fail_age_sec": None,
         "bootstrap_fail_msg": "",
+        "last_refresh_age_sec": None,
+        "last_refresh_note": "",
     }
     now = monotonic()
     with _MV_LOCK:
@@ -1657,6 +2034,9 @@ def fetch_status_payload() -> dict[str, Any]:
         if _MV_BOOTSTRAP_FAIL_AT:
             matview["bootstrap_fail_age_sec"] = round(now - _MV_BOOTSTRAP_FAIL_AT, 1)
             matview["bootstrap_fail_msg"] = _MV_BOOTSTRAP_FAIL_MSG
+        if _MV_LAST_REFRESH_AT:
+            matview["last_refresh_age_sec"] = round(now - _MV_LAST_REFRESH_AT, 1)
+            matview["last_refresh_note"] = _MV_LAST_REFRESH_NOTE
 
     if not env_err:
         try:
@@ -2063,14 +2443,24 @@ def warm_report_cache_async(
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def add_shares(rows: list[Row], week_prev: int, week_last: int) -> list[dict]:
+def add_shares(
+    rows: list[Row],
+    week_prev: int,
+    week_last: int,
+    *,
+    avg_weeks: list[int] | None = None,
+) -> list[dict]:
     """
     Доля считается от суммы ТОП-20. Сумма всех долей в таблице = 100%.
     """
     total_last = sum(r.amount(week_last) for r in rows)
+    avg_weeks = avg_weeks or _avg4_weeks(sorted({week_prev, week_last}), week_last)
     out: list[dict] = []
     for i, r in enumerate(rows, start=1):
         share = (r.amount(week_last) / total_last * 100) if total_last else 0
+        avg4 = _row_avg4(r.amounts, avg_weeks)
+        last = r.amount(week_last)
+        vs_avg4 = ((last / avg4 - 1.0) * 100) if avg4 else None
         out.append(
             {
                 "num": i,
@@ -2078,17 +2468,26 @@ def add_shares(rows: list[Row], week_prev: int, week_last: int) -> list[dict]:
                 "name": r.name,
                 "amounts": dict(r.amounts),
                 "w_prev": r.amount(week_prev),
-                "w_last": r.amount(week_last),
+                "w_last": last,
                 "dynamics": r.dynamics(week_prev, week_last),
                 "share": share,
                 "average": r.average(week_prev, week_last),
                 "pct_vs_avg": r.pct_vs_avg(week_prev, week_last),
+                "avg4": avg4,
+                "vs_avg4": vs_avg4,
             }
         )
     return out
 
 
-def totals(rows: list[dict], weeks: list[int], week_prev: int, week_last: int) -> dict:
+def totals(
+    rows: list[dict],
+    weeks: list[int],
+    week_prev: int,
+    week_last: int,
+    *,
+    avg_weeks: list[int] | None = None,
+) -> dict:
     """
     Для итоговой строки ТОП-20 доля всегда 100%.
     """
@@ -2098,6 +2497,9 @@ def totals(rows: list[dict], weeks: list[int], week_prev: int, week_last: int) -
     avg = (w_prev + w_last) / 2 if rows else 0
     dyn = ((w_last - w_prev) / w_prev * 100) if w_prev else None
     pct_avg = (w_last / avg * 100) if avg else None
+    avg_weeks = avg_weeks or _avg4_weeks(weeks, week_last)
+    avg4 = _row_avg4(amounts, avg_weeks)
+    vs_avg4 = ((w_last / avg4 - 1.0) * 100) if avg4 else None
     return {
         "amounts": amounts,
         "w_prev": w_prev,
@@ -2106,6 +2508,8 @@ def totals(rows: list[dict], weeks: list[int], week_prev: int, week_last: int) -
         "share": 100.0,  # Всегда 100% для итога ТОП-20
         "average": avg,
         "pct_vs_avg": pct_avg,
+        "avg4": avg4,
+        "vs_avg4": vs_avg4,
     }
 
 
@@ -2307,14 +2711,18 @@ def build_report_data(
         weeks = sorted(set(weeks) | {week_prev})
     if week_last not in weeks:
         weeks = sorted(set(weeks) | {week_last})
+    # Keep full history for 4-week average even when UI shows only 2 weeks.
+    available_all = list(weeks)
+    avg_weeks = _avg4_weeks(sorted(set(available_all) | {week_prev, week_last}), week_last)
+    query_weeks = sorted(set(available_all) | set(avg_weeks))
     if not show_all_weeks:
-        weeks = sorted(set([week_prev, week_last]))
+        weeks = sorted({week_prev, week_last})
 
     bundle = fetch_top_bundle(
         wh_ids=wh_ids,
         office_id=office_id,
         year=year,
-        weeks=weeks,
+        weeks=query_weeks,
         week_last=week_last,
         limit=20,
     )
@@ -2323,21 +2731,28 @@ def build_report_data(
     cats = bundle["categories"]
     cats_org0 = bundle["categories_org0"]
 
-    d_rows = add_shares(defects, week_prev, week_last)
-    d0_rows = add_shares(defects_org0, week_prev, week_last)
-    c_rows = add_shares(cats, week_prev, week_last)
-    c0_rows = add_shares(cats_org0, week_prev, week_last)
+    d_rows = add_shares(defects, week_prev, week_last, avg_weeks=avg_weeks)
+    d0_rows = add_shares(defects_org0, week_prev, week_last, avg_weeks=avg_weeks)
+    c_rows = add_shares(cats, week_prev, week_last, avg_weeks=avg_weeks)
+    c0_rows = add_shares(cats_org0, week_prev, week_last, avg_weeks=avg_weeks)
+
+    # Keep only display weeks in row amounts for HTML tables.
+    if not show_all_weeks:
+        for rows in (d_rows, d0_rows, c_rows, c0_rows):
+            for row in rows:
+                row["amounts"] = {w: row["amounts"].get(w, 0.0) for w in weeks}
 
     report = {
         "weeks": weeks,
+        "avg_weeks": avg_weeks,
         "defects": d_rows,
-        "defects_total": totals(d_rows, weeks, week_prev, week_last),
+        "defects_total": totals(d_rows, weeks, week_prev, week_last, avg_weeks=avg_weeks),
         "defects_org0": d0_rows,
-        "defects_org0_total": totals(d0_rows, weeks, week_prev, week_last),
+        "defects_org0_total": totals(d0_rows, weeks, week_prev, week_last, avg_weeks=avg_weeks),
         "categories": c_rows,
-        "categories_total": totals(c_rows, weeks, week_prev, week_last),
+        "categories_total": totals(c_rows, weeks, week_prev, week_last, avg_weeks=avg_weeks),
         "categories_org0": c0_rows,
-        "categories_org0_total": totals(c0_rows, weeks, week_prev, week_last),
+        "categories_org0_total": totals(c0_rows, weeks, week_prev, week_last, avg_weeks=avg_weeks),
     }
     total_all = fetch_totals_all(
         wh_ids=wh_ids,
@@ -2656,7 +3071,7 @@ tr.total td { background: #eef2ff; }
 .kpis {
   margin: 0 14px 12px;
   display: grid;
-  grid-template-columns: repeat(4, minmax(180px, 1fr));
+  grid-template-columns: repeat(5, minmax(160px, 1fr));
   gap: 12px;
 }
 .kpi {
@@ -2705,6 +3120,23 @@ tr.total td { background: #eef2ff; }
 }
 .corpus-stat .k { font-size: 10px; color: #64748b; font-weight: 700; text-transform: uppercase; }
 .corpus-stat .v { margin-top: 2px; font-size: 14px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.top-wh { margin-top: 4px; font-size: 11px; color: #64748b; line-height: 1.35; }
+.freshness {
+  margin: 0 14px 10px;
+  padding: 8px 12px;
+  background: #f8fafc;
+  border: 1px solid #dbe4f0;
+  border-radius: 12px;
+  color: #334155;
+  font-size: 12px;
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.freshness .ok { color: #15803d; font-weight: 700; }
+.freshness .warn { color: #b45309; font-weight: 700; }
+.freshness .err { color: #b91c1c; font-weight: 700; }
 .alert-list { display: grid; gap: 8px; }
 .alert-item {
   border: 1px solid #fecaca;
@@ -2762,6 +3194,7 @@ tr.total td { background: #eef2ff; }
   <a href="/nomenclature">Номенклатура</a>
   <a href="/details">Детализация</a>
   <a href="/weekly">Динамика</a>
+  <a href="/reason">Карточка</a>
   <a href="/status">Статус</a>
 </nav>
 <div class="toolbar">
@@ -2795,14 +3228,16 @@ tr.total td { background: #eef2ff; }
   <div class="kpi"><div class="k">ТОП-20 (посл. нед.)</div><div class="v" id="kpiTop20">—</div></div>
   <div class="kpi"><div class="k">ORG0 от общего</div><div class="v" id="kpiOrg0Share">—</div></div>
   <div class="kpi"><div class="k">Покрытие ТОП-20</div><div class="v" id="kpiCover">—</div></div>
+  <div class="kpi"><div class="k">ТОП-20 vs ср. 4 нед.</div><div class="v" id="kpiVsAvg4">—</div></div>
 </div>
+<div class="freshness" id="freshnessBar">Свежесть данных: загрузка…</div>
 <div class="insight-grid">
   <section class="insight-card">
     <h3>Сравнение корпусов</h3>
     <div class="body" id="corpusCompare"><div class="muted-box">Загрузка…</div></div>
   </section>
   <section class="insight-card">
-    <h3>Алерты роста (нед. к нед.)</h3>
+    <h3>Алерты роста (WoW / vs ср. 4 нед.)</h3>
     <div class="body" id="growthAlerts"><div class="muted-box">Загрузка…</div></div>
   </section>
 </div>
@@ -2814,6 +3249,7 @@ tr.total td { background: #eef2ff; }
   <button type="button" data-preset="korpus_3">3 корпус</button>
   <button type="button" data-preset="latest">Последние 2 недели</button>
   <button type="button" id="btnSavePreset">Сохранить текущий</button>
+  <button type="button" id="btnCopyLink">Копировать ссылку</button>
 </div>
 <div class="table-tools">
   <label>Поиск: <input type="text" id="tableSearch" placeholder="Дефект / категория / ID"></label>
@@ -2871,13 +3307,40 @@ function updateKpis(kpis) {
   document.getElementById('kpiTop20').textContent = fmtInt(d.top20_last || 0);
   document.getElementById('kpiOrg0Share').textContent = fmtPct(d.org0_share || 0);
   document.getElementById('kpiCover').textContent = fmtPct(d.top20_cover || 0);
+  document.getElementById('kpiVsAvg4').textContent = dynText(d.top20_vs_avg4);
 }
 
 function dynText(v) {
-  if (v === null || v === undefined) return '—';
+  if (v === null || v === undefined || Number.isNaN(Number(v))) return '—';
   const n = Number(v);
   const sign = n > 0 ? '+' : '';
   return sign + n.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) + '%';
+}
+
+function ageText(sec) {
+  if (sec == null) return '—';
+  const s = Number(sec);
+  if (s < 60) return Math.round(s) + ' с';
+  if (s < 3600) return Math.round(s / 60) + ' мин';
+  return (s / 3600).toFixed(1) + ' ч';
+}
+
+function updateFreshness(f) {
+  const box = document.getElementById('freshnessBar');
+  if (!f) {
+    box.innerHTML = 'Свежесть данных: нет данных';
+    return;
+  }
+  const okCls = f.ok ? 'ok' : 'err';
+  const mvCls = f.matview_available ? 'ok' : (f.matview_enabled ? 'warn' : '');
+  box.innerHTML = `
+    <span>Данные на: <b>${f.max_date || '—'}</b></span>
+    <span>Строк: <b>${fmtInt(f.row_count || 0)}</b></span>
+    <span class="${okCls}">DB ${f.ok ? 'ok' : 'error'}</span>
+    <span class="${mvCls}">Matview ${f.matview_available ? `W${f.matview_max_week || '—'} / ${f.matview_max_year || '—'}` : (f.matview_enabled ? 'нет' : 'выкл')}</span>
+    <span>Refresh: <b>${ageText(f.matview_refresh_age_sec)}</b></span>
+    <a href="/status" style="color:#1d4ed8;font-weight:700;text-decoration:none">Статус →</a>
+  `;
 }
 
 function updateCorpusCompare(rows) {
@@ -2892,9 +3355,13 @@ function updateCorpusCompare(rows) {
     const pct = Math.max(2, Math.round(Number(r.amount_last || 0) / maxLast * 100));
     const dyn = r.dynamics;
     const dynCls = dyn == null ? '' : (dyn > 2 ? ' style="color:#b91c1c"' : (dyn < -2 ? ' style="color:#15803d"' : ''));
+    const topWh = (r.top_wh || []).map(w => `${w.wh_id} ${w.name}: ${fmtInt(w.amount)}`).join('<br>');
     return `<div class="corpus-row">
       <div class="name">${r.name}<div class="muted" style="font-weight:600">${r.wh_count || 0} WH</div></div>
-      <div class="corpus-track"><div class="corpus-fill" style="width:${pct}%"></div></div>
+      <div>
+        <div class="corpus-track"><div class="corpus-fill" style="width:${pct}%"></div></div>
+        <div class="top-wh">${topWh || 'нет WH'}</div>
+      </div>
       <div class="corpus-meta">${fmtInt(r.amount_last)}<div${dynCls}>${dynText(dyn)}</div></div>
     </div>`;
   }).join('');
@@ -2910,18 +3377,19 @@ function updateGrowthAlerts(alerts) {
   const box = document.getElementById('growthAlerts');
   const list = Array.isArray(alerts) ? alerts : [];
   if (!list.length) {
-    box.innerHTML = '<div class="muted-box">Сильного роста нет (порог: +15% и сумма ≥ 50 000)</div>';
+    box.innerHTML = '<div class="muted-box">Сильного роста нет (WoW ≥ +15% или vs ср.4 ≥ +20%, сумма ≥ 50 000)</div>';
     return;
   }
   box.innerHTML = `<div class="alert-list">${list.map(a => {
     const title = `${a.label}: ${a.name}`;
-    const meta = `${fmtInt(a.w_prev)} → ${fmtInt(a.w_last)} · доля ${fmtPct(a.share || 0)}`;
+    const trigger = a.trigger === 'vs_avg4' ? 'vs ср.4' : 'WoW';
+    const meta = `${fmtInt(a.w_prev)} → ${fmtInt(a.w_last)} · ${trigger} ${dynText(a.trigger === 'vs_avg4' ? a.vs_avg4 : a.dynamics)} · доля ${fmtPct(a.share || 0)}`;
     const attrs = a.kind === 'reason' && a.row_id != null
       ? ` data-kind="reason" data-reason-id="${a.row_id}"`
       : (a.kind === 'category' ? ` data-kind="category" data-parent-name="${String(a.name).replaceAll('"','&quot;')}"` : '');
     return `<div class="alert-item"${attrs}>
       <div class="title">${title}</div>
-      <div class="meta"><span class="dyn">${dynText(a.dynamics)}</span> · ${meta}</div>
+      <div class="meta"><span class="dyn">${dynText(a.vs_avg4 != null ? a.vs_avg4 : a.dynamics)}</span> · ${meta}</div>
     </div>`;
   }).join('')}</div>`;
   box.querySelectorAll('.alert-item[data-kind]').forEach(el => {
@@ -2929,7 +3397,7 @@ function updateGrowthAlerts(alerts) {
       const params = {};
       if (el.dataset.kind === 'reason' && el.dataset.reasonId) params.reason_id = el.dataset.reasonId;
       if (el.dataset.kind === 'category' && el.dataset.parentName) params.parent_name = el.dataset.parentName;
-      openDetailsDrill(params);
+      openReasonCard(params);
     });
   });
 }
@@ -3016,6 +3484,61 @@ function openDetailsDrill(params) {
   q.set('week_last', wl);
   q.set('year', String(year));
   window.location.href = '/details?' + q.toString();
+}
+
+function openReasonCard(params) {
+  const wh = selectedWh.size ? Array.from(selectedWh).join(',') : '';
+  const { wl } = selectedWeeks();
+  const year = Number(document.getElementById('year').value) || new Date().getFullYear();
+  const q = new URLSearchParams(params || {});
+  if (wh) q.set('wh_ids', wh);
+  q.set('year', String(year));
+  q.set('week_last', String(wl));
+  window.location.href = '/reason?' + q.toString();
+}
+
+function dashboardQueryParams() {
+  const wh = selectedWh.size ? Array.from(selectedWh).join(',') : '';
+  const { wp, wl } = selectedWeeks();
+  const q = new URLSearchParams({
+    year: document.getElementById('year').value,
+    week_prev: wp,
+    week_last: wl,
+    show_all_weeks: showAllWeeks ? '1' : '0',
+  });
+  if (wh) q.set('wh_ids', wh);
+  if (activeBuilding && activeBuilding !== 'custom') q.set('building', activeBuilding);
+  return q;
+}
+
+function syncDashboardUrl() {
+  const q = dashboardQueryParams();
+  history.replaceState(null, '', '/?' + q.toString());
+}
+
+function hydrateDashboardFromUrl() {
+  const q = new URLSearchParams(window.location.search);
+  if (!q.toString()) return false;
+  if (q.get('year')) document.getElementById('year').value = q.get('year');
+  if (q.get('show_all_weeks') === '1') showAllWeeks = true;
+  if (q.get('show_all_weeks') === '0') showAllWeeks = false;
+  updateWeeksToggleLabel();
+  const building = q.get('building');
+  if (building) {
+    const b = (CONFIG.buildings || []).find(x => x.id === building);
+    if (b) {
+      selectedWh = new Set((b.wh_ids && b.wh_ids.length) ? b.wh_ids : ALL_WH_IDS);
+      activeBuilding = b.id;
+    }
+  }
+  if (q.get('wh_ids')) {
+    selectedWh = new Set(q.get('wh_ids').split(',').map(x => parseInt(x, 10)).filter(Number.isFinite));
+    activeBuilding = building || 'custom';
+  }
+  return {
+    week_prev: q.get('week_prev'),
+    week_last: q.get('week_last'),
+  };
 }
 
 function applyTableSearch() {
@@ -3150,11 +3673,33 @@ function init() {
     localStorage.setItem('dashboardPresets', JSON.stringify(list.slice(-8)));
     renderSavedPresets();
   };
+  document.getElementById('btnCopyLink').onclick = async () => {
+    syncDashboardUrl();
+    try {
+      await navigator.clipboard.writeText(window.location.href);
+      document.getElementById('status').textContent = 'Ссылка на текущий срез скопирована.';
+    } catch (_) {
+      prompt('Скопируйте ссылку среза', window.location.href);
+    }
+  };
   renderSavedPresets();
 
-  refreshWeeks(true).then(() => {
-    if (CONFIG.buildings.length) selectBuilding(CONFIG.buildings[0]);
-    else loadReport();
+  const urlState = hydrateDashboardFromUrl();
+  document.querySelectorAll('#whGrid input').forEach(cb => {
+    cb.checked = selectedWh.has(parseInt(cb.value, 10));
+  });
+  syncBuildingButtons();
+  loadFreshness();
+  refreshWeeks(!(urlState && (urlState.week_prev || urlState.week_last))).then(() => {
+    if (urlState && urlState.week_prev) document.getElementById('weekPrev').value = urlState.week_prev;
+    if (urlState && urlState.week_last) document.getElementById('weekLast').value = urlState.week_last;
+    if (urlState) {
+      loadReport();
+    } else if (CONFIG.buildings.length) {
+      selectBuilding(CONFIG.buildings[0]);
+    } else {
+      loadReport();
+    }
   });
 }
 
@@ -3410,6 +3955,14 @@ async function exportXlsx() {
   }
 }
 
+async function loadFreshness() {
+  try {
+    const r = await fetch('/api/freshness');
+    if (!r.ok) return;
+    updateFreshness(await r.json());
+  } catch (_) {}
+}
+
 async function loadReport() {
   const status = document.getElementById('status');
   const grid = document.getElementById('reportGrid');
@@ -3430,6 +3983,9 @@ async function loadReport() {
     updateKpis(data.kpis || null);
     updateCorpusCompare(data.corpus_compare || []);
     updateGrowthAlerts(data.growth_alerts || []);
+    if (data.freshness) updateFreshness(data.freshness);
+    else loadFreshness();
+    syncDashboardUrl();
     applyTableSearch();
     grid.querySelectorAll('tr.drill-row').forEach(tr => {
       tr.addEventListener('click', () => {
@@ -3437,8 +3993,7 @@ async function loadReport() {
         const params = {};
         if (kind === 'reason' && tr.dataset.reasonId) params.reason_id = tr.dataset.reasonId;
         if (kind === 'category' && tr.dataset.parentName) params.parent_name = tr.dataset.parentName;
-        if (tr.dataset.org0 === '1') params.cnt_org = '0';
-        openDetailsDrill(params);
+        openReasonCard(params);
       });
     });
     const sorted = Array.from(selectedWh).sort((a,b)=>a-b);
@@ -3446,7 +4001,7 @@ async function loadReport() {
       ? 'все корпуса (' + ALL_WH_IDS.length + ' WH)'
       : sorted.map(whLabel).join('; ');
     const alertN = (data.growth_alerts || []).length;
-    status.textContent = `WH: ${label} · расчёт нед. ${data.week_prev}→${data.week_last}, в таблице: ${(data.weeks || []).join(', ')} (${data.year}). Алертов роста: ${alertN}. Клик по строке/алерту → детализация.`;
+    status.textContent = `WH: ${label} · расчёт нед. ${data.week_prev}→${data.week_last}, в таблице: ${(data.weeks || []).join(', ')} (${data.year}). Алертов: ${alertN}. Клик по строке/алерту → карточка причины.`;
   } catch (e) {
     status.textContent = 'Ошибка: ' + e.message;
     document.getElementById('corpusCompare').innerHTML = '<div class="muted-box">Не удалось загрузить сравнение</div>';
@@ -4011,6 +4566,144 @@ loadWeekly();
 """
 
 
+REASON_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Карточка причины</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.45 Inter, "Segoe UI", Roboto, Arial, sans-serif; background: #f3f6fb; color: #0f172a; }
+header { background: linear-gradient(100deg, #0f4c81 0%, #2563eb 55%, #1d4ed8 100%); color: #fff; padding: 18px 20px; }
+header h1 { margin: 0; font-size: 22px; }
+.subtitle { margin-top: 4px; opacity: .85; font-size: 13px; }
+.topnav { margin: 12px 14px 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+.topnav a { text-decoration: none; padding: 8px 12px; border: 1px solid #bfd2ff; background: #eef4ff; color: #1e40af; border-radius: 999px; font-weight: 700; font-size: 12px; }
+.topnav a.active { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
+.meta, .kpis, .grid { margin: 0 14px 12px; }
+.meta { background: #fff; border: 1px solid #dbe4f0; border-radius: 12px; padding: 10px 12px; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
+.kpi { background: #fff; border: 1px solid #dbe4f0; border-radius: 12px; padding: 10px 12px; }
+.kpi .k { color: #64748b; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+.kpi .v { margin-top: 4px; font-size: 20px; font-weight: 800; }
+.grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 12px; }
+.card { background: #fff; border: 1px solid #dbe4f0; border-radius: 12px; overflow: hidden; box-shadow: 0 8px 20px rgba(15,23,42,.06); }
+.card h3 { margin: 0; padding: 10px 12px; background: #eff6ff; color: #1e3a8a; font-size: 13px; border-bottom: 1px solid #dbe4f0; }
+.card .body { padding: 10px 12px; }
+.bars { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(22px, 1fr); gap: 4px; align-items: end; height: 160px; }
+.bar { background: linear-gradient(180deg, #60a5fa, #2563eb); border-radius: 6px 6px 2px 2px; min-height: 2px; width: 100%; }
+.wlabel { font-size: 10px; color: #64748b; text-align: center; }
+table { width: 100%; border-collapse: collapse; }
+th, td { border-top: 1px solid #e2e8f0; padding: 7px 8px; font-size: 12px; }
+th { background: #f8fafc; text-align: left; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.btn { display: inline-block; margin-right: 8px; padding: 8px 12px; border-radius: 8px; border: 1px solid #bfd2ff; background: #eef4ff; color: #1e40af; text-decoration: none; font-weight: 700; font-size: 12px; }
+.muted { color: #64748b; }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Карточка причины</h1>
+  <div class="subtitle" id="subtitle">Тренд, топ WH / nm_id / бренды, ORG0</div>
+</header>
+<nav class="topnav">
+  <a href="/">Дашборд</a>
+  <a href="/details">Детализация</a>
+  <a href="/weekly">Динамика</a>
+  <a href="/reason" class="active">Карточка</a>
+  <a href="/status">Статус</a>
+</nav>
+<div class="meta" id="meta">Загрузка…</div>
+<div class="kpis" id="kpis"></div>
+<div class="grid">
+  <section class="card">
+    <h3>Динамика по неделям</h3>
+    <div class="body">
+      <div class="bars" id="bars"></div>
+      <div id="weekLabels" style="display:grid;grid-auto-flow:column;grid-auto-columns:minmax(22px,1fr);gap:4px;margin-top:4px"></div>
+    </div>
+  </section>
+  <section class="card">
+    <h3>Топ WH (посл. нед.)</h3>
+    <div class="body" id="topWh"></div>
+  </section>
+  <section class="card">
+    <h3>Топ nm_id</h3>
+    <div class="body" id="topNm"></div>
+  </section>
+  <section class="card">
+    <h3>Топ бренды</h3>
+    <div class="body" id="topBrands"></div>
+  </section>
+</div>
+<script>
+function fmt(n){ return Number(n||0).toLocaleString('ru-RU',{maximumFractionDigits:0}); }
+function pct(n){ if(n==null) return '—'; return Number(n).toLocaleString('ru-RU',{maximumFractionDigits:1})+'%'; }
+function dyn(n){ if(n==null) return '—'; const s=n>0?'+':''; return s+pct(n); }
+function table(rows, cols){
+  if(!rows.length) return '<div class="muted">Нет данных</div>';
+  return '<table><thead><tr>'+cols.map(c=>`<th>${c.label}</th>`).join('')+'</tr></thead><tbody>'+
+    rows.map(r=>'<tr>'+cols.map(c=>{
+      const v=r[c.key]; const cls=c.num?' class="num"':'';
+      return `<td${cls}>${c.num?fmt(v):(v??'—')}</td>`;
+    }).join('')+'</tr>').join('')+'</tbody></table>';
+}
+async function load(){
+  const q = new URLSearchParams(location.search);
+  const meta = document.getElementById('meta');
+  if(!q.get('reason_id') && !q.get('parent_name')){
+    meta.textContent = 'Укажите reason_id или parent_name в URL';
+    return;
+  }
+  try{
+    const r = await fetch('/api/reason?' + q);
+    const raw = await r.text();
+    if(!r.ok) throw new Error(raw||r.statusText);
+    const d = JSON.parse(raw);
+    document.getElementById('title').textContent = d.title || 'Карточка причины';
+    document.getElementById('subtitle').textContent =
+      (d.reason_id!=null ? ('reason_id='+d.reason_id+' · ') : '') +
+      (d.parent_name ? ('категория: '+d.parent_name+' · ') : '') +
+      `год ${d.year}, неделя ${d.week_last}`;
+    const k = d.kpis || {};
+    document.getElementById('kpis').innerHTML = [
+      ['Сумма (посл. нед.)', fmt(k.amount_last)],
+      ['ORG0', fmt(k.amount_org0_last)],
+      ['ORG0 %', pct(k.org0_share)],
+      ['Ср. 4 нед.', fmt(k.avg4)],
+      ['vs ср. 4', dyn(k.vs_avg4)],
+    ].map(([a,b])=>`<div class="kpi"><div class="k">${a}</div><div class="v">${b}</div></div>`).join('');
+    const weeks = d.weeks || [];
+    const maxA = Math.max(1, ...weeks.map(w=>w.amount_all||0));
+    document.getElementById('bars').innerHTML = weeks.map(w=>{
+      const h = Math.max(2, Math.round((w.amount_all||0)/maxA*140));
+      return `<div class="bar" style="height:${h}px" title="W${w.week}: ${fmt(w.amount_all)}"></div>`;
+    }).join('');
+    document.getElementById('weekLabels').innerHTML = weeks.map(w=>`<div class="wlabel">${w.week}</div>`).join('');
+    document.getElementById('topWh').innerHTML = table(d.top_wh||[], [
+      {key:'wh_id', label:'WH'}, {key:'name', label:'Название'}, {key:'amount', label:'Сумма', num:true}
+    ]);
+    document.getElementById('topNm').innerHTML = table(d.top_nm||[], [
+      {key:'nm_id', label:'nm_id'}, {key:'title', label:'Наименование'}, {key:'amount', label:'Сумма', num:true}
+    ]);
+    document.getElementById('topBrands').innerHTML = table(d.top_brands||[], [
+      {key:'brand_name', label:'Бренд'}, {key:'amount', label:'Сумма', num:true}
+    ]);
+    const detailsQ = new URLSearchParams(q);
+    meta.innerHTML = `Источник: ${d.source} · <a class="btn" href="/details?${detailsQ}">Сырые строки</a> <a class="btn" href="/">На дашборд</a>`;
+  }catch(e){
+    meta.textContent = 'Ошибка: ' + (e.message||e);
+  }
+}
+load();
+</script>
+</body>
+</html>
+"""
+
+
 STATUS_HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -4084,7 +4777,7 @@ async function loadStatus() {
     grid.innerHTML = [
       card('Environment', envRows + row('db_env_error', d.db_env_error || 'нет', d.db_env_error ? 'err' : 'ok')),
       card('Database', row('status', db.status, cls(db.status)) + row('detail', db.detail) + row('row_count', db.row_count) + row('max_date', db.max_date) + row('total_amount', db.total_amount)),
-      card('Matview', row('enabled', String(mv.enabled), cls(mv.enabled)) + row('available', String(mv.available), cls(mv.available)) + row('name', mv.name) + row('row_count', mv.row_count) + row('max_year/week', `${mv.max_year ?? '—'} / ${mv.max_week ?? '—'}`) + row('bootstrap_ok_age_sec', mv.bootstrap_ok_age_sec) + row('bootstrap_fail', mv.bootstrap_fail_msg || 'нет', mv.bootstrap_fail_msg ? 'err' : 'ok')),
+      card('Matview', row('enabled', String(mv.enabled), cls(mv.enabled)) + row('available', String(mv.available), cls(mv.available)) + row('name', mv.name) + row('row_count', mv.row_count) + row('max_year/week', `${mv.max_year ?? '—'} / ${mv.max_week ?? '—'}`) + row('last_refresh_age_sec', mv.last_refresh_age_sec) + row('last_refresh_note', mv.last_refresh_note || '—') + row('bootstrap_ok_age_sec', mv.bootstrap_ok_age_sec) + row('bootstrap_fail', mv.bootstrap_fail_msg || 'нет', mv.bootstrap_fail_msg ? 'err' : 'ok')),
       card('Cache / Admin', row('cache_entries', cache.entries) + row('report_ttl_sec', cache.report_ttl_sec) + row('weeks_ttl_sec', cache.weeks_ttl_sec) + row('refresh_token_required', String(admin.refresh_token_required)) + row('active_sessions', admin.active_sessions)),
     ].join('');
   } catch (e) {
@@ -4291,6 +4984,10 @@ def register_routes(application) -> None:
     def status_page():
         return STATUS_HTML
 
+    @application.route("/reason")
+    def reason_page():
+        return REASON_HTML
+
     @application.route("/api/admin/login", methods=["POST"])
     def api_admin_login():
         _, expected_password = _admin_login_password()
@@ -4483,6 +5180,7 @@ def register_routes(application) -> None:
                 "kpis": build_kpi_payload(data),
                 "corpus_compare": corpus_compare,
                 "growth_alerts": growth_alerts,
+                "freshness": fetch_freshness_payload(),
             }
         )
 
@@ -4637,6 +5335,44 @@ def register_routes(application) -> None:
             return jsonify(fetch_status_payload())
         except Exception as exc:
             return jsonify({"status": "error", "detail": str(exc)}), 500
+
+    @application.route("/api/freshness")
+    def api_freshness():
+        try:
+            return jsonify(fetch_freshness_payload())
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
+    @application.route("/api/reason")
+    def api_reason():
+        env_err = check_db_env()
+        if env_err:
+            return jsonify({"error": env_err}), 503
+        try:
+            cfg = _cfg()
+            year = request.args.get("year", cfg.get("week_year", 2026), type=int)
+            week_last = request.args.get("week_last", type=int)
+            reason_id = _detail_int_arg(request.args, "reason_id")
+            parent_name = str(request.args.get("parent_name", "") or "").strip() or None
+            top_n = _detail_positive_int_arg(
+                request.args, "top_n", 5, min_value=1, max_value=20
+            )
+            wh_raw = str(request.args.get("wh_ids", "") or "").strip()
+            wh_ids = parse_wh_ids(wh_raw) if wh_raw else None
+            payload = fetch_reason_card(
+                reason_id=reason_id,
+                parent_name=parent_name,
+                office_id=cfg.get("office_id"),
+                wh_ids=wh_ids,
+                year=year,
+                week_last=week_last,
+                top_n=top_n,
+            )
+            return jsonify(payload)
+        except QueryParamError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
 
     @application.route("/api/nomenclature/latest")
     def api_nomenclature_latest():
