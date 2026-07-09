@@ -3059,7 +3059,33 @@ input:focus, select:focus {
   border-bottom: 1px solid var(--line);
 }
 .wh-grid .corpus-hdr:first-child { margin-top: 0; }
-.actions { display: flex; align-items: flex-end; gap: 8px; flex-wrap: wrap; }
+.actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 240px;
+  flex: 1;
+  align-self: stretch;
+  justify-content: center;
+}
+.actions-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.actions-row .label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  margin-right: 2px;
+}
+.actions-row.admin {
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+}
 .table-tools {
   margin: 0 var(--pad) 10px;
   padding: 10px 12px;
@@ -3200,16 +3226,21 @@ tr.drill-row:hover td { background: #eef6ff !important; }
     <span class="hint">Все недели года — в таблице (прокрутка). Динамика, доля и среднее — только по двум выбранным неделям.</span>
   </fieldset>
   <div class="actions">
-    <button type="button" id="btnRefreshData" class="primary">Обновить данные</button>
-    <button type="button" id="btnAdminLogin" class="secondary">Вход админа</button>
-    <button type="button" id="btnAdminLogout" class="export">Выход админа</button>
-    <button type="button" id="btnToggleWeeks" class="secondary">Показать все недели</button>
-    <button type="button" id="btnNomenclature" class="secondary">Номенклатура</button>
-    <button type="button" id="btnDetails" class="secondary">Детализация</button>
-    <button type="button" id="btnClearWh" class="export">Сбросить фильтр</button>
-    <button type="button" id="btnApply" class="secondary">Применить</button>
-    <button type="button" id="btnAllWh" class="secondary">Все WH</button>
-    <button type="button" id="btnExportXlsx" class="export">Экспорт XLSX</button>
+    <div class="actions-row">
+      <button type="button" id="btnApply" class="primary">Применить</button>
+      <button type="button" id="btnToggleWeeks" class="secondary">Все недели</button>
+      <button type="button" id="btnExportXlsx" class="export">Экспорт XLSX</button>
+    </div>
+    <div class="actions-row">
+      <button type="button" id="btnAllWh" class="secondary">Все WH</button>
+      <button type="button" id="btnClearWh" class="export">Сбросить WH</button>
+    </div>
+    <div class="actions-row admin">
+      <span class="label">Админ</span>
+      <button type="button" id="btnAdminLogin" class="export">Вход</button>
+      <button type="button" id="btnAdminLogout" class="export">Выход</button>
+      <button type="button" id="btnRefreshData" class="secondary">Обновить данные</button>
+    </div>
   </div>
 </div>
 <div class="kpis" id="kpis">
@@ -3606,12 +3637,6 @@ function init() {
     updateWeeksToggleLabel();
     loadReport();
   };
-  document.getElementById('btnNomenclature').onclick = () => {
-    window.location.href = '/nomenclature';
-  };
-  document.getElementById('btnDetails').onclick = () => {
-    openDetailsDrill({});
-  };
   document.getElementById('btnClearWh').onclick = () => {
     selectedWh = new Set();
     document.querySelectorAll('#whGrid input').forEach(cb => cb.checked = false);
@@ -3766,7 +3791,7 @@ async function submitAdminLogin() {
 function updateWeeksToggleLabel() {
   const btn = document.getElementById('btnToggleWeeks');
   if (!btn) return;
-  btn.textContent = showAllWeeks ? 'Скрыть лишние недели' : 'Показать все недели';
+  btn.textContent = showAllWeeks ? 'Только 2 недели' : 'Все недели';
 }
 
 function fillWeekSelects(weeks, prev, last) {
