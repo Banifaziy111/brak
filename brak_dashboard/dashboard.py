@@ -3712,7 +3712,7 @@ SHARED_CSS = r"""
   --font: "Manrope", sans-serif;
   --display: "Source Serif 4", Georgia, serif;
   --mono: "IBM Plex Mono", ui-monospace, monospace;
-  --max: 1440px;
+  --max: 1600px;
   --ease: .25s ease;
 }
 * { box-sizing: border-box; }
@@ -3937,6 +3937,54 @@ textarea { height: auto; min-height: 56px; padding: 8px 10px; color: var(--text)
   border-radius: var(--radius-sm);
   background: #fff;
 }
+#reportGrid .table-scroll table,
+.report-grid .table-scroll table {
+  width: max-content;
+  min-width: 100%;
+  table-layout: fixed;
+  font-size: 12px;
+}
+#reportGrid .table-scroll th,
+#reportGrid .table-scroll td,
+.report-grid .table-scroll th,
+.report-grid .table-scroll td {
+  padding: 7px 8px;
+  vertical-align: middle;
+}
+#reportGrid .table-scroll .col-id,
+.report-grid .table-scroll .col-id {
+  width: 52px;
+  min-width: 52px;
+  text-align: center;
+}
+#reportGrid .table-scroll .col-name,
+.report-grid .table-scroll .col-name,
+#reportGrid .table-scroll td.name,
+.report-grid .table-scroll td.name {
+  width: 168px;
+  min-width: 168px;
+  max-width: 168px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#reportGrid .table-scroll .week-col,
+.report-grid .table-scroll .week-col {
+  width: 92px;
+  min-width: 92px;
+  white-space: nowrap;
+}
+#reportGrid .table-scroll .metric,
+.report-grid .table-scroll .metric {
+  width: 88px;
+  min-width: 88px;
+  white-space: nowrap;
+}
+#reportGrid .table-scroll .n,
+.report-grid .table-scroll .n {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
 #reportGrid .table-scroll table thead th,
 .report-grid .table-scroll table thead th {
   position: sticky;
@@ -3944,6 +3992,8 @@ textarea { height: auto; min-height: 56px; padding: 8px 10px; color: var(--text)
   z-index: 2;
   background: var(--bg-soft);
   box-shadow: 0 1px 0 var(--line-soft);
+  white-space: normal;
+  line-height: 1.2;
 }
 .insight-card, .card, .panel { padding: 14px; margin: 0; overflow: hidden; }
 .table-wrap, .heatmap-wrap { width: 100%; overflow-x: auto; }
