@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Просмотр brak_team.write_offs в браузере (HTML) или выгрузка в .html файл.
+Просмотр brak_team.brak_data_norm в браузере (HTML) или выгрузка в .html файл.
 
 Настройка:
   1. Скопируйте .env.example в .env и укажите пароль
@@ -79,6 +79,16 @@ def get_conn():
         conn.close()
 
 
+def ensure_norm_view() -> None:
+    ddl = (Path(__file__).resolve().parent / "sql" / "brak_data_norm.sql").read_text(
+        encoding="utf-8"
+    )
+    with get_conn() as conn:
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute(ddl)
+
+
 def build_where(args: argparse.Namespace) -> tuple[str, list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
@@ -115,18 +125,19 @@ def fetch_page(
     limit: int,
     offset: int,
 ) -> tuple[list[tuple], int]:
+    ensure_norm_view()
     cols = ", ".join(COL_NAMES)
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            f"SELECT COUNT(*) FROM brak_team.write_offs{where_sql}",
+            f"SELECT COUNT(*) FROM brak_team.brak_data_norm{where_sql}",
             params,
         )
         total = int(cur.fetchone()[0])
         cur.execute(
             f"""
             SELECT {cols}
-            FROM brak_team.write_offs
+            FROM brak_team.brak_data_norm
             {where_sql}
             ORDER BY date DESC NULLS LAST, shk_id
             LIMIT %s OFFSET %s
@@ -210,13 +221,13 @@ def export_static_html(path: Path, args: argparse.Namespace) -> None:
     where_sql, params = build_where(args)
     rows, total = fetch_page(where_sql, params, limit=args.limit, offset=0)
     body = f"""
-<h1>brak_team.write_offs</h1>
+<h1>brak_team.brak_data_norm</h1>
 <p class="meta">Показано {len(rows):,} из {total:,} строк (лимит export: {args.limit:,})</p>
 <div class="table-wrap">
 {rows_to_html_table(rows)}
 </div>
 """
-    path.write_text(full_html_document("write_offs", body), encoding="utf-8")
+    path.write_text(full_html_document("brak_data_norm", body), encoding="utf-8")
     print(f"Сохранено: {path} ({len(rows):,} строк)")
 
 
@@ -273,13 +284,13 @@ def run_server(args: argparse.Namespace) -> None:
 """
 
         body = f"""
-<h1>brak_team.write_offs</h1>
+<h1>brak_team.brak_data_norm</h1>
 <p class="meta">Всего по фильтру: <b>{total:,}</b> · показано {len(rows):,} на странице</p>
 {filters}
 <div class="table-wrap">{rows_to_html_table(rows)}</div>
 <div class="pager">{"".join(pager)}</div>
 """
-        return full_html_document("write_offs", body)
+        return full_html_document("brak_data_norm", body)
 
     host = os.environ.get("HTML_HOST", "127.0.0.1")
     port = int(os.environ.get("HTML_PORT", "8080"))
@@ -288,7 +299,7 @@ def run_server(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="HTML просмотр brak_team.write_offs")
+    p = argparse.ArgumentParser(description="HTML просмотр brak_team.brak_data_norm")
     p.add_argument("--export", type=Path, metavar="FILE.html", help="Сохранить статический HTML")
     p.add_argument("--limit", type=int, default=5000, help="Строк при --export (макс. для файла)")
     p.add_argument("--office-id", type=int)

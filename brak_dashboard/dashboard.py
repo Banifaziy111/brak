@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Дашборд brak_team.write_offs — 4 таблицы ТОП-20 как в отчёте.
+Дашборд brak_team.brak_data — 4 таблицы ТОП-20 как в отчёте.
+
+Источник: brak_team.brak_data → VIEW brak_team.brak_data_norm → weekly/nm matview.
 
   python write_offs_dashboard.py
   → http://127.0.0.1:8080/
@@ -40,6 +42,9 @@ from brak_dashboard.analytics import (
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / "wh_buildings.json"
+BASE_TABLE = "brak_team.brak_data"
+NORM_VIEW = "brak_team.brak_data_norm"
+NORM_VIEW_SQL_PATH = ROOT / "sql" / "brak_data_norm.sql"
 
 DETAIL_COLUMNS = (
     ("shk_id", "ШК"),
@@ -155,14 +160,14 @@ def _use_report_matview() -> bool:
 
 def _matview_name() -> str:
     return os.environ.get(
-        "WRITE_OFFS_MATVIEW_NAME", "brak_team.write_offs_weekly_mv"
-    ).strip() or "brak_team.write_offs_weekly_mv"
+        "WRITE_OFFS_MATVIEW_NAME", "brak_team.brak_weekly_mv"
+    ).strip() or "brak_team.brak_weekly_mv"
 
 
 def _nm_matview_name() -> str:
     return os.environ.get(
-        "WRITE_OFFS_NM_MATVIEW_NAME", "brak_team.write_offs_nm_weekly_mv"
-    ).strip() or "brak_team.write_offs_nm_weekly_mv"
+        "WRITE_OFFS_NM_MATVIEW_NAME", "brak_team.brak_nm_weekly_mv"
+    ).strip() or "brak_team.brak_nm_weekly_mv"
 
 
 def _quote_pg_relation_name(name: str) -> str:
@@ -213,16 +218,17 @@ def _ensure_report_matview() -> None:
                 SUM(amount)::numeric AS amount_sum,
                 COUNT(*)::bigint AS rows_cnt,
                 MAX(date) AS max_date
-            FROM brak_team.write_offs
+            FROM {NORM_VIEW}
             WHERE date IS NOT NULL
             GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
         """
         idx = [
-            f"CREATE UNIQUE INDEX IF NOT EXISTS write_offs_weekly_mv_uq ON {mv_sql} (iso_year, week_no, office_id, wh_id, cnt_org, reason_id, reason_descr, parent_name)",
-            f"CREATE INDEX IF NOT EXISTS write_offs_weekly_mv_filter_idx ON {mv_sql} (iso_year, office_id, wh_id, week_no, cnt_org)",
-            f"CREATE INDEX IF NOT EXISTS write_offs_weekly_mv_week_idx ON {mv_sql} (iso_year, week_no)",
+            f"CREATE UNIQUE INDEX IF NOT EXISTS brak_weekly_mv_uq ON {mv_sql} (iso_year, week_no, office_id, wh_id, cnt_org, reason_id, reason_descr, parent_name)",
+            f"CREATE INDEX IF NOT EXISTS brak_weekly_mv_filter_idx ON {mv_sql} (iso_year, office_id, wh_id, week_no, cnt_org)",
+            f"CREATE INDEX IF NOT EXISTS brak_weekly_mv_week_idx ON {mv_sql} (iso_year, week_no)",
         ]
         try:
+            _ensure_brak_data_norm()
             with get_conn() as conn:
                 conn.autocommit = True
                 cur = conn.cursor()
@@ -277,6 +283,7 @@ def _ensure_report_matview() -> None:
 def _ensure_nm_matview() -> None:
     if not _use_report_matview():
         return
+    _ensure_brak_data_norm()
     mv = _nm_matview_name()
     mv_sql = _quote_pg_relation_name(mv)
     ddl = f"""
@@ -289,14 +296,14 @@ def _ensure_nm_matview() -> None:
             nm_id,
             COUNT(*)::bigint AS rows_cnt,
             MAX(date) AS max_date
-        FROM brak_team.write_offs
+        FROM {NORM_VIEW}
         WHERE date IS NOT NULL
           AND nm_id IS NOT NULL
         GROUP BY 1, 2, 3, 4, 5
     """
     idx = [
-        f"CREATE UNIQUE INDEX IF NOT EXISTS write_offs_nm_weekly_mv_uq ON {mv_sql} (iso_year, week_no, office_id, wh_id, nm_id)",
-        f"CREATE INDEX IF NOT EXISTS write_offs_nm_weekly_mv_filter_idx ON {mv_sql} (iso_year, office_id, week_no, wh_id)",
+        f"CREATE UNIQUE INDEX IF NOT EXISTS brak_nm_weekly_mv_uq ON {mv_sql} (iso_year, week_no, office_id, wh_id, nm_id)",
+        f"CREATE INDEX IF NOT EXISTS brak_nm_weekly_mv_filter_idx ON {mv_sql} (iso_year, office_id, week_no, wh_id)",
     ]
     with get_conn() as conn:
         conn.autocommit = True
@@ -357,11 +364,12 @@ def _report_source() -> dict[str, str]:
             }
         except Exception as exc:
             print(
-                f"[write_offs] matview unavailable, fallback to base table: {exc}",
+                f"[brak_data] matview unavailable, fallback to {NORM_VIEW}: {exc}",
                 file=sys.stderr,
             )
+    _ensure_brak_data_norm()
     return {
-        "table": "brak_team.write_offs",
+        "table": NORM_VIEW,
         "week_expr": "EXTRACT(WEEK FROM date)::int",
         "isoyear_expr": "EXTRACT(ISOYEAR FROM date)::int",
         "amount_expr": "amount",
@@ -493,6 +501,15 @@ def get_conn():
         conn.close()
 
 
+def _ensure_brak_data_norm() -> None:
+    """Create/replace typed VIEW over brak_team.brak_data."""
+    ddl = NORM_VIEW_SQL_PATH.read_text(encoding="utf-8")
+    with get_conn() as conn:
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute(ddl)
+
+
 def load_config() -> dict:
     if CONFIG_PATH.exists():
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -520,6 +537,7 @@ def to_float(v: Any) -> float:
 
 
 def fetch_wh_list(office_id: int | None) -> list[dict]:
+    _ensure_brak_data_norm()
     clauses = []
     params: list[Any] = []
     if office_id is not None:
@@ -530,7 +548,7 @@ def fetch_wh_list(office_id: int | None) -> list[dict]:
         SELECT wh_id,
                COUNT(*) AS cnt,
                ROUND(SUM(amount)::numeric, 0) AS total_amount
-        FROM brak_team.write_offs
+        FROM {NORM_VIEW}
         {where}
         GROUP BY wh_id
         ORDER BY wh_id
@@ -549,6 +567,7 @@ def fetch_db_stats(
     office_id: int | None,
     wh_ids: list[int] | None,
 ) -> dict[str, Any]:
+    _ensure_brak_data_norm()
     clauses: list[str] = []
     params: list[Any] = []
     if office_id is not None:
@@ -562,7 +581,7 @@ def fetch_db_stats(
         SELECT COUNT(*)::bigint,
                MAX(date)::text,
                COALESCE(ROUND(SUM(amount)::numeric, 0), 0)
-        FROM brak_team.write_offs
+        FROM {NORM_VIEW}
         {where}
     """
     with get_conn() as conn:
@@ -726,15 +745,16 @@ def fetch_detail_page(
         sort_by = "date"
     if sort_dir not in ("asc", "desc"):
         sort_dir = "desc"
+    _ensure_brak_data_norm()
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute(f"SELECT COUNT(*)::bigint FROM brak_team.write_offs{where_sql}", params)
+        cur.execute(f"SELECT COUNT(*)::bigint FROM {NORM_VIEW}{where_sql}", params)
         total_row = cur.fetchone()
         total = int(total_row[0]) if total_row else 0
         cur.execute(
             f"""
             SELECT {cols}
-            FROM brak_team.write_offs
+            FROM {NORM_VIEW}
             {where_sql}
             {order_sql}
             LIMIT %s OFFSET %s
@@ -893,7 +913,7 @@ def fetch_totals_all(
     params: list[Any] = []
     if src["base_not_null_clause"]:
         clauses.append(src["base_not_null_clause"])
-    if _use_report_matview() and src["table"] != "brak_team.write_offs":
+    if _use_report_matview() and src["table"] != NORM_VIEW:
         clauses.append(src["year_clause"])
         params.append(year)
     else:
@@ -1037,7 +1057,7 @@ def fetch_top_wh_amounts(
     params: list[Any] = []
     if src["base_not_null_clause"]:
         clauses.append(src["base_not_null_clause"])
-    if _use_report_matview() and src["table"] != "brak_team.write_offs":
+    if _use_report_matview() and src["table"] != NORM_VIEW:
         clauses.append(src["year_clause"])
         params.append(year)
     else:
@@ -1301,7 +1321,7 @@ def fetch_yoy_totals(
         params: list[Any] = []
         if src["base_not_null_clause"]:
             clauses.append(src["base_not_null_clause"])
-        if _use_report_matview() and src["table"] != "brak_team.write_offs":
+        if _use_report_matview() and src["table"] != NORM_VIEW:
             clauses.append(src["year_clause"])
             params.append(y)
         else:
@@ -1398,13 +1418,14 @@ def fetch_search(
     where = " WHERE " + " AND ".join(clauses)
 
     results: list[dict[str, Any]] = []
+    _ensure_brak_data_norm()
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             f"""
             SELECT reason_id, MAX(COALESCE(reason_descr, '—')) AS name,
                    COALESCE(SUM(amount), 0) AS amount
-            FROM brak_team.write_offs
+            FROM {NORM_VIEW}
             {where}
               AND (
                 COALESCE(reason_descr, '') ILIKE %s
@@ -1429,7 +1450,7 @@ def fetch_search(
             f"""
             SELECT COALESCE(parent_name, '—') AS name,
                    COALESCE(SUM(amount), 0) AS amount
-            FROM brak_team.write_offs
+            FROM {NORM_VIEW}
             {where}
               AND COALESCE(parent_name, '') ILIKE %s
             GROUP BY 1
@@ -1451,7 +1472,7 @@ def fetch_search(
             f"""
             SELECT nm_id, MAX(COALESCE(title, '—')) AS title,
                    COALESCE(SUM(amount), 0) AS amount
-            FROM brak_team.write_offs
+            FROM {NORM_VIEW}
             {where}
               AND (
                 COALESCE(title, '') ILIKE %s
@@ -1507,7 +1528,7 @@ def fetch_reason_card(
     params: list[Any] = []
     if src["base_not_null_clause"]:
         clauses.append(src["base_not_null_clause"])
-    if _use_report_matview() and src["table"] != "brak_team.write_offs":
+    if _use_report_matview() and src["table"] != NORM_VIEW:
         clauses.append(src["year_clause"])
         params.append(year)
     else:
@@ -1594,7 +1615,8 @@ def fetch_reason_card(
             if r[0] is not None
         ]
 
-        # nm_id / brand from base table (richer dimensions).
+        # nm_id / brand from normalized base table (richer dimensions).
+        _ensure_brak_data_norm()
         base_clauses = ["date IS NOT NULL"]
         base_params: list[Any] = []
         year_start = date.fromisocalendar(year, 1, 1)
@@ -1620,7 +1642,7 @@ def fetch_reason_card(
             f"""
             SELECT nm_id, COALESCE(MAX(title), '—') AS title,
                    COALESCE(SUM(amount), 0) AS amount
-            FROM brak_team.write_offs
+            FROM {NORM_VIEW}
             {base_where}
             GROUP BY nm_id
             ORDER BY amount DESC NULLS LAST
@@ -1640,7 +1662,7 @@ def fetch_reason_card(
             f"""
             SELECT COALESCE(brand_name, '—') AS brand,
                    COALESCE(SUM(amount), 0) AS amount
-            FROM brak_team.write_offs
+            FROM {NORM_VIEW}
             {base_where}
             GROUP BY 1
             ORDER BY amount DESC
@@ -2208,12 +2230,13 @@ def export_detail_xlsx(args: Any, *, limit: int) -> bytes:
     where_sql, params = build_detail_where(args)
     cols = ", ".join(DETAIL_COL_NAMES)
     order_sql = _detail_order_sql(args)
+    _ensure_brak_data_norm()
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             f"""
             SELECT {cols}
-            FROM brak_team.write_offs
+            FROM {NORM_VIEW}
             {where_sql}
             {order_sql}
             LIMIT %s
@@ -2312,7 +2335,7 @@ def fetch_weekly_dynamics(
     params: list[Any] = []
     if src["base_not_null_clause"]:
         clauses.append(src["base_not_null_clause"])
-    if _use_report_matview() and src["table"] != "brak_team.write_offs":
+    if _use_report_matview() and src["table"] != NORM_VIEW:
         clauses.append(src["year_clause"])
         params.append(year)
     else:
@@ -2432,7 +2455,7 @@ def fetch_reason_heatmap(
     params: list[Any] = []
     if src["base_not_null_clause"]:
         clauses.append(src["base_not_null_clause"])
-    if _use_report_matview() and src["table"] != "brak_team.write_offs":
+    if _use_report_matview() and src["table"] != NORM_VIEW:
         clauses.append(src["year_clause"])
         params.append(year)
     else:
@@ -2616,7 +2639,7 @@ def fetch_watchlist_status(
     params: list[Any] = []
     if src["base_not_null_clause"]:
         clauses.append(src["base_not_null_clause"])
-    if _use_report_matview() and src["table"] != "brak_team.write_offs":
+    if _use_report_matview() and src["table"] != NORM_VIEW:
         clauses.append(src["year_clause"])
         params.append(year)
     else:
@@ -2805,7 +2828,7 @@ def fetch_available_weeks(
     params: list[Any] = []
     if src["base_not_null_clause"]:
         clauses.append(src["base_not_null_clause"])
-    if _use_report_matview() and src["table"] != "brak_team.write_offs":
+    if _use_report_matview() and src["table"] != NORM_VIEW:
         clauses.append(src["year_clause"])
         params.append(year)
     else:
@@ -2864,7 +2887,7 @@ def fetch_nomenclature_counts_latest_week(
 
     use_nm_mv = _use_report_matview()
     nm_src = {
-        "table": "brak_team.write_offs",
+        "table": NORM_VIEW,
         "week_expr": "EXTRACT(WEEK FROM date)::int",
         "isoyear_expr": "EXTRACT(ISOYEAR FROM date)::int",
         "year_clause": "date >= %s AND date < %s",
@@ -2884,7 +2907,7 @@ def fetch_nomenclature_counts_latest_week(
             }
         except Exception as exc:
             print(
-                f"[write_offs] nm matview unavailable, fallback to base table: {exc}",
+                f"[brak_data] nm matview unavailable, fallback to {NORM_VIEW}: {exc}",
                 file=sys.stderr,
             )
     clauses: list[str] = []
@@ -2896,7 +2919,7 @@ def fetch_nomenclature_counts_latest_week(
         clauses.append("office_id = %s")
         params.append(office_id)
     if year is not None:
-        if use_nm_mv and nm_src["table"] != "brak_team.write_offs":
+        if use_nm_mv and nm_src["table"] != NORM_VIEW:
             clauses.append(nm_src["year_clause"])
             params.append(year)
         else:
@@ -3017,7 +3040,7 @@ def fetch_top_bundle(
     params: list[Any] = []
     if src["base_not_null_clause"]:
         clauses.append(src["base_not_null_clause"])
-    if _use_report_matview() and src["table"] != "brak_team.write_offs":
+    if _use_report_matview() and src["table"] != NORM_VIEW:
         clauses.append(src["year_clause"])
         params.append(year)
     else:

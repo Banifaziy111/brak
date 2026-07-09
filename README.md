@@ -1,6 +1,7 @@
 # Kurkuma — дашборд брака (write_offs)
 
-HTML-отчёт ТОП-20 по дефектам и категориям из PostgreSQL `brak_team.write_offs`.
+HTML-отчёт ТОП-20 по дефектам и категориям из PostgreSQL `brak_team.brak_data`
+(через VIEW `brak_team.brak_data_norm` и weekly/nm matview).
 
 ## Локальный запуск
 
