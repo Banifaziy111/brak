@@ -3994,16 +3994,35 @@ function updatePeriodCompare(compare) {
 function updateTop20Churn(churn) {
   const box = document.getElementById('top20Churn');
   const d = (churn && churn.defects) || {};
+  const membershipChanged = Boolean(d.membership_changed);
+  const leftTitle = membershipChanged ? 'Вошли' : '↑ в рейтинге';
+  const midTitle = membershipChanged ? 'Вышли' : '↓ в рейтинге';
+  const leftItems = membershipChanged ? (d.entered || []) : (d.rank_up || []);
+  const midItems = membershipChanged ? (d.exited || []) : (d.rank_down || []);
+  const leftMode = membershipChanged ? 'entered' : 'rank_up';
+  const midMode = membershipChanged ? 'exited' : 'rank_down';
+  const note = membershipChanged
+    ? `<div class="muted" style="margin-bottom:6px">Состав ТОП-20: +${(d.entered||[]).length} / −${(d.exited||[]).length}</div>`
+    : `<div class="muted" style="margin-bottom:6px">Состав ТОП-20 не изменился — показаны сдвиги ранга</div>`;
   const col = (title, items, mode) => {
     const list = items || [];
-    if (!list.length) return `<div><h4>${title}</h4><div class="muted">—</div></div>`;
+    if (!list.length) return `<div><h4>${title}</h4><div class="muted">нет</div></div>`;
     return `<div><h4>${title}</h4>${list.slice(0,8).map(r => {
       const attrs = r.row_id != null ? ` data-kind="reason" data-reason-id="${r.row_id}"` : '';
-      const meta = mode === 'exited' ? fmtInt(r.amount_prev) : (mode === 'entered' ? fmtInt(r.amount_last) : dynText(r.delta && r.amount_prev ? (r.delta/r.amount_prev*100) : null) + ' · ' + fmtInt(r.delta));
+      let meta = '';
+      if (mode === 'exited') meta = `#${r.rank_prev || '—'} · ${fmtInt(r.amount_prev)}`;
+      else if (mode === 'entered') meta = `#${r.rank_last || '—'} · ${fmtInt(r.amount_last)}`;
+      else if (mode === 'rank_up' || mode === 'rank_down') {
+        meta = `#${r.rank_prev}→#${r.rank_last} · ${fmtInt(r.delta)}`;
+      } else {
+        const pct = r.amount_prev ? (r.delta / r.amount_prev * 100) : null;
+        const rank = (r.rank_prev != null && r.rank_last != null) ? ` · #${r.rank_prev}→#${r.rank_last}` : '';
+        meta = `${dynText(pct)} · ${fmtInt(r.delta)}${rank}`;
+      }
       return `<div class="churn-item"${attrs}><b>${r.name}</b><div class="muted">${meta}</div></div>`;
     }).join('')}</div>`;
   };
-  box.innerHTML = `<div class="churn-cols">${col('Вошли', d.entered, 'entered')}${col('Вышли', d.exited, 'exited')}${col('Остались (Δ)', d.stayed, 'stayed')}</div>`;
+  box.innerHTML = `${note}<div class="churn-cols">${col(leftTitle, leftItems, leftMode)}${col(midTitle, midItems, midMode)}${col('Остались (Δ)', d.stayed, 'stayed')}</div>`;
   box.querySelectorAll('[data-kind]').forEach(el => {
     el.addEventListener('click', () => openReasonCard({ reason_id: el.dataset.reasonId }));
   });
@@ -6445,10 +6464,22 @@ async function load(){
     `<div class="item"><b>${a.label}: ${a.name}</b><div class="meta"><span class="dyn">${dyn(a.vs_avg4!=null?a.vs_avg4:a.dynamics)}</span> · ${fmt(a.w_prev)} → ${fmt(a.w_last)}</div></div>`
   ).join('') : '<div class="muted">Сильного роста нет</div>';
   const ch = (d.top20_churn&&d.top20_churn.defects)||{};
-  const block = (title, arr, mode) => `<div style="margin-bottom:8px"><b>${title}</b>${(arr||[]).slice(0,6).map(x=>
-    `<div class="item">${x.name}<div class="meta">${mode==='exited'?fmt(x.amount_prev):fmt(x.amount_last||x.delta)}</div></div>`
-  ).join('')||'<div class="muted">—</div>'}</div>`;
-  document.getElementById('churn').innerHTML = block('Вошли', ch.entered, 'entered')+block('Вышли', ch.exited, 'exited')+block('Δ остались', ch.stayed, 'stayed');
+  const changed = Boolean(ch.membership_changed);
+  const left = changed ? (ch.entered||[]) : (ch.rank_up||[]);
+  const mid = changed ? (ch.exited||[]) : (ch.rank_down||[]);
+  const leftTitle = changed ? 'Вошли' : '↑ в рейтинге';
+  const midTitle = changed ? 'Вышли' : '↓ в рейтинге';
+  const block = (title, arr, mode) => `<div style="margin-bottom:8px"><b>${title}</b>${(arr||[]).slice(0,6).map(x=>{
+    let meta = fmt(x.amount_last||x.delta);
+    if(mode==='exited') meta = fmt(x.amount_prev);
+    if(mode==='rank') meta = `#${x.rank_prev}→#${x.rank_last} · ${fmt(x.delta)}`;
+    return `<div class="item">${x.name}<div class="meta">${meta}</div></div>`;
+  }).join('')||'<div class="muted">нет</div>'}</div>`;
+  document.getElementById('churn').innerHTML =
+    (changed?'':'<div class="muted" style="margin-bottom:6px">Состав ТОП-20 не изменился</div>')+
+    block(leftTitle, left, changed?'entered':'rank')+
+    block(midTitle, mid, changed?'exited':'rank')+
+    block('Δ остались', ch.stayed, 'stayed');
   document.getElementById('corpus').innerHTML = (d.corpus_compare||[]).map(c=>
     `<div class="item"><b>${c.name}</b><div class="meta">${fmt(c.amount_last)} · ${dyn(c.dynamics)} · доля ${pct(c.share_of_total)}</div></div>`
   ).join('') || '<div class="muted">Нет данных</div>';

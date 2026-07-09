@@ -63,18 +63,25 @@ def build_top20_churn(
     last_rows: list[dict[str, Any]],
     *,
     kind: str = "reason",
-) -> dict[str, list[dict[str, Any]]]:
-    """Classify TOP-20 membership changes between two snapshots."""
-    prev_map = {_row_key(r, kind): r for r in (prev_rows or [])}
-    last_map = {_row_key(r, kind): r for r in (last_rows or [])}
+) -> dict[str, Any]:
+    """Classify TOP-20 membership and rank changes between two snapshots."""
+    prev_sorted = sorted(
+        prev_rows or [],
+        key=lambda r: -to_float(r.get("w_last") or r.get("amount") or 0),
+    )
+    last_sorted = sorted(
+        last_rows or [],
+        key=lambda r: -to_float(r.get("w_last") or r.get("amount") or 0),
+    )
+    prev_rank = {_row_key(r, kind): i + 1 for i, r in enumerate(prev_sorted)}
+    last_rank = {_row_key(r, kind): i + 1 for i, r in enumerate(last_sorted)}
+    prev_map = {_row_key(r, kind): r for r in prev_sorted}
+    last_map = {_row_key(r, kind): r for r in last_sorted}
     prev_keys = set(prev_map)
     last_keys = set(last_map)
 
     def _item(key: str, status: str) -> dict[str, Any]:
         src = last_map.get(key) or prev_map.get(key) or {}
-        last_amt = to_float((last_map.get(key) or {}).get("w_last") or (last_map.get(key) or {}).get("amount") or 0)
-        prev_amt = to_float((prev_map.get(key) or {}).get("w_last") or (prev_map.get(key) or {}).get("amount") or 0)
-        # For prev snapshot rows, amount for that week is often in w_last of that bundle.
         if status == "exited":
             prev_amt = to_float(src.get("w_last") or src.get("amount") or 0)
             last_amt = 0.0
@@ -82,8 +89,14 @@ def build_top20_churn(
             last_amt = to_float(src.get("w_last") or src.get("amount") or 0)
             prev_amt = 0.0
         else:
-            prev_amt = to_float((prev_map.get(key) or {}).get("w_last") or 0)
-            last_amt = to_float((last_map.get(key) or {}).get("w_last") or 0)
+            prev_amt = to_float((prev_map.get(key) or {}).get("w_last") or (prev_map.get(key) or {}).get("amount") or 0)
+            last_amt = to_float((last_map.get(key) or {}).get("w_last") or (last_map.get(key) or {}).get("amount") or 0)
+        rp = prev_rank.get(key)
+        rl = last_rank.get(key)
+        rank_delta = None
+        if rp is not None and rl is not None:
+            # Positive = moved up in ranking (e.g. 5 -> 2 => +3).
+            rank_delta = rp - rl
         return {
             "kind": kind,
             "status": status,
@@ -92,15 +105,33 @@ def build_top20_churn(
             "amount_prev": prev_amt,
             "amount_last": last_amt,
             "delta": last_amt - prev_amt,
+            "rank_prev": rp,
+            "rank_last": rl,
+            "rank_delta": rank_delta,
         }
 
-    entered = [_item(k, "entered") for k in sorted(last_keys - prev_keys)]
-    exited = [_item(k, "exited") for k in sorted(prev_keys - last_keys)]
-    stayed = [_item(k, "stayed") for k in sorted(prev_keys & last_keys)]
+    entered = [_item(k, "entered") for k in (last_keys - prev_keys)]
+    exited = [_item(k, "exited") for k in (prev_keys - last_keys)]
+    stayed = [_item(k, "stayed") for k in (prev_keys & last_keys)]
     entered.sort(key=lambda x: -x["amount_last"])
     exited.sort(key=lambda x: -x["amount_prev"])
     stayed.sort(key=lambda x: -abs(x["delta"]))
-    return {"entered": entered, "exited": exited, "stayed": stayed}
+    rank_up = sorted(
+        [x for x in stayed if (x.get("rank_delta") or 0) > 0],
+        key=lambda x: (-x["rank_delta"], -abs(x["delta"])),
+    )
+    rank_down = sorted(
+        [x for x in stayed if (x.get("rank_delta") or 0) < 0],
+        key=lambda x: (x["rank_delta"], -abs(x["delta"])),
+    )
+    return {
+        "entered": entered,
+        "exited": exited,
+        "stayed": stayed,
+        "rank_up": rank_up,
+        "rank_down": rank_down,
+        "membership_changed": bool(entered or exited),
+    }
 
 
 def build_growth_alerts(

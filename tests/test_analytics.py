@@ -34,6 +34,26 @@ def test_build_top20_churn_entered_exited_stayed():
     assert [x["name"] for x in churn["exited"]] == ["Out"]
     assert churn["stayed"][0]["name"] == "Keep"
     assert churn["stayed"][0]["delta"] == 20
+    assert churn["membership_changed"] is True
+
+
+def test_build_top20_churn_rank_fallback_when_same_members():
+    prev = [
+        {"row_id": 1, "name": "A", "w_last": 200},
+        {"row_id": 2, "name": "B", "w_last": 100},
+    ]
+    last = [
+        {"row_id": 2, "name": "B", "w_last": 180},
+        {"row_id": 1, "name": "A", "w_last": 150},
+    ]
+    churn = build_top20_churn(prev, last, kind="reason")
+    assert churn["entered"] == []
+    assert churn["exited"] == []
+    assert churn["membership_changed"] is False
+    assert churn["rank_up"][0]["name"] == "B"
+    assert churn["rank_up"][0]["rank_delta"] == 1
+    assert churn["rank_down"][0]["name"] == "A"
+    assert churn["rank_down"][0]["rank_delta"] == -1
 
 
 def test_build_growth_alerts_thresholds_and_key():
