@@ -15,7 +15,7 @@ python write_offs_dashboard.py
 
 Страницы: `/` дашборд, `/digest` дайджест, `/actions` доска, `/reason` карточка, `/weekly`, `/details`, `/status`, `/nomenclature`.
 
-UI: светлая мягкая палитра — `SHARED_CSS` в `brak_dashboard/dashboard.py`.
+UI: тёмный beauty-стиль (CocosBeauty: чёрный / #F6005E, Montserrat+Oswald) — `SHARED_CSS` в `brak_dashboard/dashboard.py`.
 
 ## Тесты
 
