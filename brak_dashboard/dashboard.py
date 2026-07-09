@@ -4702,15 +4702,19 @@ function renderReasonShortcuts() {
   sel.innerHTML = opts.join('');
 }
 
+function setText(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
+}
 function updateKpis(kpis, yoy) {
   const d = kpis || {};
-  document.getElementById('kpiTotal').textContent = fmtInt(d.total_last || 0);
-  document.getElementById('kpiTop20').textContent = fmtInt(d.top20_last || 0);
-  document.getElementById('kpiOrg0Share').textContent = fmtPct(d.org0_share || 0);
-  document.getElementById('kpiCover').textContent = fmtPct(d.top20_cover || 0);
-  document.getElementById('kpiVsAvg4').textContent = dynText(d.top20_vs_avg4);
+  setText('kpiTotal', fmtInt(d.total_last || 0));
+  setText('kpiTop20', fmtInt(d.top20_last || 0));
+  setText('kpiOrg0Share', fmtPct(d.org0_share || 0));
+  setText('kpiCover', fmtPct(d.top20_cover || 0));
+  setText('kpiVsAvg4', dynText(d.top20_vs_avg4));
   const y = yoy || {};
-  document.getElementById('kpiYoy').textContent = y.yoy_pct == null ? 'нет данных' : dynText(y.yoy_pct);
+  setText('kpiYoy', y.yoy_pct == null ? 'нет данных' : dynText(y.yoy_pct));
 }
 
 function dynText(v) {
@@ -4730,6 +4734,7 @@ function ageText(sec) {
 
 function updateFreshness(f) {
   const box = document.getElementById('freshnessBar');
+  if (!box) return;
   if (!f) {
     box.innerHTML = 'Свежесть данных: нет данных';
     return;
@@ -4773,6 +4778,7 @@ function updateDimBreakdowns(payload) {
 }
 function updateCorpusCompare(rows) {
   const box = document.getElementById('corpusCompare');
+  if (!box) return;
   const list = Array.isArray(rows) ? rows : [];
   if (!list.length) {
     box.innerHTML = '<div class="muted-box">Нет данных по корпусам</div>';
@@ -4902,6 +4908,7 @@ function updateOrg0Spark(series) {
 
 function updatePeriodCompare(compare) {
   const box = document.getElementById('periodCompare');
+  if (!box) return;
   const c = compare || {};
   const rows = [...(c.defects || []), ...(c.categories || [])].slice(0, 12);
   if (!rows.length) {
@@ -4929,6 +4936,7 @@ function updatePeriodCompare(compare) {
 
 function updateTop20Churn(churn) {
   const box = document.getElementById('top20Churn');
+  if (!box) return;
   const d = (churn && churn.defects) || {};
   const membershipChanged = Boolean(d.membership_changed);
   const leftTitle = membershipChanged ? 'Вошли' : '↑ в рейтинге';
@@ -4966,6 +4974,7 @@ function updateTop20Churn(churn) {
 
 function updateGrowthAlerts(alerts, thresholds) {
   const box = document.getElementById('growthAlerts');
+  if (!box) return;
   const t = thresholds || saveAlertThresholds();
   let list = Array.isArray(alerts) ? alerts : [];
   const notes = loadAlertNotes();
@@ -5066,6 +5075,7 @@ function loadSavedPresets() {
 
 function renderSavedPresets() {
   const bar = document.getElementById('presetsBar');
+  if (!bar) return;
   bar.querySelectorAll('[data-saved-preset]').forEach(el => el.remove());
   loadSavedPresets().forEach((p, idx) => {
     const btn = document.createElement('button');
@@ -5361,9 +5371,10 @@ function applyAdminUi() {
   const btnLogin = document.getElementById('btnAdminLogin');
   const btnLogout = document.getElementById('btnAdminLogout');
   const needAuth = Boolean(CONFIG.refresh_token_required);
-  btnRefresh.classList.toggle('hidden', !isAdminSession);
-  btnLogin.disabled = isAdminSession;
-  btnLogout.disabled = !isAdminSession;
+  if (btnRefresh) btnRefresh.classList.toggle('hidden', !isAdminSession);
+  if (btnLogin) btnLogin.disabled = isAdminSession;
+  if (btnLogout) btnLogout.disabled = !isAdminSession;
+  void needAuth;
 }
 
 function adminLogin() {
@@ -5386,17 +5397,22 @@ function adminLogout() {
 
 function openAdminModal() {
   const modal = document.getElementById('adminModal');
-  document.getElementById('adminAuthError').textContent = '';
-  document.getElementById('adminLoginInput').value = '';
-  document.getElementById('adminPasswordInput').value = '';
-  modal.classList.add('show');
+  if (!modal) return;
+  const err = document.getElementById('adminAuthError');
+  const login = document.getElementById('adminLoginInput');
+  const password = document.getElementById('adminPasswordInput');
+  if (err) err.textContent = '';
+  if (login) login.value = '';
+  if (password) password.value = '';
+  modal.classList.add('open');
   modal.setAttribute('aria-hidden', 'false');
-  setTimeout(() => document.getElementById('adminLoginInput').focus(), 0);
+  setTimeout(() => { if (login) login.focus(); }, 0);
 }
 
 function closeAdminModal() {
   const modal = document.getElementById('adminModal');
-  modal.classList.remove('show');
+  if (!modal) return;
+  modal.classList.remove('open');
   modal.setAttribute('aria-hidden', 'true');
 }
 
@@ -5619,6 +5635,10 @@ async function loadFreshness() {
 async function loadReport() {
   const status = document.getElementById('status');
   const grid = document.getElementById('reportGrid');
+  if (!grid) {
+    setText('status', 'Ошибка: не найден контейнер отчёта');
+    return;
+  }
   grid.classList.add('loading');
   const wh = selectedWh.size ? Array.from(selectedWh).join(',') : '';
   const { wp, wl } = selectedWeeks();
@@ -5633,7 +5653,7 @@ async function loadReport() {
   });
   q.set('show_all_weeks', showAllWeeks ? '1' : '0');
   if (wh) q.set('wh_ids', wh);
-  status.textContent = 'Загрузка…';
+  setText('status', 'Загрузка…');
   try {
     const data = await parseApiResponse(await fetch('/api/report?' + q));
     grid.innerHTML = data.html;
@@ -5664,17 +5684,16 @@ async function loadReport() {
       ? 'все корпуса (' + ALL_WH_IDS.length + ' WH)'
       : sorted.map(whLabel).join('; ');
     const alertN = (data.growth_alerts || []).length;
-    status.textContent = `WH: ${label} · расчёт нед. ${data.week_prev}→${data.week_last}, в таблице: ${(data.weeks || []).join(', ')} (${data.year}). Алертов: ${alertN}. Клик по строке/алерту → карточка причины.`;
+    setText('status', `WH: ${label} · расчёт нед. ${data.week_prev}→${data.week_last}, в таблице: ${(data.weeks || []).join(', ')} (${data.year}). Алертов: ${alertN}. Клик по строке/алерту → карточка причины.`);
   } catch (e) {
-    status.textContent = 'Ошибка: ' + e.message;
-    document.getElementById('corpusCompare').innerHTML = '<div class="muted-box">Не удалось загрузить сравнение</div>';
-    const dimSub = document.getElementById('dimSubject');
-    const dimOwn = document.getElementById('dimOwnerState');
-    if (dimSub) dimSub.innerHTML = '<div class="muted-box">Не удалось загрузить предметы</div>';
-    if (dimOwn) dimOwn.innerHTML = '<div class="muted-box">Не удалось загрузить владельца/статус</div>';
-    document.getElementById('growthAlerts').innerHTML = '<div class="muted-box">Не удалось загрузить алерты</div>';
-    document.getElementById('periodCompare').innerHTML = '<div class="muted-box">Не удалось загрузить сравнение недель</div>';
-    document.getElementById('top20Churn').innerHTML = '<div class="muted-box">Не удалось загрузить сдвиг ТОП-20</div>';
+    setText('status', 'Ошибка: ' + e.message);
+    const setBox = (id, html) => { const el = document.getElementById(id); if (el) el.innerHTML = html; };
+    setBox('corpusCompare', '<div class="muted-box">Не удалось загрузить сравнение</div>');
+    setBox('dimSubject', '<div class="muted-box">Не удалось загрузить предметы</div>');
+    setBox('dimOwnerState', '<div class="muted-box">Не удалось загрузить владельца/статус</div>');
+    setBox('growthAlerts', '<div class="muted-box">Не удалось загрузить алерты</div>');
+    setBox('periodCompare', '<div class="muted-box">Не удалось загрузить сравнение недель</div>');
+    setBox('top20Churn', '<div class="muted-box">Не удалось загрузить сдвиг ТОП-20</div>');
   } finally {
     grid.classList.remove('loading');
   }
@@ -6175,8 +6194,8 @@ __SHARED_CSS__
 <div class="app-shell">
 <div class="app-top"><div class="app-top-inner">
 <div class="brand-row">
-  <h1>Карточка причины</h1>
-  <div class="subtitle">Тренд, топ WH / nm_id / бренды, ORG0</div>
+  <h1 id="title">Карточка причины</h1>
+  <div class="subtitle" id="subtitle">Тренд, топ WH / nm_id / бренды, ORG0</div>
 </div>
 <nav class="topnav">
   <a href="/">Дашборд</a>
@@ -6279,8 +6298,10 @@ async function load(){
     const raw = await r.text();
     if(!r.ok) throw new Error(raw||r.statusText);
     const d = JSON.parse(raw);
-    document.getElementById('title').textContent = d.title || 'Карточка причины';
-    document.getElementById('subtitle').textContent =
+    const titleEl = document.getElementById('title');
+    const subtitleEl = document.getElementById('subtitle');
+    if (titleEl) titleEl.textContent = d.title || 'Карточка причины';
+    if (subtitleEl) subtitleEl.textContent =
       (d.reason_id!=null ? ('reason_id='+d.reason_id+' · ') : '') +
       (d.parent_name ? ('категория: '+d.parent_name+' · ') : '') +
       `год ${d.year}, неделя ${d.week_last}`;
