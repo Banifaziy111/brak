@@ -953,6 +953,154 @@ def build_kpi_payload(report: dict) -> dict[str, float]:
     }
 
 
+def _corpus_wh_map(cfg: dict | None = None) -> dict[int, list[int]]:
+    cfg = cfg or load_config()
+    out: dict[int, list[int]] = {1: [], 2: [], 3: []}
+    for b in cfg.get("buildings") or []:
+        bid = str(b.get("id") or "")
+        if not bid.startswith("korpus_"):
+            continue
+        try:
+            corpus = int(bid.split("_", 1)[1])
+        except (TypeError, ValueError):
+            continue
+        if corpus not in out:
+            continue
+        ids: list[int] = []
+        for raw in b.get("wh_ids") or []:
+            try:
+                ids.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        out[corpus] = sorted(set(ids))
+    if any(out.values()):
+        return out
+    for w in cfg.get("wh_catalog") or []:
+        try:
+            wid = int(w.get("wh_id"))
+            corpus = int(w.get("corpus") or 0)
+        except (TypeError, ValueError):
+            continue
+        if corpus in out:
+            out[corpus].append(wid)
+    for corpus in out:
+        out[corpus] = sorted(set(out[corpus]))
+    return out
+
+
+def fetch_corpus_comparison(
+    *,
+    office_id: int | None,
+    year: int,
+    week_prev: int,
+    week_last: int,
+    cfg: dict | None = None,
+) -> list[dict[str, Any]]:
+    cfg = cfg or load_config()
+    corpus_map = _corpus_wh_map(cfg)
+    corpus_sig = ";".join(
+        f"{c}:{','.join(map(str, ids))}" for c, ids in sorted(corpus_map.items())
+    )
+    cache_key = f"corpus_cmp:{year}:{week_prev}:{week_last}:{office_id}:{corpus_sig}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    rows: list[dict[str, Any]] = []
+    for corpus in (1, 2, 3):
+        wh_ids = corpus_map.get(corpus) or []
+        if not wh_ids:
+            rows.append(
+                {
+                    "corpus": corpus,
+                    "name": f"{corpus} корпус",
+                    "wh_count": 0,
+                    "amount_prev": 0.0,
+                    "amount_last": 0.0,
+                    "amount_org0_last": 0.0,
+                    "dynamics": None,
+                    "org0_share": 0.0,
+                    "share_of_total": 0.0,
+                }
+            )
+            continue
+        totals_all = fetch_totals_all(
+            wh_ids=wh_ids,
+            office_id=office_id,
+            org0_only=False,
+            year=year,
+            week_prev=week_prev,
+            week_last=week_last,
+        )
+        totals_org0 = fetch_totals_all(
+            wh_ids=wh_ids,
+            office_id=office_id,
+            org0_only=True,
+            year=year,
+            week_prev=week_prev,
+            week_last=week_last,
+        )
+        prev = to_float(totals_all.get("w_prev"))
+        last = to_float(totals_all.get("w_last"))
+        org0_last = to_float(totals_org0.get("w_last"))
+        dyn = ((last - prev) / prev * 100) if prev else None
+        rows.append(
+            {
+                "corpus": corpus,
+                "name": f"{corpus} корпус",
+                "wh_count": len(wh_ids),
+                "amount_prev": prev,
+                "amount_last": last,
+                "amount_org0_last": org0_last,
+                "dynamics": dyn,
+                "org0_share": (org0_last / last * 100) if last else 0.0,
+                "share_of_total": 0.0,
+            }
+        )
+
+    total_last = sum(r["amount_last"] for r in rows)
+    for r in rows:
+        r["share_of_total"] = (r["amount_last"] / total_last * 100) if total_last else 0.0
+
+    _cache_set(cache_key, rows, CACHE_TTL_SEC)
+    return rows
+
+
+def build_growth_alerts(
+    report: dict,
+    *,
+    min_dynamics: float = 15.0,
+    min_amount: float = 50000.0,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    alerts: list[dict[str, Any]] = []
+    for kind, key, label in (
+        ("reason", "defects", "Дефект"),
+        ("category", "categories", "Категория"),
+    ):
+        for row in report.get(key) or []:
+            dyn = row.get("dynamics")
+            last = to_float(row.get("w_last"))
+            prev = to_float(row.get("w_prev"))
+            if dyn is None or dyn < min_dynamics or last < min_amount:
+                continue
+            alerts.append(
+                {
+                    "kind": kind,
+                    "label": label,
+                    "row_id": row.get("row_id"),
+                    "name": row.get("name") or "—",
+                    "w_prev": prev,
+                    "w_last": last,
+                    "dynamics": to_float(dyn),
+                    "delta": last - prev,
+                    "share": to_float(row.get("share")),
+                }
+            )
+    alerts.sort(key=lambda a: (-a["dynamics"], -a["w_last"]))
+    return alerts[: max(1, min(20, limit))]
+
+
 def export_report_xlsx(report: dict, year: int, week_prev: int, week_last: int) -> bytes:
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -2520,6 +2668,56 @@ tr.total td { background: #eef2ff; }
 }
 .kpi .k { color: #64748b; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .35px; margin-bottom: 5px; }
 .kpi .v { color: #0f172a; font-size: 22px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.insight-grid {
+  margin: 0 14px 12px;
+  display: grid;
+  grid-template-columns: 1.1fr 1fr;
+  gap: 12px;
+}
+.insight-card {
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 6px 18px rgba(15,23,42,.07);
+  overflow: hidden;
+}
+.insight-card h3 {
+  margin: 0;
+  padding: 10px 12px;
+  font-size: 13px;
+  color: #1e3a8a;
+  background: #eff6ff;
+  border-bottom: 1px solid #dbe4f0;
+}
+.insight-card .body { padding: 10px 12px; }
+.corpus-bars { display: grid; gap: 10px; }
+.corpus-row { display: grid; grid-template-columns: 84px 1fr 110px; gap: 8px; align-items: center; }
+.corpus-row .name { font-weight: 700; color: #334155; font-size: 12px; }
+.corpus-track { height: 12px; background: #eef2ff; border-radius: 999px; overflow: hidden; }
+.corpus-fill { height: 100%; background: linear-gradient(90deg, #60a5fa, #2563eb); border-radius: 999px; min-width: 2px; }
+.corpus-meta { font-size: 11px; color: #475569; text-align: right; font-variant-numeric: tabular-nums; }
+.corpus-stats { margin-top: 8px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.corpus-stat {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 8px;
+}
+.corpus-stat .k { font-size: 10px; color: #64748b; font-weight: 700; text-transform: uppercase; }
+.corpus-stat .v { margin-top: 2px; font-size: 14px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.alert-list { display: grid; gap: 8px; }
+.alert-item {
+  border: 1px solid #fecaca;
+  background: #fff7f7;
+  border-radius: 10px;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+.alert-item:hover { background: #fee2e2; }
+.alert-item .title { font-weight: 700; color: #7f1d1d; font-size: 13px; }
+.alert-item .meta { margin-top: 3px; color: #7c2d12; font-size: 12px; }
+.alert-item .dyn { color: #b91c1c; font-weight: 800; }
+.muted-box { color: #64748b; font-size: 13px; padding: 6px 0; }
 .table-tools {
   margin: 0 14px 10px;
   background: #fff;
@@ -2546,6 +2744,7 @@ tr.total td { background: #eef2ff; }
   .toolbar { margin: 10px; padding: 10px; }
   .topnav { margin: 10px 10px 8px; }
   .kpis { margin: 0 10px 10px; grid-template-columns: 1fr 1fr; }
+  .insight-grid { margin: 0 10px 10px; grid-template-columns: 1fr; }
   .table-tools { margin: 0 10px 8px; }
   #status { margin: 0 10px 10px; }
   .grid { padding: 0 10px 10px; }
@@ -2596,6 +2795,16 @@ tr.total td { background: #eef2ff; }
   <div class="kpi"><div class="k">ТОП-20 (посл. нед.)</div><div class="v" id="kpiTop20">—</div></div>
   <div class="kpi"><div class="k">ORG0 от общего</div><div class="v" id="kpiOrg0Share">—</div></div>
   <div class="kpi"><div class="k">Покрытие ТОП-20</div><div class="v" id="kpiCover">—</div></div>
+</div>
+<div class="insight-grid">
+  <section class="insight-card">
+    <h3>Сравнение корпусов</h3>
+    <div class="body" id="corpusCompare"><div class="muted-box">Загрузка…</div></div>
+  </section>
+  <section class="insight-card">
+    <h3>Алерты роста (нед. к нед.)</h3>
+    <div class="body" id="growthAlerts"><div class="muted-box">Загрузка…</div></div>
+  </section>
 </div>
 <div class="presets" id="presetsBar">
   <span class="label">Пресеты:</span>
@@ -2662,6 +2871,67 @@ function updateKpis(kpis) {
   document.getElementById('kpiTop20').textContent = fmtInt(d.top20_last || 0);
   document.getElementById('kpiOrg0Share').textContent = fmtPct(d.org0_share || 0);
   document.getElementById('kpiCover').textContent = fmtPct(d.top20_cover || 0);
+}
+
+function dynText(v) {
+  if (v === null || v === undefined) return '—';
+  const n = Number(v);
+  const sign = n > 0 ? '+' : '';
+  return sign + n.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) + '%';
+}
+
+function updateCorpusCompare(rows) {
+  const box = document.getElementById('corpusCompare');
+  const list = Array.isArray(rows) ? rows : [];
+  if (!list.length) {
+    box.innerHTML = '<div class="muted-box">Нет данных по корпусам</div>';
+    return;
+  }
+  const maxLast = Math.max(1, ...list.map(r => Number(r.amount_last || 0)));
+  const bars = list.map(r => {
+    const pct = Math.max(2, Math.round(Number(r.amount_last || 0) / maxLast * 100));
+    const dyn = r.dynamics;
+    const dynCls = dyn == null ? '' : (dyn > 2 ? ' style="color:#b91c1c"' : (dyn < -2 ? ' style="color:#15803d"' : ''));
+    return `<div class="corpus-row">
+      <div class="name">${r.name}<div class="muted" style="font-weight:600">${r.wh_count || 0} WH</div></div>
+      <div class="corpus-track"><div class="corpus-fill" style="width:${pct}%"></div></div>
+      <div class="corpus-meta">${fmtInt(r.amount_last)}<div${dynCls}>${dynText(dyn)}</div></div>
+    </div>`;
+  }).join('');
+  const stats = list.map(r => `<div class="corpus-stat">
+    <div class="k">${r.name}</div>
+    <div class="v">${fmtPct(r.share_of_total || 0)}</div>
+    <div class="muted">ORG0 ${fmtPct(r.org0_share || 0)}</div>
+  </div>`).join('');
+  box.innerHTML = `<div class="corpus-bars">${bars}</div><div class="corpus-stats">${stats}</div>`;
+}
+
+function updateGrowthAlerts(alerts) {
+  const box = document.getElementById('growthAlerts');
+  const list = Array.isArray(alerts) ? alerts : [];
+  if (!list.length) {
+    box.innerHTML = '<div class="muted-box">Сильного роста нет (порог: +15% и сумма ≥ 50 000)</div>';
+    return;
+  }
+  box.innerHTML = `<div class="alert-list">${list.map(a => {
+    const title = `${a.label}: ${a.name}`;
+    const meta = `${fmtInt(a.w_prev)} → ${fmtInt(a.w_last)} · доля ${fmtPct(a.share || 0)}`;
+    const attrs = a.kind === 'reason' && a.row_id != null
+      ? ` data-kind="reason" data-reason-id="${a.row_id}"`
+      : (a.kind === 'category' ? ` data-kind="category" data-parent-name="${String(a.name).replaceAll('"','&quot;')}"` : '');
+    return `<div class="alert-item"${attrs}>
+      <div class="title">${title}</div>
+      <div class="meta"><span class="dyn">${dynText(a.dynamics)}</span> · ${meta}</div>
+    </div>`;
+  }).join('')}</div>`;
+  box.querySelectorAll('.alert-item[data-kind]').forEach(el => {
+    el.addEventListener('click', () => {
+      const params = {};
+      if (el.dataset.kind === 'reason' && el.dataset.reasonId) params.reason_id = el.dataset.reasonId;
+      if (el.dataset.kind === 'category' && el.dataset.parentName) params.parent_name = el.dataset.parentName;
+      openDetailsDrill(params);
+    });
+  });
 }
 
 function currentFilterState() {
@@ -3158,6 +3428,8 @@ async function loadReport() {
     const data = await parseApiResponse(await fetch('/api/report?' + q));
     grid.innerHTML = data.html;
     updateKpis(data.kpis || null);
+    updateCorpusCompare(data.corpus_compare || []);
+    updateGrowthAlerts(data.growth_alerts || []);
     applyTableSearch();
     grid.querySelectorAll('tr.drill-row').forEach(tr => {
       tr.addEventListener('click', () => {
@@ -3173,9 +3445,12 @@ async function loadReport() {
     const label = selectedWh.size === ALL_WH_IDS.length
       ? 'все корпуса (' + ALL_WH_IDS.length + ' WH)'
       : sorted.map(whLabel).join('; ');
-    status.textContent = `WH: ${label} · расчёт нед. ${data.week_prev}→${data.week_last}, в таблице: ${(data.weeks || []).join(', ')} (${data.year}). Клик по строке → детализация.`;
+    const alertN = (data.growth_alerts || []).length;
+    status.textContent = `WH: ${label} · расчёт нед. ${data.week_prev}→${data.week_last}, в таблице: ${(data.weeks || []).join(', ')} (${data.year}). Алертов роста: ${alertN}. Клик по строке/алерту → детализация.`;
   } catch (e) {
     status.textContent = 'Ошибка: ' + e.message;
+    document.getElementById('corpusCompare').innerHTML = '<div class="muted-box">Не удалось загрузить сравнение</div>';
+    document.getElementById('growthAlerts').innerHTML = '<div class="muted-box">Не удалось загрузить алерты</div>';
   } finally {
     grid.classList.remove('loading');
   }
@@ -4129,6 +4404,14 @@ def register_routes(application) -> None:
             data = build_report_data(
                 wh_ids, office_id, year, week_prev, week_last, show_all_weeks=show_all_weeks
             )
+            corpus_compare = fetch_corpus_comparison(
+                office_id=office_id,
+                year=year,
+                week_prev=week_prev,
+                week_last=week_last,
+                cfg=cfg,
+            )
+            growth_alerts = build_growth_alerts(data)
         except QueryParamError as exc:
             return jsonify({"error": str(exc)}), 400
         except Exception as exc:
@@ -4198,6 +4481,8 @@ def register_routes(application) -> None:
                 "week_prev": week_prev,
                 "week_last": week_last,
                 "kpis": build_kpi_payload(data),
+                "corpus_compare": corpus_compare,
+                "growth_alerts": growth_alerts,
             }
         )
 
