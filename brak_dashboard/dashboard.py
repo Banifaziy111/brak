@@ -3902,15 +3902,48 @@ textarea { height: auto; min-height: 56px; padding: 8px 10px; color: var(--text)
   gap: 12px;
   width: 100%;
   margin: 0 0 12px;
-  align-items: start;
+  align-items: stretch;
 }
 #reportGrid .panel, .report-grid .panel {
   min-width: 0;
+  min-height: 0;
+  height: 420px;
+  max-height: 420px;
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
 }
+#reportGrid .panel > h2, .report-grid .panel > h2 {
+  flex: 0 0 auto;
+  margin: 0 0 10px;
+  font-family: var(--display);
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: .01em;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 #reportGrid .table-scroll, .report-grid .table-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
   width: 100%;
-  overflow-x: auto;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  background: #fff;
+}
+#reportGrid .table-scroll table thead th,
+.report-grid .table-scroll table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--bg-soft);
+  box-shadow: 0 1px 0 var(--line-soft);
 }
 .insight-card, .card, .panel { padding: 14px; margin: 0; overflow: hidden; }
 .table-wrap, .heatmap-wrap { width: 100%; overflow-x: auto; }
