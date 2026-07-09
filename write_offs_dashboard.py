@@ -177,93 +177,91 @@ def _ensure_report_matview() -> None:
     global _MV_BOOTSTRAP_OK_AT, _MV_BOOTSTRAP_FAIL_AT, _MV_BOOTSTRAP_FAIL_MSG
     if not _use_report_matview():
         return
-    now = monotonic()
     with _MV_LOCK:
+        now = monotonic()
         if _MV_BOOTSTRAP_OK_AT and (now - _MV_BOOTSTRAP_OK_AT) < MATVIEW_BOOTSTRAP_TTL_SEC:
             return
         if _MV_BOOTSTRAP_FAIL_AT and (now - _MV_BOOTSTRAP_FAIL_AT) < MATVIEW_BOOTSTRAP_TTL_SEC:
             raise RuntimeError(_MV_BOOTSTRAP_FAIL_MSG or "matview bootstrap failed")
 
-    mv = _matview_name()
-    mv_tmp = f"{mv}{_MV_TEMP_SUFFIX}"
-    mv_sql = _quote_pg_relation_name(mv)
-    mv_tmp_sql = _quote_pg_relation_name(mv_tmp)
-    mv_basename_sql = _quote_pg_relation_name(_relation_basename(mv))
-    ddl_tmp = f"""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS {mv_tmp_sql} AS
-        SELECT
-            EXTRACT(ISOYEAR FROM date)::int AS iso_year,
-            EXTRACT(WEEK FROM date)::int AS week_no,
-            office_id,
-            wh_id,
-            cnt_org,
-            reason_id,
-            COALESCE(reason_descr, '—') AS reason_descr,
-            COALESCE(parent_name, '—') AS parent_name,
-            SUM(amount)::numeric AS amount_sum,
-            COUNT(*)::bigint AS rows_cnt,
-            MAX(date) AS max_date
-        FROM brak_team.write_offs
-        WHERE date IS NOT NULL
-        GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
-    """
-    idx = [
-        f"CREATE UNIQUE INDEX IF NOT EXISTS write_offs_weekly_mv_uq ON {mv_sql} (iso_year, week_no, office_id, wh_id, cnt_org, reason_id, reason_descr, parent_name)",
-        f"CREATE INDEX IF NOT EXISTS write_offs_weekly_mv_filter_idx ON {mv_sql} (iso_year, office_id, wh_id, week_no, cnt_org)",
-        f"CREATE INDEX IF NOT EXISTS write_offs_weekly_mv_week_idx ON {mv_sql} (iso_year, week_no)",
-    ]
-    try:
-        with get_conn() as conn:
-            conn.autocommit = True
-            cur = conn.cursor()
-            cur.execute(f"DROP MATERIALIZED VIEW IF EXISTS {mv_tmp_sql} CASCADE")
-            cur.execute("SELECT to_regclass(%s)", (mv,))
-            mv_regclass = cur.fetchone()
-            if mv_regclass and mv_regclass[0]:
-                cur.execute(
-                    """
-                    SELECT attname
-                    FROM pg_attribute
-                    WHERE attrelid = to_regclass(%s)
-                      AND attnum > 0
-                      AND NOT attisdropped
-                    """,
-                    (mv,),
-                )
-                cols = {str(r[0]) for r in cur.fetchall()}
-                required = {
-                    "iso_year",
-                    "week_no",
-                    "office_id",
-                    "wh_id",
-                    "cnt_org",
-                    "reason_id",
-                    "reason_descr",
-                    "parent_name",
-                    "amount_sum",
-                    "rows_cnt",
-                    "max_date",
-                }
-                if ("nm_id" in cols) or (not required.issubset(cols)):
-                    cur.execute(f"DROP MATERIALIZED VIEW IF EXISTS {mv_sql} CASCADE")
-            cur.execute("SELECT to_regclass(%s)", (mv,))
-            mv_regclass = cur.fetchone()
-            if not mv_regclass or not mv_regclass[0]:
-                cur.execute(ddl_tmp)
-                cur.execute(
-                    f"ALTER MATERIALIZED VIEW {mv_tmp_sql} RENAME TO {mv_basename_sql}"
-                )
-            for stmt in idx:
-                cur.execute(stmt)
-        with _MV_LOCK:
+        mv = _matview_name()
+        mv_tmp = f"{mv}{_MV_TEMP_SUFFIX}"
+        mv_sql = _quote_pg_relation_name(mv)
+        mv_tmp_sql = _quote_pg_relation_name(mv_tmp)
+        mv_basename_sql = _quote_pg_relation_name(_relation_basename(mv))
+        ddl_tmp = f"""
+            CREATE MATERIALIZED VIEW IF NOT EXISTS {mv_tmp_sql} AS
+            SELECT
+                EXTRACT(ISOYEAR FROM date)::int AS iso_year,
+                EXTRACT(WEEK FROM date)::int AS week_no,
+                office_id,
+                wh_id,
+                cnt_org,
+                reason_id,
+                COALESCE(reason_descr, '—') AS reason_descr,
+                COALESCE(parent_name, '—') AS parent_name,
+                SUM(amount)::numeric AS amount_sum,
+                COUNT(*)::bigint AS rows_cnt,
+                MAX(date) AS max_date
+            FROM brak_team.write_offs
+            WHERE date IS NOT NULL
+            GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+        """
+        idx = [
+            f"CREATE UNIQUE INDEX IF NOT EXISTS write_offs_weekly_mv_uq ON {mv_sql} (iso_year, week_no, office_id, wh_id, cnt_org, reason_id, reason_descr, parent_name)",
+            f"CREATE INDEX IF NOT EXISTS write_offs_weekly_mv_filter_idx ON {mv_sql} (iso_year, office_id, wh_id, week_no, cnt_org)",
+            f"CREATE INDEX IF NOT EXISTS write_offs_weekly_mv_week_idx ON {mv_sql} (iso_year, week_no)",
+        ]
+        try:
+            with get_conn() as conn:
+                conn.autocommit = True
+                cur = conn.cursor()
+                cur.execute(f"DROP MATERIALIZED VIEW IF EXISTS {mv_tmp_sql} CASCADE")
+                cur.execute("SELECT to_regclass(%s)", (mv,))
+                mv_regclass = cur.fetchone()
+                if mv_regclass and mv_regclass[0]:
+                    cur.execute(
+                        """
+                        SELECT attname
+                        FROM pg_attribute
+                        WHERE attrelid = to_regclass(%s)
+                          AND attnum > 0
+                          AND NOT attisdropped
+                        """,
+                        (mv,),
+                    )
+                    cols = {str(r[0]) for r in cur.fetchall()}
+                    required = {
+                        "iso_year",
+                        "week_no",
+                        "office_id",
+                        "wh_id",
+                        "cnt_org",
+                        "reason_id",
+                        "reason_descr",
+                        "parent_name",
+                        "amount_sum",
+                        "rows_cnt",
+                        "max_date",
+                    }
+                    if ("nm_id" in cols) or (not required.issubset(cols)):
+                        cur.execute(f"DROP MATERIALIZED VIEW IF EXISTS {mv_sql} CASCADE")
+                cur.execute("SELECT to_regclass(%s)", (mv,))
+                mv_regclass = cur.fetchone()
+                if not mv_regclass or not mv_regclass[0]:
+                    cur.execute(ddl_tmp)
+                    cur.execute(
+                        f"ALTER MATERIALIZED VIEW {mv_tmp_sql} RENAME TO {mv_basename_sql}"
+                    )
+                for stmt in idx:
+                    cur.execute(stmt)
             _MV_BOOTSTRAP_OK_AT = monotonic()
             _MV_BOOTSTRAP_FAIL_AT = 0.0
             _MV_BOOTSTRAP_FAIL_MSG = ""
-    except Exception as exc:
-        with _MV_LOCK:
+        except Exception as exc:
             _MV_BOOTSTRAP_FAIL_AT = monotonic()
             _MV_BOOTSTRAP_FAIL_MSG = f"matview bootstrap failed: {exc}"
-        raise
+            raise
 
 
 def _ensure_nm_matview() -> None:
@@ -610,9 +608,10 @@ def build_detail_where(args: Any) -> tuple[str, list[Any]]:
         params.append(wh_id)
     elif wh_raw:
         wh_ids = parse_wh_ids(wh_raw)
-        if wh_ids:
-            clauses.append("wh_id = ANY(%s)")
-            params.append(wh_ids)
+        if not wh_ids:
+            raise QueryParamError("Некорректный wh_ids: список пуст")
+        clauses.append("wh_id = ANY(%s)")
+        params.append(wh_ids)
 
     row_type = str(args.get("type", "") or "").strip()
     if row_type:
@@ -1225,8 +1224,9 @@ def fetch_reason_card(
         raise QueryParamError("Укажите reason_id или parent_name")
 
     sorted_wh = sorted(wh_ids) if wh_ids else []
+    week_key = "latest" if week_last is None else str(week_last)
     cache_key = (
-        f"reason_card:{year}:{week_last}:{office_id}:{reason_id}:"
+        f"reason_card:{year}:{week_key}:{office_id}:{reason_id}:"
         f"{parent_name or ''}:{','.join(map(str, sorted_wh))}:{top_n}"
     )
     cached = _cache_get(cache_key)
@@ -1284,10 +1284,12 @@ def fetch_reason_card(
             }
             for r in week_rows
         ]
-        if week_last is None and weeks_payload:
-            week_last = weeks_payload[-1]["week"]
-        if week_last is None:
-            week_last = 1
+        resolved_week_last = week_last
+        if resolved_week_last is None and weeks_payload:
+            resolved_week_last = weeks_payload[-1]["week"]
+        if resolved_week_last is None:
+            resolved_week_last = 1
+        week_last = resolved_week_last
 
         title = parent_name or f"reason_id={reason_id}"
         if reason_id is not None:
@@ -2590,12 +2592,12 @@ def render_table(
         if drill_kind == "reason" and r.get("row_id") is not None:
             drill_attrs = (
                 f' class="drill-row" data-drill="reason" data-reason-id="{_e(r["row_id"])}"'
-                f' data-org0="{1 if org0_only else 0}" title="Открыть детализацию"'
+                f' data-org0="{1 if org0_only else 0}" title="Открыть карточку причины"'
             )
         elif drill_kind == "category" and r.get("name"):
             drill_attrs = (
                 f' class="drill-row" data-drill="category" data-parent-name="{_e(r["name"])}"'
-                f' data-org0="{1 if org0_only else 0}" title="Открыть детализацию"'
+                f' data-org0="{1 if org0_only else 0}" title="Открыть карточку причины"'
             )
         body.append(
             f"<tr{drill_attrs}>{id_cell}"
@@ -2736,23 +2738,36 @@ def build_report_data(
     c_rows = add_shares(cats, week_prev, week_last, avg_weeks=avg_weeks)
     c0_rows = add_shares(cats_org0, week_prev, week_last, avg_weeks=avg_weeks)
 
+    # Totals/avg4 must use full history before display trimming.
+    defects_total = totals(d_rows, query_weeks, week_prev, week_last, avg_weeks=avg_weeks)
+    defects_org0_total = totals(d0_rows, query_weeks, week_prev, week_last, avg_weeks=avg_weeks)
+    categories_total = totals(c_rows, query_weeks, week_prev, week_last, avg_weeks=avg_weeks)
+    categories_org0_total = totals(c0_rows, query_weeks, week_prev, week_last, avg_weeks=avg_weeks)
+
     # Keep only display weeks in row amounts for HTML tables.
     if not show_all_weeks:
         for rows in (d_rows, d0_rows, c_rows, c0_rows):
             for row in rows:
                 row["amounts"] = {w: row["amounts"].get(w, 0.0) for w in weeks}
+        for total_row in (
+            defects_total,
+            defects_org0_total,
+            categories_total,
+            categories_org0_total,
+        ):
+            total_row["amounts"] = {w: total_row["amounts"].get(w, 0.0) for w in weeks}
 
     report = {
         "weeks": weeks,
         "avg_weeks": avg_weeks,
         "defects": d_rows,
-        "defects_total": totals(d_rows, weeks, week_prev, week_last, avg_weeks=avg_weeks),
+        "defects_total": defects_total,
         "defects_org0": d0_rows,
-        "defects_org0_total": totals(d0_rows, weeks, week_prev, week_last, avg_weeks=avg_weeks),
+        "defects_org0_total": defects_org0_total,
         "categories": c_rows,
-        "categories_total": totals(c_rows, weeks, week_prev, week_last, avg_weeks=avg_weeks),
+        "categories_total": categories_total,
         "categories_org0": c0_rows,
-        "categories_org0_total": totals(c0_rows, weeks, week_prev, week_last, avg_weeks=avg_weeks),
+        "categories_org0_total": categories_org0_total,
     }
     total_all = fetch_totals_all(
         wh_ids=wh_ids,
@@ -3484,28 +3499,6 @@ function renderSavedPresets() {
   });
 }
 
-function openDetailsDrill(params) {
-  const wh = selectedWh.size ? Array.from(selectedWh).join(',') : '';
-  const { wp, wl } = selectedWeeks();
-  const year = Number(document.getElementById('year').value) || new Date().getFullYear();
-  const q = new URLSearchParams(params || {});
-  if (wh) q.set('wh_ids', wh);
-  // Approximate ISO week range for selected last week.
-  try {
-    const start = new Date(Date.UTC(year, 0, 1 + (Number(wl) - 1) * 7));
-    const day = start.getUTCDay() || 7;
-    start.setUTCDate(start.getUTCDate() - day + 1);
-    const end = new Date(start);
-    end.setUTCDate(end.getUTCDate() + 6);
-    q.set('date_from', start.toISOString().slice(0, 10));
-    q.set('date_to', end.toISOString().slice(0, 10));
-  } catch (_) {}
-  q.set('week_prev', wp);
-  q.set('week_last', wl);
-  q.set('year', String(year));
-  window.location.href = '/details?' + q.toString();
-}
-
 function openReasonCard(params) {
   const wh = selectedWh.size ? Array.from(selectedWh).join(',') : '';
   const { wl } = selectedWeeks();
@@ -3552,8 +3545,11 @@ function hydrateDashboardFromUrl() {
     }
   }
   if (q.get('wh_ids')) {
-    selectedWh = new Set(q.get('wh_ids').split(',').map(x => parseInt(x, 10)).filter(Number.isFinite));
-    activeBuilding = building || 'custom';
+    const parsed = q.get('wh_ids').split(',').map(x => parseInt(String(x).trim(), 10)).filter(Number.isFinite);
+    if (parsed.length) {
+      selectedWh = new Set(parsed);
+      activeBuilding = building || 'custom';
+    }
   }
   return {
     week_prev: q.get('week_prev'),
@@ -6510,10 +6506,34 @@ def register_routes(application) -> None:
         wh_raw = request.args.get("wh_ids", "")
         catalog_ids = catalog_wh_ids(cfg)
         if wh_raw.strip():
-            return parse_wh_ids(wh_raw)
+            wh_ids = parse_wh_ids(wh_raw)
+            if not wh_ids:
+                raise QueryParamError("Некорректный wh_ids: список пуст")
+            return wh_ids
         if catalog_ids:
             return catalog_ids
         return None
+
+    def _year_arg(default: int | None = None) -> int | None:
+        raw = request.args.get("year", "")
+        if raw is None or str(raw).strip() == "":
+            return default
+        try:
+            year = int(str(raw).strip())
+        except (TypeError, ValueError) as exc:
+            raise QueryParamError("Некорректный year: значение должно быть числом") from exc
+        if year < 2000 or year > 2100:
+            raise QueryParamError("Некорректный year: допустим диапазон 2000–2100")
+        return year
+
+    def _optional_wh_ids() -> list[int] | None:
+        wh_raw = str(request.args.get("wh_ids", "") or "").strip()
+        if not wh_raw:
+            return None
+        wh_ids = parse_wh_ids(wh_raw)
+        if not wh_ids:
+            raise QueryParamError("Некорректный wh_ids: список пуст")
+        return wh_ids
 
     @application.route("/")
     def index():
@@ -6594,7 +6614,7 @@ def register_routes(application) -> None:
 
         try:
             cfg = _cfg()
-            year = request.args.get("year", cfg.get("week_year", 2026), type=int)
+            year = _year_arg(cfg.get("week_year", 2026))
             wh_ids = _resolve_wh_ids(cfg)
             office_id = cfg.get("office_id")
 
@@ -6650,7 +6670,7 @@ def register_routes(application) -> None:
 
         try:
             cfg = _cfg()
-            year = request.args.get("year", cfg.get("week_year", 2026), type=int)
+            year = _year_arg(cfg.get("week_year", 2026))
 
             def _week_arg(name: str, default: int) -> int:
                 raw = request.args.get(name, "")
@@ -6759,7 +6779,7 @@ def register_routes(application) -> None:
             return jsonify({"error": env_err}), 503
         try:
             cfg = _cfg()
-            year = request.args.get("year", cfg.get("week_year", 2026), type=int)
+            year = _year_arg(cfg.get("week_year", 2026))
 
             def _week_arg(name: str, default: int) -> int:
                 raw = request.args.get(name, "")
@@ -6801,7 +6821,7 @@ def register_routes(application) -> None:
             return jsonify({"error": env_err}), 503
         try:
             cfg = _cfg()
-            year = request.args.get("year", cfg.get("week_year", 2026), type=int)
+            year = _year_arg(cfg.get("week_year", 2026))
             wh_ids = _resolve_wh_ids(cfg)
             weeks = fetch_available_weeks(year, cfg.get("office_id"), wh_ids)
             week_prev = cfg.get("week_prev", 20)
@@ -6879,12 +6899,11 @@ def register_routes(application) -> None:
             return jsonify({"error": env_err}), 503
         try:
             cfg = _cfg()
-            year = request.args.get("year", cfg.get("week_year", 2026), type=int)
+            year = _year_arg(cfg.get("week_year", 2026))
             top_n = _detail_positive_int_arg(
                 request.args, "top_n", 5, min_value=1, max_value=20
             )
-            wh_raw = str(request.args.get("wh_ids", "") or "").strip()
-            wh_ids = parse_wh_ids(wh_raw) if wh_raw else None
+            wh_ids = _optional_wh_ids()
             payload = fetch_weekly_dynamics(
                 year=year,
                 office_id=cfg.get("office_id"),
@@ -6918,15 +6937,14 @@ def register_routes(application) -> None:
             return jsonify({"error": env_err}), 503
         try:
             cfg = _cfg()
-            year = request.args.get("year", cfg.get("week_year", 2026), type=int)
+            year = _year_arg(cfg.get("week_year", 2026))
             week_last = request.args.get("week_last", type=int)
             reason_id = _detail_int_arg(request.args, "reason_id")
             parent_name = str(request.args.get("parent_name", "") or "").strip() or None
             top_n = _detail_positive_int_arg(
                 request.args, "top_n", 5, min_value=1, max_value=20
             )
-            wh_raw = str(request.args.get("wh_ids", "") or "").strip()
-            wh_ids = parse_wh_ids(wh_raw) if wh_raw else None
+            wh_ids = _optional_wh_ids()
             payload = fetch_reason_card(
                 reason_id=reason_id,
                 parent_name=parent_name,
@@ -6949,7 +6967,7 @@ def register_routes(application) -> None:
             return jsonify({"error": env_err}), 503
         try:
             cfg = _cfg()
-            year = request.args.get("year", type=int)
+            year = _year_arg(None)
             data = fetch_nomenclature_counts_latest_week(
                 office_id=cfg.get("office_id"),
                 year=year,
@@ -6965,7 +6983,7 @@ def register_routes(application) -> None:
             return jsonify({"error": env_err}), 503
         try:
             cfg = _cfg()
-            year = request.args.get("year", type=int)
+            year = _year_arg(None)
             payload = fetch_nomenclature_counts_latest_week(
                 office_id=cfg.get("office_id"),
                 year=year,
