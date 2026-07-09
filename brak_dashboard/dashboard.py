@@ -3552,22 +3552,40 @@ body {
 }
 a { color: var(--primary-2); text-decoration: none; }
 a:hover { text-decoration: underline; }
-.page, .page-shell { max-width: var(--max); margin: 0 auto; }
-.app-shell { min-height: 100vh; display: flex; flex-direction: column; }
+.app-shell { min-height: 100vh; display: flex; flex-direction: column; width: 100%; }
+.app-frame,
+.app-top-inner,
+.page-body,
+.page,
+.page-shell,
+.wrap {
+  width: 100%;
+  max-width: var(--max);
+  margin-left: auto;
+  margin-right: auto;
+  padding-left: var(--pad);
+  padding-right: var(--pad);
+  box-sizing: border-box;
+}
+.page-body .page,
+.page-body .wrap,
+.page-body .page-shell {
+  max-width: none;
+  margin: 0;
+  padding-left: 0;
+  padding-right: 0;
+}
 .app-top {
   background: rgba(255,255,255,.92);
   border-bottom: 1px solid var(--line);
   position: sticky; top: 0; z-index: 40;
   backdrop-filter: blur(8px);
+  width: 100%;
 }
-.app-top-inner {
-  max-width: var(--max);
-  margin: 0 auto;
-  padding: 12px var(--pad) 0;
-}
+.app-top-inner { padding-top: 12px; padding-bottom: 0; }
 .brand-row {
   display: flex; align-items: baseline; justify-content: space-between;
-  gap: 12px; flex-wrap: wrap; padding-bottom: 10px;
+  gap: 12px; flex-wrap: wrap; padding-bottom: 10px; width: 100%;
 }
 .brand-row h1 {
   margin: 0; font-size: 20px; font-weight: 700; letter-spacing: -0.03em;
@@ -3577,9 +3595,10 @@ a:hover { text-decoration: underline; }
   margin: 0; color: var(--muted); font-size: 12.5px; font-weight: 500;
 }
 .topnav {
-  display: flex; gap: 4px; flex-wrap: wrap;
-  margin: 0 calc(var(--pad) * -1); padding: 0 var(--pad);
+  display: flex; gap: 2px; flex-wrap: wrap;
+  margin: 0; padding: 0;
   border-top: 1px solid var(--line-soft);
+  width: 100%;
 }
 .topnav a {
   color: var(--muted); text-decoration: none; font-weight: 600; font-size: 12.5px;
@@ -3590,23 +3609,31 @@ a:hover { text-decoration: underline; }
 .topnav a.active {
   color: var(--primary); border-bottom-color: var(--primary); background: transparent;
 }
-.page-body { max-width: var(--max); margin: 0 auto; padding: 16px var(--pad) 32px; width: 100%; }
-header.app-header { background: transparent; border: 0; padding: 0 0 12px; }
+.page-body { padding-top: 16px; padding-bottom: 32px; flex: 1 1 auto; }
+header.app-header { background: transparent; border: 0; padding: 0 0 12px; width: 100%; }
 header.app-header h1 {
   margin: 0; font-size: 24px; font-weight: 700; letter-spacing: -0.03em; color: var(--primary);
 }
 header.app-header .subtitle, header.app-header .header-subtitle {
   margin-top: 4px; color: var(--muted); font-size: 13px; font-weight: 500;
 }
-.toolbar, .filters, .panel, .surface, .card, .insight-card, .meta, .presets, .table-tools, .freshness {
+.toolbar, .filters, .panel, .surface, .card, .insight-card, .presets, .table-tools, .freshness {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
+  width: 100%;
+  box-sizing: border-box;
 }
-.toolbar {
+.toolbar, .filters {
   display: flex; flex-wrap: wrap; gap: 12px; align-items: end;
   padding: 14px; margin: 0 0 12px;
 }
+.toolbar.main-toolbar {
+  display: grid;
+  grid-template-columns: minmax(280px, 2.2fr) minmax(220px, 1fr) minmax(180px, auto);
+  align-items: stretch;
+}
+.toolbar.main-toolbar .actions { justify-content: flex-start; }
 .toolbar > label, .toolbar .actions label, .filters > label, .filters label:not(.wh-grid label) {
   display: flex; flex-direction: column; gap: 5px;
   font-size: 11px; font-weight: 700; color: var(--muted);
@@ -3646,7 +3673,7 @@ textarea { height: auto; min-height: 56px; padding: 8px 10px; color: var(--text)
 }
 .kpis {
   display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 10px; margin: 0 0 12px;
+  gap: 10px; margin: 0 0 12px; width: 100%;
 }
 .kpi, .kpis .kpi {
   background: var(--surface);
@@ -3666,10 +3693,20 @@ textarea { height: auto; min-height: 56px; padding: 8px 10px; color: var(--text)
 .kpi .v.up, .dyn, .alert-item .dyn, .board .card .dyn { color: var(--danger); }
 .kpi .v.down { color: var(--ok); }
 .insight-grid, .grid {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 0 0 12px;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 0 0 12px; width: 100%;
+}
+#reportGrid.grid, .report-grid {
+  display: block; width: 100%; margin: 0 0 12px;
 }
 .insight-card, .card, .panel { padding: 14px; margin: 0; overflow: hidden; }
-.insight-card h3, .card h3, .panel h3 {
+.table-wrap, .heatmap-wrap { width: 100%; overflow-x: auto; }
+.chips, .pager {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  margin: 0 0 12px; width: 100%;
+}
+.pager .spacer { flex: 1 1 auto; }
+.row .val { font-family: var(--mono); font-weight: 700; white-space: nowrap; }
+.insight-card h3, .card h3, .panel h3, .card h2, .panel h2 {
   margin: 0 0 10px; font-size: 13px; font-weight: 700; letter-spacing: -0.01em;
   padding-bottom: 8px; border-bottom: 1px solid var(--line-soft); color: var(--text);
 }
@@ -3689,9 +3726,14 @@ textarea { height: auto; min-height: 56px; padding: 8px 10px; color: var(--text)
 .freshness .err { color: var(--danger); font-weight: 700; }
 .presets, .table-tools, .meta {
   display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
-  padding: 10px 12px; margin: 0 0 12px;
+  padding: 10px 12px; margin: 0 0 12px; width: 100%; box-sizing: border-box;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
 }
 .presets .label { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; }
+.alert-item .meta, .item .meta, .watch-item .meta, .row .meta {
+  display: block; width: auto; padding: 0; margin: 2px 0 0;
+  background: transparent; border: 0; border-radius: 0;
+}
 table {
   width: 100%; border-collapse: collapse; font-size: 12.5px;
   background: transparent; color: var(--text);
@@ -3709,15 +3751,21 @@ tr.drill-row { cursor: pointer; }
 tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: #f5f8fc; }
 .delta-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .delta-table th, .delta-table td { padding: 6px 7px; border-bottom: 1px solid var(--line-soft); }
-.alert-list, .watch-list, .list { display: grid; gap: 0; }
-.alert-item, .item, .watch-item, .row, .churn-item {
+.alert-list, .watch-list, .list { display: grid; gap: 0; width: 100%; }
+.alert-item, .item, .watch-item, .churn-item {
+  border: 0; border-bottom: 1px solid var(--line-soft); border-radius: 0;
+  background: transparent; padding: 9px 0; cursor: default; width: 100%;
+}
+.row {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 12px; width: 100%;
   border: 0; border-bottom: 1px solid var(--line-soft); border-radius: 0;
   background: transparent; padding: 9px 0; cursor: default;
 }
 .alert-item { cursor: pointer; }
 .alert-item:hover { background: var(--danger-soft); }
 .alert-item .title, .row .name, .watch-item b { font-weight: 650; font-size: 13px; color: var(--text); }
-.alert-item .meta, .item .meta, .row .meta { margin-top: 2px; color: var(--muted); font-size: 12px; }
+.alert-item .meta, .item .meta, .row .meta, .row .hint { margin-top: 2px; color: var(--muted); font-size: 12px; }
 .alert-item .note-row select, .alert-item .note-row input {
   background: #fff; color: var(--text); border-color: var(--line);
 }
@@ -3787,14 +3835,18 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: #f5f8
   width: 15px; height: 15px; margin: 0; flex: 0 0 auto;
   accent-color: var(--primary);
 }
-.group { border:1px solid var(--line); border-radius:var(--radius-sm); padding:10px; margin:0; min-width:260px; flex:1 1 320px; background:var(--bg-soft); }
+.group {
+  border:1px solid var(--line); border-radius:var(--radius-sm); padding:10px; margin:0;
+  min-width:0; flex:1 1 280px; background:var(--bg-soft); width:100%;
+}
+.toolbar.main-toolbar .group { flex: none; }
 .group legend { padding:0 4px; font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; }
 .group.weeks label {
   display: flex; flex-direction: column; gap: 5px;
   font-size: 11px; font-weight: 700; color: var(--muted);
   text-transform: uppercase; letter-spacing: .04em;
 }
-.actions { display:flex; flex-direction:column; gap:8px; }
+.actions { display:flex; flex-direction:column; gap:8px; min-width:0; }
 .actions-row { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
 .actions-row .label { font-size:11px; color:var(--muted); font-weight:700; text-transform:uppercase; }
 .modal-overlay {
@@ -3808,6 +3860,7 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: #f5f8
 }
 .modal h3 { margin:0 0 10px; font-size:16px; color:var(--text); }
 .modal .body { display:grid; gap:8px; }
+.modal .row { border: 0; padding: 0; justify-content: flex-end; }
 .bars { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(18px,1fr); gap:3px; align-items:end; height:140px; }
 .bar { background: var(--primary); border-radius: 3px 3px 1px 1px; min-height:2px; width:100%; }
 .bar.org0 { background: #c9852c; }
@@ -3821,7 +3874,7 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: #f5f8
   font-weight:600; cursor:pointer; border:0; background:transparent; text-transform:none;
 }
 .heatmap td.cell { border-radius: 3px; cursor: pointer; border:0; }
-.board { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
+.board { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; width:100%; }
 .col { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:12px; min-height:280px; }
 .col h3 { margin:0 0 10px; font-size:12px; display:flex; justify-content:space-between; border:0; padding:0; color:var(--text); }
 .col h3 .n { font-family:var(--mono); color:var(--muted); }
@@ -3842,10 +3895,14 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: #f5f8
   .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .churn-cols, .churn-grid { grid-template-columns: 1fr; }
   .board { grid-template-columns: 1fr 1fr; }
+  .toolbar.main-toolbar { grid-template-columns: 1fr 1fr; }
+  .toolbar.main-toolbar .actions { grid-column: 1 / -1; }
 }
 @media (max-width: 800px) {
   .insight-grid, .grid, .kpis, .board, .corpus-stats { grid-template-columns: 1fr; }
+  #reportGrid.grid, .report-grid { display: block; }
   .corpus-row { grid-template-columns: 1fr; }
+  .toolbar.main-toolbar { grid-template-columns: 1fr; }
 }
 @media print {
   .topnav, .toolbar, .no-print, .app-top { display: none !important; }
@@ -3886,7 +3943,7 @@ __SHARED_CSS__
 </div></div>
 <div class="page-body">
 
-<div class="toolbar">
+<div class="toolbar main-toolbar">
   <fieldset class="group">
     <legend>Корпус / WH</legend>
     <div class="building-btns" id="buildingBtns"></div>
@@ -4003,7 +4060,7 @@ __SHARED_CSS__
     </div>
   </div>
 </div>
-<div class="grid" id="reportGrid"></div>
+<div class="report-grid" id="reportGrid"></div>
 <script>
 const CONFIG = __CONFIG_JSON__;
 const CATALOG = CONFIG.wh_catalog && CONFIG.wh_catalog.length
@@ -5687,12 +5744,12 @@ __SHARED_CSS__
 </style>
 </head>
 <body>
-<div class="page-body">
-<div class="page">
-<header class="app-header">
-  <h1>Дайджест брака</h1>
+<div class="app-shell">
+<div class="app-top"><div class="app-top-inner">
+<div class="brand-row">
+  <h1>Дайджест</h1>
   <div class="subtitle" id="subtitle">Еженедельный срез KPI, алертов и сдвига ТОП-20</div>
-</header>
+</div>
 <nav class="topnav no-print">
   <a href="/">Дашборд</a>
   <a href="/nomenclature">Номенклатура</a>
@@ -5703,6 +5760,8 @@ __SHARED_CSS__
   <a href="/actions">Действия</a>
   <a href="/status">Статус</a>
 </nav>
+</div></div>
+<div class="page-body">
 <div class="toolbar no-print">
   <label>Год <input id="year" type="number" value="2026"></label>
   <label>Пред. нед. <input id="week_prev" type="number"></label>
@@ -5723,7 +5782,6 @@ __SHARED_CSS__
   <section class="card"><h3>Крупнейшие дельты</h3><div class="body" id="compare"><div class="empty">Загрузка…</div></div></section>
   <section class="card" style="grid-column:1 / -1"><h3>Снимок: тогда vs сейчас</h3><div class="body" id="snapshotBox"><div class="empty">Загрузка…</div></div></section>
 </div>
-</div>
 <script>
 function fmt(n){ return Number(n||0).toLocaleString('ru-RU',{maximumFractionDigits:0}); }
 function pct(n){ if(n==null) return '—'; return Number(n).toLocaleString('ru-RU',{maximumFractionDigits:1})+'%'; }
@@ -5735,7 +5793,7 @@ function dynClass(n){
 function row(name, meta, val, valCls=''){
   return `<div class="row">
     <div><div class="name" title="${String(name).replaceAll('"','&quot;')}">${name}</div>
-    ${meta ? `<div class="meta">${meta}</div>` : ''}</div>
+    ${meta ? `<div class="hint">${meta}</div>` : ''}</div>
     <div class="val ${valCls}">${val}</div>
   </div>`;
 }
@@ -5890,6 +5948,7 @@ hydrate();
 load().catch(e => { document.getElementById('alerts').innerHTML = '<div class="empty">Ошибка: '+(e.message||e)+'</div>'; });
 </script>
 </div>
+</div>
 </body>
 </html>
 """
@@ -5906,12 +5965,12 @@ __SHARED_CSS__
 </style>
 </head>
 <body>
-<div class="page-body">
-<div class="page">
-<header class="app-header">
-  <h1>Доска действий</h1>
+<div class="app-shell">
+<div class="app-top"><div class="app-top-inner">
+<div class="brand-row">
+  <h1>Действия</h1>
   <div class="subtitle">Алерты роста со статусами из localStorage</div>
-</header>
+</div>
 <nav class="topnav">
   <a href="/">Дашборд</a>
   <a href="/nomenclature">Номенклатура</a>
@@ -5922,6 +5981,8 @@ __SHARED_CSS__
   <a href="/actions" class="active">Действия</a>
   <a href="/status">Статус</a>
 </nav>
+</div></div>
+<div class="page-body">
 <div class="toolbar">
   <label>Год <input id="year" type="number" value="2026"></label>
   <label>Пред. нед. <input id="week_prev" type="number"></label>
@@ -5930,7 +5991,6 @@ __SHARED_CSS__
   <button class="btn primary" id="btnLoad" type="button">Обновить</button>
 </div>
 <div class="board" id="board"></div>
-</div>
 <script>
 const STATUSES = ['new','watching','escalated','closed'];
 function fmt(n){ return Number(n||0).toLocaleString('ru-RU',{maximumFractionDigits:0}); }
@@ -6014,6 +6074,7 @@ if(q0.get('week_last')) document.getElementById('week_last').value=q0.get('week_
 if(q0.get('wh_ids')) document.getElementById('wh_ids').value=q0.get('wh_ids');
 load().catch(e=>{ document.getElementById('board').innerHTML='<div class="empty">Ошибка: '+(e.message||e)+'</div>'; });
 </script>
+</div>
 </div>
 </body>
 </html>
@@ -6132,7 +6193,6 @@ __SHARED_CSS__
 </div></div>
 <div class="page-body">
 
-<div class="wrap">
   <section class="panel">
     <div class="toolbar">
       <a class="btn secondary" href="/">На главную</a>
@@ -6156,7 +6216,6 @@ __SHARED_CSS__
     </div>
     <div class="meta muted">Метрика: количество записей брака по `nm_id` за последнюю доступную ISO-неделю.</div>
   </section>
-</div>
 <script>
 function fmtInt(v) { return Number(v || 0).toLocaleString('ru-RU'); }
 function fmtPct(v) { return Number(v || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
