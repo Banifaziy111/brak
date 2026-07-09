@@ -56,6 +56,37 @@ DETAIL_COLUMNS = (
     ("cnt_ocr", "cnt_ocr"),
 )
 DETAIL_COL_NAMES = [c[0] for c in DETAIL_COLUMNS]
+DETAIL_SORTABLE = {
+    "date",
+    "amount",
+    "total_cost",
+    "share",
+    "office_id",
+    "wh_id",
+    "nm_id",
+    "shk_id",
+    "reason_id",
+    "cnt_org",
+    "cnt_ors",
+    "cnt_ocr",
+    "type",
+    "parent_name",
+    "reason_descr",
+    "title",
+    "brand_name",
+    "subject_name",
+}
+DETAIL_CLICK_FILTERS = {
+    "wh_id",
+    "office_id",
+    "nm_id",
+    "shk_id",
+    "reason_id",
+    "parent_name",
+    "type",
+    "cnt_org",
+    "brand_name",
+}
 
 _env_file = ROOT / ".env"
 if _env_file.exists():
@@ -592,6 +623,36 @@ def build_detail_where(args: Any) -> tuple[str, list[Any]]:
         clauses.append("date < %s::date + interval '1 day'")
         params.append(date_to)
 
+    reason_id = _detail_int_arg(args, "reason_id")
+    if reason_id is not None:
+        clauses.append("reason_id = %s")
+        params.append(reason_id)
+
+    parent_name = str(args.get("parent_name", "") or "").strip()
+    if parent_name:
+        clauses.append("COALESCE(parent_name, '—') = %s")
+        params.append(parent_name)
+
+    nm_id = _detail_int_arg(args, "nm_id")
+    if nm_id is not None:
+        clauses.append("nm_id = %s")
+        params.append(nm_id)
+
+    shk_id = _detail_int_arg(args, "shk_id")
+    if shk_id is not None:
+        clauses.append("shk_id = %s")
+        params.append(shk_id)
+
+    cnt_org = _detail_int_arg(args, "cnt_org")
+    if cnt_org is not None:
+        clauses.append("cnt_org = %s")
+        params.append(cnt_org)
+
+    brand_name = str(args.get("brand_name", "") or "").strip()
+    if brand_name:
+        clauses.append("COALESCE(brand_name, '') = %s")
+        params.append(brand_name)
+
     search = str(args.get("search", "") or "").strip()
     if search:
         like = f"%{search}%"
@@ -621,6 +682,19 @@ def _detail_row_to_dict(row: tuple[Any, ...]) -> dict[str, Any]:
     return out
 
 
+def _detail_order_sql(args: Any) -> str:
+    sort_by = str(args.get("sort_by", "") or "").strip()
+    sort_dir = str(args.get("sort_dir", "") or "").strip().lower()
+    if sort_by not in DETAIL_SORTABLE:
+        sort_by = "date"
+    if sort_dir not in ("asc", "desc"):
+        sort_dir = "desc"
+    nulls = "NULLS LAST" if sort_dir == "desc" else "NULLS FIRST"
+    if sort_by == "date":
+        return f"ORDER BY date {sort_dir} {nulls}, shk_id"
+    return f"ORDER BY {sort_by} {sort_dir} {nulls}, date DESC NULLS LAST, shk_id"
+
+
 def fetch_detail_page(
     args: Any,
     *,
@@ -630,6 +704,13 @@ def fetch_detail_page(
     where_sql, params = build_detail_where(args)
     cols = ", ".join(DETAIL_COL_NAMES)
     offset = (page - 1) * per_page
+    order_sql = _detail_order_sql(args)
+    sort_by = str(args.get("sort_by", "") or "").strip() or "date"
+    sort_dir = str(args.get("sort_dir", "") or "").strip().lower() or "desc"
+    if sort_by not in DETAIL_SORTABLE:
+        sort_by = "date"
+    if sort_dir not in ("asc", "desc"):
+        sort_dir = "desc"
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(f"SELECT COUNT(*)::bigint FROM brak_team.write_offs{where_sql}", params)
@@ -640,7 +721,7 @@ def fetch_detail_page(
             SELECT {cols}
             FROM brak_team.write_offs
             {where_sql}
-            ORDER BY date DESC NULLS LAST, shk_id
+            {order_sql}
             LIMIT %s OFFSET %s
             """,
             [*params, per_page, offset],
@@ -655,6 +736,9 @@ def fetch_detail_page(
         "page": page,
         "per_page": per_page,
         "pages": pages,
+        "sort_by": sort_by,
+        "sort_dir": sort_dir,
+        "click_filters": sorted(DETAIL_CLICK_FILTERS),
     }
 
 
@@ -851,12 +935,18 @@ def enrich_coverages(report: dict, all_totals: dict[str, dict[str, float]]) -> d
 
 def build_kpi_payload(report: dict) -> dict[str, float]:
     d = report.get("defects_total", {}) or {}
-    d0 = report.get("defects_org0_total", {}) or {}
-    total_last = to_float(d.get("w_last"))
-    org0_last = to_float(d0.get("w_last"))
+    all_totals = report.get("all_totals") or {}
+    all_defects = all_totals.get("defects") or {}
+    all_org0 = all_totals.get("defects_org0") or {}
+    total_last = to_float(all_defects.get("w_last"))
+    org0_last = to_float(all_org0.get("w_last"))
+    top20_last = to_float(d.get("w_last"))
     cover = d.get("top20_cover_last")
+    if cover is None and total_last:
+        cover = top20_last / total_last * 100
     return {
         "total_last": total_last,
+        "top20_last": top20_last,
         "org0_last": org0_last,
         "org0_share": (org0_last / total_last * 100) if total_last else 0.0,
         "top20_cover": to_float(cover) if cover is not None else 0.0,
@@ -1182,6 +1272,7 @@ def export_detail_xlsx(args: Any, *, limit: int) -> bytes:
 
     where_sql, params = build_detail_where(args)
     cols = ", ".join(DETAIL_COL_NAMES)
+    order_sql = _detail_order_sql(args)
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -1189,7 +1280,7 @@ def export_detail_xlsx(args: Any, *, limit: int) -> bytes:
             SELECT {cols}
             FROM brak_team.write_offs
             {where_sql}
-            ORDER BY date DESC NULLS LAST, shk_id
+            {order_sql}
             LIMIT %s
             """,
             [*params, limit],
@@ -1266,6 +1357,218 @@ def export_detail_xlsx(args: Any, *, limit: int) -> bytes:
     stream = BytesIO()
     wb.save(stream)
     return stream.getvalue()
+
+
+def fetch_weekly_dynamics(
+    *,
+    year: int,
+    office_id: int | None,
+    wh_ids: list[int] | None,
+    top_n: int = 5,
+) -> dict[str, Any]:
+    sorted_wh = sorted(wh_ids) if wh_ids else []
+    cache_key = f"weekly:{year}:{office_id}:{','.join(map(str, sorted_wh))}:{top_n}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    src = _report_source()
+    clauses: list[str] = []
+    params: list[Any] = []
+    if src["base_not_null_clause"]:
+        clauses.append(src["base_not_null_clause"])
+    if _use_report_matview() and src["table"] != "brak_team.write_offs":
+        clauses.append(src["year_clause"])
+        params.append(year)
+    else:
+        year_start = date.fromisocalendar(year, 1, 1)
+        year_end = date.fromisocalendar(year + 1, 1, 1)
+        clauses.append(src["year_clause"])
+        params.extend([year_start, year_end])
+    if office_id is not None:
+        clauses.append("office_id = %s")
+        params.append(office_id)
+    if wh_ids:
+        clauses.append("wh_id = ANY(%s)")
+        params.append(wh_ids)
+    where = " WHERE " + " AND ".join(clauses)
+    week_expr = src["week_expr"]
+    amount_expr = src["amount_expr"]
+    # Base table: raw rows. Matview: aggregated group rows (approx. volume).
+    row_count_expr = "COUNT(*)::bigint"
+
+    sql_weeks = f"""
+        SELECT {week_expr}::int AS week_no,
+               COALESCE(SUM({amount_expr}), 0) AS amount_all,
+               COALESCE(SUM({amount_expr}) FILTER (WHERE cnt_org = 0), 0) AS amount_org0,
+               {row_count_expr} AS row_count
+        FROM {src["table"]}
+        {where}
+        GROUP BY 1
+        ORDER BY 1
+    """
+    sql_top = f"""
+        SELECT week_no, reason_id, reason_descr, amount_sum
+        FROM (
+            SELECT {week_expr}::int AS week_no,
+                   reason_id,
+                   MAX(COALESCE(reason_descr, '—')) AS reason_descr,
+                   COALESCE(SUM({amount_expr}), 0) AS amount_sum,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY {week_expr}::int
+                       ORDER BY COALESCE(SUM({amount_expr}), 0) DESC, reason_id
+                   ) AS rn
+            FROM {src["table"]}
+            {where}
+            GROUP BY {week_expr}::int, reason_id
+        ) t
+        WHERE rn <= %s
+        ORDER BY week_no, rn
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql_weeks, params)
+        week_rows = cur.fetchall()
+        cur.execute(sql_top, [*params, max(1, min(20, top_n))])
+        top_rows = cur.fetchall()
+
+    weeks = []
+    for r in week_rows:
+        amount_all = to_float(r[1])
+        amount_org0 = to_float(r[2])
+        weeks.append(
+            {
+                "week": int(r[0]),
+                "amount_all": amount_all,
+                "amount_org0": amount_org0,
+                "org0_share": (amount_org0 / amount_all * 100) if amount_all else 0.0,
+                "row_count": int(r[3] or 0),
+            }
+        )
+    top_by_week: dict[int, list[dict[str, Any]]] = {}
+    for r in top_rows:
+        week = int(r[0])
+        top_by_week.setdefault(week, []).append(
+            {
+                "reason_id": int(r[1]) if r[1] is not None else None,
+                "reason_descr": r[2] or "—",
+                "amount": to_float(r[3]),
+            }
+        )
+    for w in weeks:
+        w["top_reasons"] = top_by_week.get(w["week"], [])
+
+    payload = {
+        "year": year,
+        "source": src["table"],
+        "weeks": weeks,
+        "totals": {
+            "amount_all": sum(w["amount_all"] for w in weeks),
+            "amount_org0": sum(w["amount_org0"] for w in weeks),
+            "row_count": sum(w["row_count"] for w in weeks),
+        },
+    }
+    _cache_set(cache_key, payload, WEEKS_CACHE_TTL_SEC)
+    return payload
+
+
+def fetch_status_payload() -> dict[str, Any]:
+    env_err = check_db_env()
+    env_states = {}
+    for name in (
+        "DATABASE_URL",
+        "DB_HOST",
+        "DB_PORT",
+        "DB_NAME",
+        "DB_USER",
+        "DB_PASSWORD",
+        "DB_SSLMODE",
+    ):
+        if name not in os.environ:
+            env_states[name] = "missing"
+        elif os.environ.get(name, "").strip() == "":
+            env_states[name] = "empty"
+        else:
+            env_states[name] = "set"
+
+    db_status = "error"
+    db_detail = env_err or ""
+    stats: dict[str, Any] = {}
+    matview: dict[str, Any] = {
+        "enabled": _use_report_matview(),
+        "name": _matview_name(),
+        "available": False,
+        "bootstrap_ok_age_sec": None,
+        "bootstrap_fail_age_sec": None,
+        "bootstrap_fail_msg": "",
+    }
+    now = monotonic()
+    with _MV_LOCK:
+        if _MV_BOOTSTRAP_OK_AT:
+            matview["bootstrap_ok_age_sec"] = round(now - _MV_BOOTSTRAP_OK_AT, 1)
+        if _MV_BOOTSTRAP_FAIL_AT:
+            matview["bootstrap_fail_age_sec"] = round(now - _MV_BOOTSTRAP_FAIL_AT, 1)
+            matview["bootstrap_fail_msg"] = _MV_BOOTSTRAP_FAIL_MSG
+
+    if not env_err:
+        try:
+            with get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                cur.fetchone()
+                db_status = "ok"
+                db_detail = "connected"
+                cfg = load_config()
+                stats = fetch_db_stats(cfg.get("office_id"), None)
+                if _use_report_matview():
+                    try:
+                        _ensure_report_matview()
+                        cur.execute(
+                            f"""
+                            SELECT COUNT(*)::bigint,
+                                   MAX(iso_year)::int,
+                                   MAX(week_no)::int
+                            FROM {_matview_name()}
+                            """
+                        )
+                        mv_row = cur.fetchone()
+                        matview["available"] = True
+                        matview["row_count"] = int(mv_row[0]) if mv_row else 0
+                        matview["max_year"] = int(mv_row[1]) if mv_row and mv_row[1] is not None else None
+                        matview["max_week"] = int(mv_row[2]) if mv_row and mv_row[2] is not None else None
+                    except Exception as exc:
+                        matview["available"] = False
+                        matview["error"] = str(exc)
+        except Exception as exc:
+            db_status = "error"
+            db_detail = str(exc)
+
+    with _CACHE_LOCK:
+        cache_entries = len(_CACHE)
+
+    return {
+        "status": "ok" if db_status == "ok" and not env_err else "degraded",
+        "vercel_env": os.environ.get("VERCEL_ENV", "local"),
+        "db_env_error": env_err,
+        "env": env_states,
+        "database": {"status": db_status, "detail": db_detail, **stats},
+        "matview": matview,
+        "cache": {
+            "entries": cache_entries,
+            "report_ttl_sec": CACHE_TTL_SEC,
+            "weeks_ttl_sec": WEEKS_CACHE_TTL_SEC,
+        },
+        "admin": {
+            "refresh_token_required": bool(
+                (
+                    os.environ.get("ADMIN_PASSWORD")
+                    or os.environ.get("DB_REFRESH_TOKEN")
+                    or ""
+                ).strip()
+            ),
+            "active_sessions": len(_ADMIN_SESSIONS),
+        },
+    }
 
 
 def fetch_available_weeks(
@@ -1708,6 +2011,8 @@ def render_table(
     week_last: int,
     name_header: str = "Наименование",
     all_totals: dict[str, float] | None = None,
+    drill_kind: str | None = None,
+    org0_only: bool = False,
 ) -> str:
     id_hdr = (
         "<th class='sticky col-id'>ИД</th>"
@@ -1729,8 +2034,19 @@ def render_table(
             f"{fmt_num(r['amounts'].get(w, 0))}</td>"
             for w in weeks
         )
+        drill_attrs = ""
+        if drill_kind == "reason" and r.get("row_id") is not None:
+            drill_attrs = (
+                f' class="drill-row" data-drill="reason" data-reason-id="{_e(r["row_id"])}"'
+                f' data-org0="{1 if org0_only else 0}" title="Открыть детализацию"'
+            )
+        elif drill_kind == "category" and r.get("name"):
+            drill_attrs = (
+                f' class="drill-row" data-drill="category" data-parent-name="{_e(r["name"])}"'
+                f' data-org0="{1 if org0_only else 0}" title="Открыть детализацию"'
+            )
         body.append(
-            f"<tr>{id_cell}"
+            f"<tr{drill_attrs}>{id_cell}"
             f"<td class='name sticky col-name' title='{_e(r['name'])}'>{_e(r['name'])}</td>"
             f"{week_cells}"
             f"<td class='n metric' style='{_e(heat_style(r['dynamics'], 'dynamics'))}'>{fmt_pct(r['dynamics'])}</td>"
@@ -2137,7 +2453,28 @@ td.sticky { background: #fff; }
 tbody tr:not(.total):nth-child(even) td { background-color: #fbfdff; }
 tbody tr:not(.total):hover td { background-color: #eef6ff; }
 tbody tr:not(.total):hover td.sticky { background-color: #eef6ff; }
+tr.drill-row { cursor: pointer; }
+tr.drill-row:hover td { background-color: #dbeafe !important; }
 tr.total td { background: #eef2ff; }
+.presets {
+  margin: 0 14px 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.presets .label { color: #64748b; font-size: 12px; font-weight: 700; margin-right: 4px; }
+.presets button {
+  border: 1px solid #bfd2ff;
+  background: #eef4ff;
+  color: #1e40af;
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.presets button:hover { background: #dbeafe; }
 .modal h3 {
   background: linear-gradient(100deg, #1d4ed8, #2563eb);
 }
@@ -2225,6 +2562,8 @@ tr.total td { background: #eef2ff; }
   <a href="/" class="active">Дашборд</a>
   <a href="/nomenclature">Номенклатура</a>
   <a href="/details">Детализация</a>
+  <a href="/weekly">Динамика</a>
+  <a href="/status">Статус</a>
 </nav>
 <div class="toolbar">
   <fieldset class="group">
@@ -2253,10 +2592,19 @@ tr.total td { background: #eef2ff; }
   </div>
 </div>
 <div class="kpis" id="kpis">
-  <div class="kpi"><div class="k">Итого брак (посл. нед.)</div><div class="v" id="kpiTotal">—</div></div>
-  <div class="kpi"><div class="k">ORG0 (посл. нед.)</div><div class="v" id="kpiOrg0">—</div></div>
-  <div class="kpi"><div class="k">Доля ORG0</div><div class="v" id="kpiOrg0Share">—</div></div>
+  <div class="kpi"><div class="k">Всего брак (посл. нед.)</div><div class="v" id="kpiTotal">—</div></div>
+  <div class="kpi"><div class="k">ТОП-20 (посл. нед.)</div><div class="v" id="kpiTop20">—</div></div>
+  <div class="kpi"><div class="k">ORG0 от общего</div><div class="v" id="kpiOrg0Share">—</div></div>
   <div class="kpi"><div class="k">Покрытие ТОП-20</div><div class="v" id="kpiCover">—</div></div>
+</div>
+<div class="presets" id="presetsBar">
+  <span class="label">Пресеты:</span>
+  <button type="button" data-preset="all">Все корпуса</button>
+  <button type="button" data-preset="korpus_1">1 корпус</button>
+  <button type="button" data-preset="korpus_2">2 корпус</button>
+  <button type="button" data-preset="korpus_3">3 корпус</button>
+  <button type="button" data-preset="latest">Последние 2 недели</button>
+  <button type="button" id="btnSavePreset">Сохранить текущий</button>
 </div>
 <div class="table-tools">
   <label>Поиск: <input type="text" id="tableSearch" placeholder="Дефект / категория / ID"></label>
@@ -2311,9 +2659,93 @@ function fmtPct(v) {
 function updateKpis(kpis) {
   const d = kpis || {};
   document.getElementById('kpiTotal').textContent = fmtInt(d.total_last || 0);
-  document.getElementById('kpiOrg0').textContent = fmtInt(d.org0_last || 0);
+  document.getElementById('kpiTop20').textContent = fmtInt(d.top20_last || 0);
   document.getElementById('kpiOrg0Share').textContent = fmtPct(d.org0_share || 0);
   document.getElementById('kpiCover').textContent = fmtPct(d.top20_cover || 0);
+}
+
+function currentFilterState() {
+  const { wp, wl } = selectedWeeks();
+  return {
+    year: document.getElementById('year').value,
+    week_prev: wp,
+    week_last: wl,
+    show_all_weeks: showAllWeeks,
+    building: activeBuilding,
+    wh_ids: Array.from(selectedWh),
+  };
+}
+
+function applyFilterState(state) {
+  if (!state) return;
+  if (state.year) document.getElementById('year').value = state.year;
+  if (Array.isArray(state.wh_ids)) {
+    selectedWh = new Set(state.wh_ids.map(Number));
+    document.querySelectorAll('#whGrid input').forEach(cb => {
+      cb.checked = selectedWh.has(parseInt(cb.value, 10));
+    });
+  }
+  if (state.building) {
+    activeBuilding = state.building;
+    syncBuildingButtons();
+  }
+  if (typeof state.show_all_weeks === 'boolean') {
+    showAllWeeks = state.show_all_weeks;
+    updateWeeksToggleLabel();
+  }
+  fillWeekSelects(
+    availableWeeks.length ? availableWeeks : [Number(state.week_prev), Number(state.week_last)].filter(Boolean),
+    Number(state.week_prev),
+    Number(state.week_last)
+  );
+}
+
+function loadSavedPresets() {
+  try {
+    return JSON.parse(localStorage.getItem('dashboardPresets') || '[]');
+  } catch (_) {
+    return [];
+  }
+}
+
+function renderSavedPresets() {
+  const bar = document.getElementById('presetsBar');
+  bar.querySelectorAll('[data-saved-preset]').forEach(el => el.remove());
+  loadSavedPresets().forEach((p, idx) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.dataset.savedPreset = String(idx);
+    btn.textContent = p.name || ('Пресет ' + (idx + 1));
+    btn.addEventListener('click', async () => {
+      applyFilterState(p.state);
+      await refreshWeeks();
+      applyFilterState(p.state);
+      loadReport();
+    });
+    bar.appendChild(btn);
+  });
+}
+
+function openDetailsDrill(params) {
+  const wh = selectedWh.size ? Array.from(selectedWh).join(',') : '';
+  const { wp, wl } = selectedWeeks();
+  const year = Number(document.getElementById('year').value) || new Date().getFullYear();
+  const q = new URLSearchParams(params || {});
+  if (wh) q.set('wh_ids', wh);
+  // Approximate ISO week range for selected last week.
+  try {
+    const start = new Date(Date.UTC(year, 0, 1 + (Number(wl) - 1) * 7));
+    const day = start.getUTCDay() || 7;
+    start.setUTCDate(start.getUTCDate() - day + 1);
+    const end = new Date(start);
+    end.setUTCDate(end.getUTCDate() + 6);
+    q.set('date_from', start.toISOString().slice(0, 10));
+    q.set('date_to', end.toISOString().slice(0, 10));
+  } catch (_) {}
+  q.set('week_prev', wp);
+  q.set('week_last', wl);
+  q.set('year', String(year));
+  window.location.href = '/details?' + q.toString();
 }
 
 function applyTableSearch() {
@@ -2396,7 +2828,7 @@ function init() {
     window.location.href = '/nomenclature';
   };
   document.getElementById('btnDetails').onclick = () => {
-    window.location.href = '/details';
+    openDetailsDrill({});
   };
   document.getElementById('btnClearWh').onclick = () => {
     selectedWh = new Set();
@@ -2417,6 +2849,38 @@ function init() {
     await refreshWeeks();
     loadReport();
   };
+  document.querySelectorAll('#presetsBar [data-preset]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const key = btn.dataset.preset;
+      if (key === 'all') {
+        selectedWh = new Set(ALL_WH_IDS);
+        activeBuilding = 'all';
+      } else if (key.startsWith('korpus_')) {
+        const b = (CONFIG.buildings || []).find(x => x.id === key);
+        if (b) {
+          selectedWh = new Set(b.wh_ids || []);
+          activeBuilding = b.id;
+        }
+      } else if (key === 'latest') {
+        await refreshWeeks(true);
+      }
+      document.querySelectorAll('#whGrid input').forEach(cb => {
+        cb.checked = selectedWh.has(parseInt(cb.value, 10));
+      });
+      syncBuildingButtons();
+      await refreshWeeks(key === 'latest');
+      loadReport();
+    });
+  });
+  document.getElementById('btnSavePreset').onclick = () => {
+    const name = prompt('Название пресета', 'Мой фильтр');
+    if (!name) return;
+    const list = loadSavedPresets();
+    list.push({ name: name.trim(), state: currentFilterState() });
+    localStorage.setItem('dashboardPresets', JSON.stringify(list.slice(-8)));
+    renderSavedPresets();
+  };
+  renderSavedPresets();
 
   refreshWeeks(true).then(() => {
     if (CONFIG.buildings.length) selectBuilding(CONFIG.buildings[0]);
@@ -2664,7 +3128,8 @@ async function exportXlsx() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'write_offs_report.xlsx';
+    const building = activeBuilding && activeBuilding !== 'custom' ? activeBuilding : 'wh';
+    a.download = `write_offs_${building}_${q.get('year')}_w${wp}-${wl}.xlsx`;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -2694,11 +3159,21 @@ async function loadReport() {
     grid.innerHTML = data.html;
     updateKpis(data.kpis || null);
     applyTableSearch();
+    grid.querySelectorAll('tr.drill-row').forEach(tr => {
+      tr.addEventListener('click', () => {
+        const kind = tr.dataset.drill;
+        const params = {};
+        if (kind === 'reason' && tr.dataset.reasonId) params.reason_id = tr.dataset.reasonId;
+        if (kind === 'category' && tr.dataset.parentName) params.parent_name = tr.dataset.parentName;
+        if (tr.dataset.org0 === '1') params.cnt_org = '0';
+        openDetailsDrill(params);
+      });
+    });
     const sorted = Array.from(selectedWh).sort((a,b)=>a-b);
     const label = selectedWh.size === ALL_WH_IDS.length
       ? 'все корпуса (' + ALL_WH_IDS.length + ' WH)'
       : sorted.map(whLabel).join('; ');
-    status.textContent = `WH: ${label} · расчёт нед. ${data.week_prev}→${data.week_last}, в таблице: ${(data.weeks || []).join(', ')} (${data.year})`;
+    status.textContent = `WH: ${label} · расчёт нед. ${data.week_prev}→${data.week_last}, в таблице: ${(data.weeks || []).join(', ')} (${data.year}). Клик по строке → детализация.`;
   } catch (e) {
     status.textContent = 'Ошибка: ' + e.message;
   } finally {
@@ -2724,7 +3199,6 @@ DETAILS_HTML = """<!DOCTYPE html>
 :root {
   --bg: #f3f6fb;
   --surface: #ffffff;
-  --surface-2: #f8fafc;
   --text: #0f172a;
   --muted: #64748b;
   --line: #dbe4f0;
@@ -2761,7 +3235,7 @@ header h1 { margin: 0; font-size: 24px; font-weight: 750; }
 }
 .topnav a:hover { background: #dbeafe; border-color: #93c5fd; }
 .topnav a.active { background: linear-gradient(180deg, #2563eb, #1d4ed8); color: #fff; border-color: #1d4ed8; }
-.filters, .meta, .panel {
+.filters, .meta, .panel, .chips {
   margin: 0 14px 12px;
   background: var(--surface);
   border: 1px solid var(--line);
@@ -2783,14 +3257,15 @@ header h1 { margin: 0; font-size: 24px; font-weight: 750; }
   font-weight: 700;
 }
 .filters input, .filters select {
-  min-width: 120px;
+  min-width: 110px;
   border: 1px solid #cbd5e1;
   border-radius: 9px;
   background: #fff;
   padding: 7px 9px;
   font: inherit;
 }
-.filters input[name="search"] { min-width: 280px; }
+.filters input[name="search"] { min-width: 240px; }
+.filters input[name="wh_ids"], .filters input[name="parent_name"] { min-width: 160px; }
 .filters input:focus, .filters select:focus {
   outline: none;
   border-color: #60a5fa;
@@ -2809,10 +3284,30 @@ header h1 { margin: 0; font-size: 24px; font-weight: 750; }
 .btn.secondary { background: #f0f9ff; color: #075985; border-color: #bae6fd; }
 .btn.export { background: #f8fafc; color: #334155; border-color: #dbe4f0; }
 .meta { padding: 10px 12px; color: #334155; }
+.chips { padding: 10px 12px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.chip {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  background: #eff6ff;
+  color: #1e40af;
+  border: 1px solid #bfdbfe;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.chip button {
+  border: 0;
+  background: transparent;
+  color: #1d4ed8;
+  cursor: pointer;
+  font-weight: 800;
+}
 .panel { overflow: hidden; }
 .table-wrap {
   overflow: auto;
-  max-height: calc(100vh - 300px);
+  max-height: calc(100vh - 340px);
   background: #fff;
 }
 table { width: max-content; min-width: 100%; border-collapse: collapse; }
@@ -2835,7 +3330,12 @@ th {
   text-transform: uppercase;
   letter-spacing: .25px;
 }
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { background: #eef6ff; color: #1d4ed8; }
+th.active-sort { color: #1d4ed8; background: #e0efff; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.clickable { cursor: pointer; color: #1d4ed8; text-decoration: underline; text-underline-offset: 2px; }
+td.clickable:hover { background: #dbeafe !important; }
 tbody tr:nth-child(even) td { background: #fbfdff; }
 tbody tr:hover td { background: #eef6ff; }
 .pager {
@@ -2850,27 +3350,36 @@ tbody tr:hover td { background: #eef6ff; }
 .pager .spacer { flex: 1; }
 .muted { color: var(--muted); }
 @media (max-width: 900px) {
-  .filters, .meta, .panel { margin-left: 10px; margin-right: 10px; }
-  .filters input[name="search"] { min-width: 220px; }
+  .filters, .meta, .panel, .chips { margin-left: 10px; margin-right: 10px; }
+  .filters input[name="search"] { min-width: 180px; }
 }
 </style>
 </head>
 <body>
 <header>
   <h1>Полная детализация</h1>
-  <div class="subtitle">Сырые строки `brak_team.write_offs` с фильтрами, пагинацией и экспортом</div>
+  <div class="subtitle">Сырые строки `brak_team.write_offs` · клик по ячейке фильтрует · клик по заголовку сортирует</div>
 </header>
 <nav class="topnav">
   <a href="/">Дашборд</a>
   <a href="/nomenclature">Номенклатура</a>
   <a href="/details" class="active">Детализация</a>
+  <a href="/weekly">Динамика</a>
+  <a href="/status">Статус</a>
 </nav>
 <form class="filters" id="filters">
   <label>Дата от <input name="date_from" type="date"></label>
   <label>Дата до <input name="date_to" type="date"></label>
   <label>Офис <input name="office_id" type="number" placeholder="office_id"></label>
   <label>WH <input name="wh_id" type="number" placeholder="wh_id"></label>
+  <label>WH list <input name="wh_ids" placeholder="1,2,3"></label>
   <label>Тип <input name="type" placeholder="type"></label>
+  <label>reason_id <input name="reason_id" type="number"></label>
+  <label>Категория <input name="parent_name" placeholder="parent_name"></label>
+  <label>nm_id <input name="nm_id" type="number"></label>
+  <label>shk_id <input name="shk_id" type="number"></label>
+  <label>cnt_org <input name="cnt_org" type="number"></label>
+  <label>Бренд <input name="brand_name" placeholder="brand_name"></label>
   <label>Поиск <input name="search" placeholder="title, причина, бренд, nm_id, shk_id"></label>
   <label>На стр.
     <select name="per_page">
@@ -2881,10 +3390,13 @@ tbody tr:hover td { background: #eef6ff; }
       <option>500</option>
     </select>
   </label>
+  <input type="hidden" name="sort_by" value="date">
+  <input type="hidden" name="sort_dir" value="desc">
   <button class="btn primary" type="submit">Применить</button>
   <button class="btn export" type="button" id="btnReset">Сбросить</button>
   <button class="btn secondary" type="button" id="btnExport">Экспорт XLSX</button>
 </form>
+<div class="chips" id="activeFilters"></div>
 <div class="meta" id="meta">Загрузка…</div>
 <section class="panel">
   <div class="table-wrap">
@@ -2898,17 +3410,23 @@ tbody tr:hover td { background: #eef6ff; }
     <button class="btn export" type="button" id="btnNext">Вперёд</button>
     <span class="muted" id="pageInfo"></span>
     <span class="spacer"></span>
-    <span class="muted">Экспорт ограничен параметром limit, по умолчанию 5000 строк.</span>
+    <span class="muted">Клик по ячейке = фильтр. Экспорт по умолчанию 5000 строк.</span>
   </div>
 </section>
 <script>
 let currentPage = 1;
 let columns = [];
+let clickFilters = new Set(['wh_id','office_id','nm_id','shk_id','reason_id','parent_name','type','cnt_org','brand_name']);
+const SORTABLE = new Set(['date','amount','total_cost','share','office_id','wh_id','nm_id','shk_id','reason_id','cnt_org','cnt_ors','cnt_ocr','type','parent_name','reason_descr','title','brand_name','subject_name']);
 
 function fmtValue(v) {
   if (v === null || v === undefined || v === '') return '—';
   if (typeof v === 'number') return v.toLocaleString('ru-RU');
   return String(v);
+}
+
+function formEl(name) {
+  return document.getElementById('filters').elements[name];
 }
 
 function paramsFor(page) {
@@ -2929,7 +3447,56 @@ function hydrateFiltersFromUrl() {
     const el = form.elements[k];
     if (el) el.value = v;
   }
+  if (!form.elements.sort_by.value) form.elements.sort_by.value = 'date';
+  if (!form.elements.sort_dir.value) form.elements.sort_dir.value = 'desc';
   currentPage = parseInt(q.get('page') || '1', 10) || 1;
+}
+
+function renderActiveFilters() {
+  const box = document.getElementById('activeFilters');
+  const keys = ['date_from','date_to','office_id','wh_id','wh_ids','type','reason_id','parent_name','nm_id','shk_id','cnt_org','brand_name','search'];
+  const chips = [];
+  keys.forEach(k => {
+    const el = formEl(k);
+    const v = (el && el.value || '').trim();
+    if (!v) return;
+    chips.push(`<span class="chip">${k}=${v}<button type="button" data-clear="${k}" title="Сбросить">×</button></span>`);
+  });
+  const sortBy = formEl('sort_by').value || 'date';
+  const sortDir = formEl('sort_dir').value || 'desc';
+  chips.push(`<span class="chip">sort=${sortBy} ${sortDir}</span>`);
+  box.innerHTML = chips.length ? chips.join('') : '<span class="muted">Активных фильтров нет. Кликните по ячейке таблицы, чтобы отфильтровать.</span>';
+  box.querySelectorAll('[data-clear]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const el = formEl(btn.dataset.clear);
+      if (el) el.value = '';
+      loadDetails(1);
+    });
+  });
+}
+
+function setSort(key) {
+  const by = formEl('sort_by');
+  const dir = formEl('sort_dir');
+  if (by.value === key) {
+    dir.value = dir.value === 'asc' ? 'desc' : 'asc';
+  } else {
+    by.value = key;
+    dir.value = (key === 'date' || key === 'amount' || key === 'total_cost') ? 'desc' : 'asc';
+  }
+  loadDetails(1);
+}
+
+function applyCellFilter(key, value) {
+  if (value === null || value === undefined || value === '') return;
+  const el = formEl(key);
+  if (!el) return;
+  el.value = String(value);
+  if (key === 'wh_id') {
+    const list = formEl('wh_ids');
+    if (list) list.value = '';
+  }
+  loadDetails(1);
 }
 
 async function loadDetails(page = 1, pushState = true) {
@@ -2945,20 +3512,44 @@ async function loadDetails(page = 1, pushState = true) {
     if (!r.ok) throw new Error(raw || r.statusText);
     const data = JSON.parse(raw);
     columns = data.columns || [];
+    if (Array.isArray(data.click_filters)) clickFilters = new Set(data.click_filters);
     currentPage = data.page || page;
+    if (data.sort_by) formEl('sort_by').value = data.sort_by;
+    if (data.sort_dir) formEl('sort_dir').value = data.sort_dir;
     if (pushState) history.replaceState(null, '', '/details?' + q);
-    thead.innerHTML = columns.map(c => `<th>${c.label}</th>`).join('');
+    const sortBy = formEl('sort_by').value;
+    const sortDir = formEl('sort_dir').value;
+    thead.innerHTML = columns.map(c => {
+      const sortable = SORTABLE.has(c.key);
+      const active = sortable && c.key === sortBy;
+      const mark = active ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';
+      const cls = sortable ? ` class="sortable${active ? ' active-sort' : ''}" data-sort="${c.key}"` : '';
+      return `<th${cls}>${c.label}${mark}</th>`;
+    }).join('');
+    thead.querySelectorAll('[data-sort]').forEach(th => {
+      th.addEventListener('click', () => setSort(th.dataset.sort));
+    });
     tbody.innerHTML = (data.rows || []).map(row => {
       return '<tr>' + columns.map(c => {
-        const cls = typeof row[c.key] === 'number' ? ' class="num"' : '';
-        const value = fmtValue(row[c.key]);
-        return `<td${cls} title="${String(value).replaceAll('"', '&quot;')}">${value}</td>`;
+        const rawVal = row[c.key];
+        const value = fmtValue(rawVal);
+        const isNum = typeof rawVal === 'number';
+        const canClick = clickFilters.has(c.key) && rawVal !== null && rawVal !== undefined && rawVal !== '';
+        const cls = [isNum ? 'num' : '', canClick ? 'clickable' : ''].filter(Boolean).join(' ');
+        const attrs = canClick
+          ? ` class="${cls}" data-filter-key="${c.key}" data-filter-value="${String(rawVal).replaceAll('"', '&quot;')}" title="Фильтр: ${c.key}=${String(value).replaceAll('"', '&quot;')}"`
+          : ` class="${cls}" title="${String(value).replaceAll('"', '&quot;')}"`;
+        return `<td${attrs}>${value}</td>`;
       }).join('') + '</tr>';
     }).join('');
+    tbody.querySelectorAll('[data-filter-key]').forEach(td => {
+      td.addEventListener('click', () => applyCellFilter(td.dataset.filterKey, td.dataset.filterValue));
+    });
     meta.textContent = `Всего по фильтру: ${Number(data.total || 0).toLocaleString('ru-RU')} · показано: ${(data.rows || []).length}`;
     document.getElementById('pageInfo').textContent = `Страница ${data.page} / ${data.pages}`;
     document.getElementById('btnPrev').disabled = data.page <= 1;
     document.getElementById('btnNext').disabled = data.page >= data.pages;
+    renderActiveFilters();
   } catch (e) {
     meta.textContent = 'Ошибка загрузки: ' + (e.message || e);
   }
@@ -2968,7 +3559,11 @@ function exportXlsx() {
   const q = paramsFor(currentPage);
   q.delete('page');
   q.set('limit', '5000');
+  const reason = q.get('reason_id') || 'all';
+  const parent = (q.get('parent_name') || 'all').replaceAll(/[^\\w\\-]+/g, '_').slice(0, 24);
   window.location.href = '/api/details/export/xlsx?' + q;
+  // filename is set by server; keep query rich for filters
+  void reason; void parent;
 }
 
 document.getElementById('filters').addEventListener('submit', (e) => {
@@ -2977,6 +3572,8 @@ document.getElementById('filters').addEventListener('submit', (e) => {
 });
 document.getElementById('btnReset').addEventListener('click', () => {
   document.getElementById('filters').reset();
+  formEl('sort_by').value = 'date';
+  formEl('sort_dir').value = 'desc';
   loadDetails(1);
 });
 document.getElementById('btnExport').addEventListener('click', exportXlsx);
@@ -2985,6 +3582,242 @@ document.getElementById('btnNext').addEventListener('click', () => loadDetails(c
 
 hydrateFiltersFromUrl();
 loadDetails(currentPage, false);
+</script>
+</body>
+</html>
+"""
+
+
+WEEKLY_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Динамика по неделям</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.45 Inter, "Segoe UI", Roboto, Arial, sans-serif; background: #f3f6fb; color: #0f172a; }
+header { background: linear-gradient(100deg, #0f4c81 0%, #2563eb 55%, #1d4ed8 100%); color: #fff; padding: 18px 20px; }
+header h1 { margin: 0; font-size: 22px; }
+.subtitle { margin-top: 4px; opacity: .85; font-size: 13px; }
+.topnav { margin: 12px 14px 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+.topnav a { text-decoration: none; padding: 8px 12px; border: 1px solid #bfd2ff; background: #eef4ff; color: #1e40af; border-radius: 999px; font-weight: 700; font-size: 12px; }
+.topnav a.active { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
+.toolbar, .meta, .panel { margin: 0 14px 12px; background: #fff; border: 1px solid #dbe4f0; border-radius: 14px; box-shadow: 0 10px 28px rgba(15,23,42,.08); }
+.toolbar { padding: 12px; display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
+.toolbar label { display: grid; gap: 4px; font-size: 12px; font-weight: 700; color: #334155; }
+.toolbar input, .toolbar select { border: 1px solid #cbd5e1; border-radius: 8px; padding: 7px 9px; font: inherit; min-width: 120px; }
+.btn { border: 1px solid #bfd2ff; background: #eef4ff; color: #1e40af; border-radius: 10px; padding: 8px 12px; font-weight: 700; cursor: pointer; }
+.btn.primary { background: linear-gradient(180deg, #2563eb, #1d4ed8); color: #fff; border-color: #1d4ed8; }
+.meta { padding: 10px 12px; color: #334155; }
+.panel { overflow: hidden; }
+.chart { padding: 14px 16px 8px; }
+.bars { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(28px, 1fr); gap: 6px; align-items: end; height: 220px; }
+.bar-wrap { display: flex; flex-direction: column; align-items: center; height: 100%; justify-content: end; gap: 4px; }
+.bar { width: 100%; max-width: 36px; border-radius: 8px 8px 4px 4px; background: linear-gradient(180deg, #60a5fa, #2563eb); min-height: 2px; }
+.bar.org0 { background: linear-gradient(180deg, #fbbf24, #d97706); opacity: .9; position: absolute; left: 0; right: 0; bottom: 0; border-radius: 8px 8px 4px 4px; }
+.bar-stack { position: relative; width: 100%; max-width: 36px; height: var(--h); }
+.wlabel { font-size: 10px; color: #64748b; }
+table { width: 100%; border-collapse: collapse; }
+th, td { border-top: 1px solid #e2e8f0; padding: 8px 10px; text-align: left; }
+th { background: #f8fafc; font-size: 12px; color: #334155; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.top { font-size: 12px; color: #475569; max-width: 420px; }
+.muted { color: #64748b; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Динамика по неделям</h1>
+  <div class="subtitle">Сумма брака, ORG0 и топ причин по ISO-неделям</div>
+</header>
+<nav class="topnav">
+  <a href="/">Дашборд</a>
+  <a href="/nomenclature">Номенклатура</a>
+  <a href="/details">Детализация</a>
+  <a href="/weekly" class="active">Динамика</a>
+  <a href="/status">Статус</a>
+</nav>
+<div class="toolbar">
+  <label>Год <input id="year" type="number" value="2026"></label>
+  <label>WH ids <input id="wh_ids" placeholder="пусто = все"></label>
+  <label>Топ причин
+    <select id="top_n">
+      <option>3</option>
+      <option selected>5</option>
+      <option>10</option>
+    </select>
+  </label>
+  <button class="btn primary" id="btnLoad" type="button">Загрузить</button>
+</div>
+<div class="meta" id="meta">Загрузка…</div>
+<section class="panel">
+  <div class="chart">
+    <div class="bars" id="bars"></div>
+  </div>
+  <div style="overflow:auto">
+    <table>
+      <thead>
+        <tr>
+          <th>Неделя</th>
+          <th class="num">Всего, ₽</th>
+          <th class="num">ORG0, ₽</th>
+          <th class="num">ORG0 %</th>
+          <th class="num">Строк</th>
+          <th>Топ причин</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</section>
+<script>
+function fmt(n) { return Number(n || 0).toLocaleString('ru-RU', { maximumFractionDigits: 0 }); }
+function pct(n) { return (Number(n || 0)).toLocaleString('ru-RU', { maximumFractionDigits: 1 }) + '%'; }
+
+function hydrate() {
+  const q = new URLSearchParams(location.search);
+  if (q.get('year')) document.getElementById('year').value = q.get('year');
+  if (q.get('wh_ids')) document.getElementById('wh_ids').value = q.get('wh_ids');
+  if (q.get('top_n')) document.getElementById('top_n').value = q.get('top_n');
+}
+
+async function loadWeekly() {
+  const meta = document.getElementById('meta');
+  const year = document.getElementById('year').value || new Date().getFullYear();
+  const wh = (document.getElementById('wh_ids').value || '').trim();
+  const topN = document.getElementById('top_n').value || '5';
+  const q = new URLSearchParams({ year, top_n: topN });
+  if (wh) q.set('wh_ids', wh);
+  meta.textContent = 'Загрузка…';
+  try {
+    const r = await fetch('/api/weekly?' + q);
+    const raw = await r.text();
+    if (!r.ok) throw new Error(raw || r.statusText);
+    const data = JSON.parse(raw);
+    history.replaceState(null, '', '/weekly?' + q);
+    const weeks = data.weeks || [];
+    const maxAmt = Math.max(1, ...weeks.map(w => w.amount_all || 0));
+    document.getElementById('bars').innerHTML = weeks.map(w => {
+      const h = Math.max(2, Math.round((w.amount_all || 0) / maxAmt * 180));
+      const h0 = Math.max(0, Math.round((w.amount_org0 || 0) / maxAmt * 180));
+      return `<div class="bar-wrap" title="W${w.week}: ${fmt(w.amount_all)}">
+        <div class="bar-stack" style="--h:${h}px">
+          <div class="bar" style="height:${h}px"></div>
+          <div class="bar org0" style="height:${h0}px"></div>
+        </div>
+        <div class="wlabel">${w.week}</div>
+      </div>`;
+    }).join('');
+    document.getElementById('tbody').innerHTML = weeks.map(w => {
+      const top = (w.top_reasons || []).map(t => `${t.reason_descr} (${fmt(t.amount)})`).join('; ');
+      return `<tr>
+        <td>${w.week}</td>
+        <td class="num">${fmt(w.amount_all)}</td>
+        <td class="num">${fmt(w.amount_org0)}</td>
+        <td class="num">${pct(w.org0_share)}</td>
+        <td class="num">${fmt(w.row_count)}</td>
+        <td class="top">${top || '—'}</td>
+      </tr>`;
+    }).join('');
+    const t = data.totals || {};
+    meta.textContent = `Год ${data.year} · источник ${data.source} · всего ${fmt(t.amount_all)} ₽ · ORG0 ${fmt(t.amount_org0)} ₽ · недель ${weeks.length}`;
+  } catch (e) {
+    meta.textContent = 'Ошибка: ' + (e.message || e);
+  }
+}
+
+document.getElementById('btnLoad').onclick = loadWeekly;
+hydrate();
+loadWeekly();
+</script>
+</body>
+</html>
+"""
+
+
+STATUS_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Статус системы</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.45 Inter, "Segoe UI", Roboto, Arial, sans-serif; background: #f3f6fb; color: #0f172a; }
+header { background: linear-gradient(100deg, #0f4c81 0%, #2563eb 55%, #1d4ed8 100%); color: #fff; padding: 18px 20px; }
+header h1 { margin: 0; font-size: 22px; }
+.topnav { margin: 12px 14px 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+.topnav a { text-decoration: none; padding: 8px 12px; border: 1px solid #bfd2ff; background: #eef4ff; color: #1e40af; border-radius: 999px; font-weight: 700; font-size: 12px; }
+.topnav a.active { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
+.grid { margin: 0 14px 14px; display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.card { background: #fff; border: 1px solid #dbe4f0; border-radius: 14px; box-shadow: 0 10px 28px rgba(15,23,42,.08); padding: 14px; }
+.card h2 { margin: 0 0 10px; font-size: 14px; color: #1e3a8a; }
+.row { display: flex; justify-content: space-between; gap: 10px; padding: 6px 0; border-bottom: 1px solid #f1f5f9; font-size: 13px; }
+.row:last-child { border-bottom: 0; }
+.k { color: #64748b; }
+.v { font-weight: 700; text-align: right; word-break: break-all; }
+.ok { color: #15803d; }
+.warn { color: #b45309; }
+.err { color: #b91c1c; }
+.meta { margin: 0 14px 12px; color: #334155; }
+.btn { margin-left: 14px; border: 1px solid #bfd2ff; background: #eef4ff; color: #1e40af; border-radius: 10px; padding: 8px 12px; font-weight: 700; cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Статус системы</h1>
+</header>
+<nav class="topnav">
+  <a href="/">Дашборд</a>
+  <a href="/nomenclature">Номенклатура</a>
+  <a href="/details">Детализация</a>
+  <a href="/weekly">Динамика</a>
+  <a href="/status" class="active">Статус</a>
+</nav>
+<div class="meta" id="meta">Загрузка…</div>
+<button class="btn" id="btnReload" type="button">Обновить</button>
+<div class="grid" id="grid"></div>
+<script>
+function cls(v) {
+  if (v === 'ok' || v === 'set' || v === true) return 'ok';
+  if (v === 'missing' || v === 'empty' || v === 'error' || v === false) return 'err';
+  if (v === 'degraded') return 'warn';
+  return '';
+}
+function row(k, v, c='') {
+  return `<div class="row"><span class="k">${k}</span><span class="v ${c}">${v ?? '—'}</span></div>`;
+}
+function card(title, body) {
+  return `<section class="card"><h2>${title}</h2>${body}</section>`;
+}
+async function loadStatus() {
+  const meta = document.getElementById('meta');
+  const grid = document.getElementById('grid');
+  meta.textContent = 'Загрузка…';
+  try {
+    const r = await fetch('/api/status');
+    const raw = await r.text();
+    if (!r.ok) throw new Error(raw || r.statusText);
+    const d = JSON.parse(raw);
+    meta.innerHTML = `Общий статус: <b class="${cls(d.status)}">${d.status}</b> · env: ${d.vercel_env || 'local'}`;
+    const envRows = Object.entries(d.env || {}).map(([k,v]) => row(k, v, cls(v))).join('');
+    const db = d.database || {};
+    const mv = d.matview || {};
+    const cache = d.cache || {};
+    const admin = d.admin || {};
+    grid.innerHTML = [
+      card('Environment', envRows + row('db_env_error', d.db_env_error || 'нет', d.db_env_error ? 'err' : 'ok')),
+      card('Database', row('status', db.status, cls(db.status)) + row('detail', db.detail) + row('row_count', db.row_count) + row('max_date', db.max_date) + row('total_amount', db.total_amount)),
+      card('Matview', row('enabled', String(mv.enabled), cls(mv.enabled)) + row('available', String(mv.available), cls(mv.available)) + row('name', mv.name) + row('row_count', mv.row_count) + row('max_year/week', `${mv.max_year ?? '—'} / ${mv.max_week ?? '—'}`) + row('bootstrap_ok_age_sec', mv.bootstrap_ok_age_sec) + row('bootstrap_fail', mv.bootstrap_fail_msg || 'нет', mv.bootstrap_fail_msg ? 'err' : 'ok')),
+      card('Cache / Admin', row('cache_entries', cache.entries) + row('report_ttl_sec', cache.report_ttl_sec) + row('weeks_ttl_sec', cache.weeks_ttl_sec) + row('refresh_token_required', String(admin.refresh_token_required)) + row('active_sessions', admin.active_sessions)),
+    ].join('');
+  } catch (e) {
+    meta.textContent = 'Ошибка: ' + (e.message || e);
+  }
+}
+document.getElementById('btnReload').onclick = loadStatus;
+loadStatus();
 </script>
 </body>
 </html>
@@ -3026,6 +3859,8 @@ tr.total td { background: #eef2ff; font-weight: 700; }
   <a href="/">Дашборд</a>
   <a href="/nomenclature" class="active">Номенклатура</a>
   <a href="/details">Детализация</a>
+  <a href="/weekly">Динамика</a>
+  <a href="/status">Статус</a>
 </nav>
 <div class="wrap">
   <section class="panel">
@@ -3173,6 +4008,14 @@ def register_routes(application) -> None:
     def details_page():
         return DETAILS_HTML
 
+    @application.route("/weekly")
+    def weekly_page():
+        return WEEKLY_HTML
+
+    @application.route("/status")
+    def status_page():
+        return STATUS_HTML
+
     @application.route("/api/admin/login", methods=["POST"])
     def api_admin_login():
         _, expected_password = _admin_login_password()
@@ -3303,6 +4146,8 @@ def register_routes(application) -> None:
                 week_last=week_last,
                 name_header="Дефект",
                 all_totals=data["all_totals"]["defects"],
+                drill_kind="reason",
+                org0_only=False,
             )
             + render_table(
                 "Дефект ТОП-20, ORG 0, рубли",
@@ -3314,6 +4159,8 @@ def register_routes(application) -> None:
                 week_last=week_last,
                 name_header="Дефект",
                 all_totals=data["all_totals"]["defects_org0"],
+                drill_kind="reason",
+                org0_only=True,
             )
             + render_table(
                 "ТОП-20 категорий, рубли",
@@ -3325,6 +4172,8 @@ def register_routes(application) -> None:
                 week_last=week_last,
                 name_header="Категория",
                 all_totals=data["all_totals"]["categories"],
+                drill_kind="category",
+                org0_only=False,
             )
             + render_table(
                 "ТОП-20 категорий, ORG 0, рубли",
@@ -3336,6 +4185,8 @@ def register_routes(application) -> None:
                 week_last=week_last,
                 name_header="Категория",
                 all_totals=data["all_totals"]["categories_org0"],
+                drill_kind="category",
+                org0_only=True,
             )
         )
 
@@ -3377,7 +4228,10 @@ def register_routes(application) -> None:
                 wh_ids, office_id, year, week_prev, week_last, show_all_weeks=show_all_weeks
             )
             blob = export_report_xlsx(report, year, week_prev, week_last)
-            filename = f"write_offs_{year}_{week_prev}_{week_last}.xlsx"
+            scope = "all"
+            if wh_ids:
+                scope = f"wh{len(wh_ids)}"
+            filename = f"write_offs_{scope}_{year}_w{week_prev}-{week_last}.xlsx"
             return send_file(
                 BytesIO(blob),
                 as_attachment=True,
@@ -3451,7 +4305,11 @@ def register_routes(application) -> None:
                 request.args, "limit", 5000, min_value=1, max_value=20000
             )
             blob = export_detail_xlsx(request.args, limit=limit)
-            filename = "write_offs_details.xlsx"
+            reason = request.args.get("reason_id") or "all"
+            parent = re.sub(r"[^\w\-]+", "_", str(request.args.get("parent_name") or "all"))[:24]
+            date_from = request.args.get("date_from") or "na"
+            date_to = request.args.get("date_to") or "na"
+            filename = f"write_offs_details_r{reason}_{parent}_{date_from}_{date_to}.xlsx"
             return send_file(
                 BytesIO(blob),
                 as_attachment=True,
@@ -3462,6 +4320,38 @@ def register_routes(application) -> None:
             return jsonify({"error": str(exc)}), 400
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
+
+    @application.route("/api/weekly")
+    def api_weekly():
+        env_err = check_db_env()
+        if env_err:
+            return jsonify({"error": env_err}), 503
+        try:
+            cfg = _cfg()
+            year = request.args.get("year", cfg.get("week_year", 2026), type=int)
+            top_n = _detail_positive_int_arg(
+                request.args, "top_n", 5, min_value=1, max_value=20
+            )
+            wh_raw = str(request.args.get("wh_ids", "") or "").strip()
+            wh_ids = parse_wh_ids(wh_raw) if wh_raw else None
+            payload = fetch_weekly_dynamics(
+                year=year,
+                office_id=cfg.get("office_id"),
+                wh_ids=wh_ids,
+                top_n=top_n,
+            )
+            return jsonify(payload)
+        except QueryParamError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
+    @application.route("/api/status")
+    def api_status():
+        try:
+            return jsonify(fetch_status_payload())
+        except Exception as exc:
+            return jsonify({"status": "error", "detail": str(exc)}), 500
 
     @application.route("/api/nomenclature/latest")
     def api_nomenclature_latest():
