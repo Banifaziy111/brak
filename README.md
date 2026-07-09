@@ -8,9 +8,18 @@ HTML-отчёт ТОП-20 по дефектам и категориям из Pos
 pip install -r requirements.txt
 cp .env.example .env   # укажите DB_PASSWORD
 python write_offs_dashboard.py
+# или: python -m brak_dashboard
 ```
 
 Откройте http://127.0.0.1:8080/
+
+Страницы: `/` дашборд, `/digest` дайджест, `/reason` карточка, `/weekly`, `/details`, `/status`.
+
+## Тесты
+
+```bash
+python -m pytest -q
+```
 
 ## Фильтр WH
 
