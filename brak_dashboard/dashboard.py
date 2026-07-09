@@ -3897,7 +3897,20 @@ textarea { height: auto; min-height: 56px; padding: 8px 10px; color: var(--text)
   display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 0 0 12px; width: 100%;
 }
 #reportGrid.grid, .report-grid {
-  display: block; width: 100%; margin: 0 0 12px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  width: 100%;
+  margin: 0 0 12px;
+  align-items: start;
+}
+#reportGrid .panel, .report-grid .panel {
+  min-width: 0;
+  overflow: hidden;
+}
+#reportGrid .table-scroll, .report-grid .table-scroll {
+  width: 100%;
+  overflow-x: auto;
 }
 .insight-card, .card, .panel { padding: 14px; margin: 0; overflow: hidden; }
 .table-wrap, .heatmap-wrap { width: 100%; overflow-x: auto; }
@@ -4141,7 +4154,7 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: var(-
 .status, #status { margin: 0 0 12px; color: var(--muted); font-size: 12.5px; }
 #reportGrid.loading, .loading { opacity: .55; pointer-events: none; }
 #reportGrid table, .report-grid table {
-  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden;
+  background: transparent; border: 0; border-radius: 0; width: 100%;
 }
 @media (max-width: 1100px) {
   .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -4149,10 +4162,11 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: var(-
   .board { grid-template-columns: 1fr 1fr; }
   .toolbar.main-toolbar { grid-template-columns: 1fr 1fr; }
   .toolbar.main-toolbar .actions { grid-column: 1 / -1; }
+  #reportGrid.grid, .report-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 800px) {
   .insight-grid, .grid, .kpis, .board, .corpus-stats { grid-template-columns: 1fr; }
-  #reportGrid.grid, .report-grid { display: block; }
+  #reportGrid.grid, .report-grid { grid-template-columns: 1fr; }
   .corpus-row { grid-template-columns: 1fr; }
   .toolbar.main-toolbar { grid-template-columns: 1fr; }
 }
