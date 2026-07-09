@@ -2407,6 +2407,283 @@ def fetch_weekly_dynamics(
     return payload
 
 
+def fetch_reason_heatmap(
+    *,
+    year: int,
+    office_id: int | None,
+    wh_ids: list[int] | None,
+    top_n: int = 12,
+    week_limit: int = 12,
+) -> dict[str, Any]:
+    """Matrix of top reasons × recent weeks for heatmap UI."""
+    sorted_wh = sorted(wh_ids) if wh_ids else []
+    top_n = max(3, min(20, top_n))
+    week_limit = max(4, min(26, week_limit))
+    cache_key = (
+        f"heatmap:{year}:{office_id}:{','.join(map(str, sorted_wh))}:"
+        f"{top_n}:{week_limit}"
+    )
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    src = _report_source()
+    clauses: list[str] = []
+    params: list[Any] = []
+    if src["base_not_null_clause"]:
+        clauses.append(src["base_not_null_clause"])
+    if _use_report_matview() and src["table"] != "brak_team.write_offs":
+        clauses.append(src["year_clause"])
+        params.append(year)
+    else:
+        year_start = date.fromisocalendar(year, 1, 1)
+        year_end = date.fromisocalendar(year + 1, 1, 1)
+        clauses.append(src["year_clause"])
+        params.extend([year_start, year_end])
+    if office_id is not None:
+        clauses.append("office_id = %s")
+        params.append(office_id)
+    if wh_ids:
+        clauses.append("wh_id = ANY(%s)")
+        params.append(wh_ids)
+    where = " WHERE " + " AND ".join(clauses)
+    week_expr = src["week_expr"]
+    amount_expr = src["amount_expr"]
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT {week_expr}::int AS week_no
+            FROM {src["table"]}
+            {where}
+            GROUP BY 1
+            ORDER BY 1 DESC
+            LIMIT %s
+            """,
+            [*params, week_limit],
+        )
+        weeks = sorted(int(r[0]) for r in cur.fetchall())
+        if not weeks:
+            payload = {"year": year, "weeks": [], "reasons": [], "cells": []}
+            _cache_set(cache_key, payload, CACHE_TTL_SEC)
+            return payload
+
+        week_clause = f"{week_expr} = ANY(%s)"
+        cur.execute(
+            f"""
+            SELECT reason_id, MAX(COALESCE(reason_descr, '—')) AS name,
+                   COALESCE(SUM({amount_expr}), 0) AS amount
+            FROM {src["table"]}
+            {where} AND {week_clause}
+            GROUP BY reason_id
+            ORDER BY amount DESC NULLS LAST
+            LIMIT %s
+            """,
+            [*params, weeks, top_n],
+        )
+        reasons = [
+            {
+                "reason_id": int(r[0]) if r[0] is not None else None,
+                "name": r[1] or "—",
+                "total": to_float(r[2]),
+            }
+            for r in cur.fetchall()
+        ]
+        reason_ids = [r["reason_id"] for r in reasons if r["reason_id"] is not None]
+        cells: list[dict[str, Any]] = []
+        if reason_ids:
+            cur.execute(
+                f"""
+                SELECT reason_id, {week_expr}::int AS week_no,
+                       COALESCE(SUM({amount_expr}), 0) AS amount
+                FROM {src["table"]}
+                {where}
+                  AND {week_clause}
+                  AND reason_id = ANY(%s)
+                GROUP BY reason_id, {week_expr}::int
+                """,
+                [*params, weeks, reason_ids],
+            )
+            cells = [
+                {
+                    "reason_id": int(r[0]),
+                    "week": int(r[1]),
+                    "amount": to_float(r[2]),
+                }
+                for r in cur.fetchall()
+            ]
+
+    max_amount = max((c["amount"] for c in cells), default=0.0)
+    for c in cells:
+        c["intensity"] = (c["amount"] / max_amount) if max_amount else 0.0
+    payload = {
+        "year": year,
+        "weeks": weeks,
+        "reasons": reasons,
+        "cells": cells,
+        "max_amount": max_amount,
+        "source": src["table"],
+    }
+    _cache_set(cache_key, payload, CACHE_TTL_SEC)
+    return payload
+
+
+def fetch_corpus_reasons(
+    *,
+    corpus: int,
+    year: int,
+    week_prev: int,
+    week_last: int,
+    office_id: int | None,
+    cfg: dict | None = None,
+    limit: int = 10,
+) -> dict[str, Any]:
+    cfg = cfg or load_config()
+    corpus_map = _corpus_wh_map(cfg)
+    wh_ids = corpus_map.get(int(corpus)) or []
+    if not wh_ids:
+        raise QueryParamError(f"Корпус {corpus}: нет WH в справочнике")
+    limit = max(3, min(20, limit))
+    cache_key = (
+        f"corpus_reasons:{corpus}:{year}:{week_prev}:{week_last}:{office_id}:"
+        f"{','.join(map(str, sorted(wh_ids)))}:{limit}"
+    )
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    weeks = sorted({week_prev, week_last})
+    bundle = fetch_top_bundle(
+        wh_ids=wh_ids,
+        office_id=office_id,
+        year=year,
+        weeks=weeks,
+        week_last=week_last,
+        limit=limit,
+    )
+    rows = []
+    for r in bundle.get("defects") or []:
+        prev = to_float((r.amounts or {}).get(week_prev, 0))
+        last = to_float((r.amounts or {}).get(week_last, 0))
+        rows.append(
+            {
+                "reason_id": r.row_id,
+                "name": r.name,
+                "amount_prev": prev,
+                "amount_last": last,
+                "delta": last - prev,
+                "dynamics": ((last / prev - 1.0) * 100) if prev else (100.0 if last else None),
+            }
+        )
+    payload = {
+        "corpus": int(corpus),
+        "name": f"{corpus} корпус",
+        "year": year,
+        "week_prev": week_prev,
+        "week_last": week_last,
+        "wh_ids": wh_ids,
+        "wh_count": len(wh_ids),
+        "reasons": rows,
+    }
+    _cache_set(cache_key, payload, CACHE_TTL_SEC)
+    return payload
+
+
+def fetch_watchlist_status(
+    *,
+    reason_ids: list[int],
+    year: int,
+    week_prev: int,
+    week_last: int,
+    office_id: int | None,
+    wh_ids: list[int] | None,
+) -> dict[str, Any]:
+    ids = sorted({int(x) for x in reason_ids if x is not None})[:20]
+    if not ids:
+        return {"year": year, "week_prev": week_prev, "week_last": week_last, "items": []}
+    sorted_wh = sorted(wh_ids) if wh_ids else []
+    cache_key = (
+        f"watchlist:{year}:{week_prev}:{week_last}:{office_id}:"
+        f"{','.join(map(str, sorted_wh))}:{','.join(map(str, ids))}"
+    )
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    src = _report_source()
+    clauses: list[str] = []
+    params: list[Any] = []
+    if src["base_not_null_clause"]:
+        clauses.append(src["base_not_null_clause"])
+    if _use_report_matview() and src["table"] != "brak_team.write_offs":
+        clauses.append(src["year_clause"])
+        params.append(year)
+    else:
+        year_start = date.fromisocalendar(year, 1, 1)
+        year_end = date.fromisocalendar(year + 1, 1, 1)
+        clauses.append(src["year_clause"])
+        params.extend([year_start, year_end])
+    if office_id is not None:
+        clauses.append("office_id = %s")
+        params.append(office_id)
+    if wh_ids:
+        clauses.append("wh_id = ANY(%s)")
+        params.append(wh_ids)
+    clauses.append("reason_id = ANY(%s)")
+    params.append(ids)
+    where = " WHERE " + " AND ".join(clauses)
+    week_expr = src["week_expr"]
+    amount_expr = src["amount_expr"]
+    sql = f"""
+        SELECT reason_id,
+               MAX(COALESCE(reason_descr, '—')) AS name,
+               COALESCE(SUM({amount_expr}) FILTER (WHERE {week_expr} = %s), 0) AS amount_prev,
+               COALESCE(SUM({amount_expr}) FILTER (WHERE {week_expr} = %s), 0) AS amount_last
+        FROM {src["table"]}
+        {where}
+        GROUP BY reason_id
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, [week_prev, week_last, *params])
+        raw = cur.fetchall()
+    by_id = {
+        int(r[0]): {
+            "reason_id": int(r[0]),
+            "name": r[1] or "—",
+            "amount_prev": to_float(r[2]),
+            "amount_last": to_float(r[3]),
+        }
+        for r in raw
+        if r[0] is not None
+    }
+    items = []
+    for rid in ids:
+        item = by_id.get(
+            rid,
+            {
+                "reason_id": rid,
+                "name": f"reason_id={rid}",
+                "amount_prev": 0.0,
+                "amount_last": 0.0,
+            },
+        )
+        prev = to_float(item["amount_prev"])
+        last = to_float(item["amount_last"])
+        item["delta"] = last - prev
+        item["dynamics"] = ((last / prev - 1.0) * 100) if prev else (100.0 if last else None)
+        items.append(item)
+    payload = {
+        "year": year,
+        "week_prev": week_prev,
+        "week_last": week_last,
+        "items": items,
+    }
+    _cache_set(cache_key, payload, CACHE_TTL_SEC)
+    return payload
+
+
 def fetch_status_payload() -> dict[str, Any]:
     env_err = check_db_env()
     env_states = {}
@@ -3665,7 +3942,13 @@ tr.drill-row:hover td { background: #eef6ff !important; }
 .search-drop button:hover { background:var(--primary-soft); }
 .thresholds { display:flex; flex-wrap:wrap; gap:8px; align-items:center; font-size:12px; color:var(--muted); margin-bottom:8px; }
 .thresholds input { width:72px; }
-@media (max-width: 900px) { .churn-cols { grid-template-columns:1fr; } }
+.corpus-row { cursor:pointer; }
+.corpus-row:hover { background:#f5f8fc; border-radius:8px; }
+.corpus-drill { margin-top:10px; border-top:1px solid var(--line); padding-top:8px; }
+.watch-list { display:grid; gap:6px; }
+.watch-item { display:grid; grid-template-columns:1fr auto auto; gap:8px; align-items:center; padding:6px 0; border-bottom:1px solid var(--line); font-size:12px; }
+.watch-item button { border:1px solid var(--line); background:#fff; border-radius:6px; padding:2px 7px; cursor:pointer; font-size:11px; }
+@media (max-width: 900px) { .churn-cols { grid-template-columns:1fr; } .watch-item { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -3680,6 +3963,7 @@ tr.drill-row:hover td { background: #eef6ff !important; }
   <a href="/weekly">Динамика</a>
   <a href="/reason">Карточка</a>
   <a href="/digest">Дайджест</a>
+  <a href="/actions">Действия</a>
   <a href="/status">Статус</a>
 </nav>
 <div class="toolbar">
@@ -3748,6 +4032,16 @@ tr.drill-row:hover td { background: #eef6ff !important; }
   <section class="insight-card">
     <h3>Что изменило ТОП-20</h3>
     <div class="body" id="top20Churn"><div class="muted-box">Загрузка…</div></div>
+  </section>
+</div>
+<div class="insight-grid">
+  <section class="insight-card">
+    <h3>Watchlist причин</h3>
+    <div class="body" id="watchlistBox"><div class="muted-box">Пусто — добавьте из карточки причины</div></div>
+  </section>
+  <section class="insight-card">
+    <h3>Корпус: ТОП причин</h3>
+    <div class="body" id="corpusDrill"><div class="muted-box">Кликните по корпусу слева сверху</div></div>
   </section>
 </div>
 <div class="presets" id="presetsBar">
@@ -3935,8 +4229,8 @@ function updateCorpusCompare(rows) {
     const dyn = r.dynamics;
     const dynCls = dyn == null ? '' : (dyn > 2 ? ' style="color:#b91c1c"' : (dyn < -2 ? ' style="color:#15803d"' : ''));
     const topWh = (r.top_wh || []).map(w => `${w.wh_id} ${w.name}: ${fmtInt(w.amount)}`).join('<br>');
-    return `<div class="corpus-row">
-      <div class="name">${r.name}<div class="muted" style="font-weight:600">${r.wh_count || 0} WH</div></div>
+    return `<div class="corpus-row" data-corpus="${r.corpus}" title="Открыть ТОП причин корпуса">
+      <div class="name">${r.name}<div class="muted" style="font-weight:600">${r.wh_count || 0} WH · клик → ТОП</div></div>
       <div>
         <div class="corpus-track"><div class="corpus-fill" style="width:${pct}%"></div></div>
         <div class="top-wh">${topWh || 'нет WH'}</div>
@@ -3950,6 +4244,93 @@ function updateCorpusCompare(rows) {
     <div class="muted">ORG0 ${fmtPct(r.org0_share || 0)}</div>
   </div>`).join('');
   box.innerHTML = `<div class="corpus-bars">${bars}</div><div class="corpus-stats">${stats}</div>`;
+  box.querySelectorAll('.corpus-row[data-corpus]').forEach(el => {
+    el.addEventListener('click', () => loadCorpusDrill(Number(el.dataset.corpus)));
+  });
+}
+
+function watchlistGet() {
+  try { return JSON.parse(localStorage.getItem('kurkuma_reason_watchlist') || '[]') || []; } catch (_) { return []; }
+}
+function watchlistSet(arr) {
+  localStorage.setItem('kurkuma_reason_watchlist', JSON.stringify((arr || []).slice(0, 12)));
+}
+async function loadWatchlist() {
+  const box = document.getElementById('watchlistBox');
+  if (!box) return;
+  const list = watchlistGet().filter(x => x.reason_id != null);
+  if (!list.length) {
+    box.innerHTML = '<div class="muted-box">Пусто — откройте карточку причины и нажмите «В watchlist»</div>';
+    return;
+  }
+  const { wp, wl } = selectedWeeks();
+  const wh = selectedWh.size ? Array.from(selectedWh).join(',') : '';
+  const q = new URLSearchParams({
+    year: document.getElementById('year').value,
+    week_prev: wp,
+    week_last: wl,
+    reason_ids: list.map(x => x.reason_id).join(','),
+  });
+  if (wh) q.set('wh_ids', wh);
+  try {
+    const r = await fetch('/api/watchlist?' + q);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    const items = d.items || [];
+    box.innerHTML = `<div class="watch-list">${items.map(it => {
+      const title = it.name || ('reason ' + it.reason_id);
+      return `<div class="watch-item">
+        <div><b style="cursor:pointer" data-reason-id="${it.reason_id}">${title}</b>
+          <div class="muted">${fmtInt(it.amount_prev)} → ${fmtInt(it.amount_last)}</div></div>
+        <div style="font-family:var(--mono);font-weight:700;color:${Number(it.dynamics)>0?'#b42318':'#1f7a4c'}">${dynText(it.dynamics)}</div>
+        <button type="button" data-remove="${it.reason_id}">✕</button>
+      </div>`;
+    }).join('')}</div>`;
+    box.querySelectorAll('[data-reason-id]').forEach(el => {
+      el.addEventListener('click', () => openReasonCard({ reason_id: el.dataset.reasonId }));
+    });
+    box.querySelectorAll('[data-remove]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        watchlistSet(watchlistGet().filter(x => String(x.reason_id) !== String(btn.dataset.remove)));
+        loadWatchlist();
+      });
+    });
+  } catch (e) {
+    box.innerHTML = `<div class="muted-box">Ошибка watchlist: ${e.message || e}</div>`;
+  }
+}
+
+async function loadCorpusDrill(corpus) {
+  const box = document.getElementById('corpusDrill');
+  if (!box || !corpus) return;
+  const { wp, wl } = selectedWeeks();
+  const q = new URLSearchParams({
+    corpus: String(corpus),
+    year: document.getElementById('year').value,
+    week_prev: wp,
+    week_last: wl,
+  });
+  box.innerHTML = '<div class="muted-box">Загрузка корпуса…</div>';
+  try {
+    const r = await fetch('/api/corpus/reasons?' + q);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    const rows = d.reasons || [];
+    if (!rows.length) {
+      box.innerHTML = `<div class="muted-box">${d.name || ('Корпус '+corpus)}: нет данных</div>`;
+      return;
+    }
+    box.innerHTML = `<div class="muted" style="margin-bottom:6px">${d.name} · W${d.week_prev}→${d.week_last} · ${d.wh_count} WH</div>
+      <table class="delta-table"><thead><tr><th>Причина</th><th class="num">Δ ₽</th><th class="num">%</th></tr></thead>
+      <tbody>${rows.map(r => `<tr data-reason-id="${r.reason_id}">
+        <td>${r.name}</td><td class="num">${fmtInt(r.delta)}</td><td class="num">${dynText(r.dynamics)}</td>
+      </tr>`).join('')}</tbody></table>`;
+    box.querySelectorAll('tr[data-reason-id]').forEach(tr => {
+      tr.addEventListener('click', () => openReasonCard({ reason_id: tr.dataset.reasonId }));
+    });
+  } catch (e) {
+    box.innerHTML = `<div class="muted-box">Ошибка: ${e.message || e}</div>`;
+  }
 }
 
 function updateOrg0Spark(series) {
@@ -4707,6 +5088,7 @@ async function loadReport() {
     updatePeriodCompare(data.compare || null);
     updateTop20Churn(data.top20_churn || null);
     updateGrowthAlerts(data.growth_alerts || [], data.alert_thresholds || thr);
+    loadWatchlist();
     if (data.freshness) updateFreshness(data.freshness);
     else loadFreshness();
     syncDashboardUrl();
@@ -5136,6 +5518,7 @@ td.clickable { cursor: pointer; color: var(--primary-2); text-decoration: underl
   <a href="/weekly">Динамика</a>
   <a href="/reason">Карточка</a>
   <a href="/digest">Дайджест</a>
+  <a href="/actions">Действия</a>
   <a href="/status">Статус</a>
 </nav>
 <form class="filters" id="filters">
@@ -5719,12 +6102,18 @@ tr.total td { background: #eef4fa; font-weight: 700; }
 .wlabel { font-size: 10px; color: var(--muted); font-family: var(--mono); }
 .panel { margin: 0 var(--pad) 16px; overflow: hidden; }
 .top { font-size: 12px; color: #475569; max-width: 420px; }
+.heatmap-wrap { overflow:auto; margin-top: 4px; }
+.heatmap { border-collapse: separate; border-spacing: 2px; font-size: 11px; }
+.heatmap th, .heatmap td { padding: 0; text-align: center; min-width: 28px; height: 26px; }
+.heatmap th { color: var(--muted); font-weight: 600; font-family: var(--mono); }
+.heatmap .rname { text-align: left; padding: 0 8px 0 0; min-width: 160px; max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); font-weight: 600; cursor: pointer; }
+.heatmap td.cell { border-radius: 4px; cursor: pointer; }
 </style>
 </head>
 <body>
 <header class="app-header">
   <h1>Динамика по неделям</h1>
-  <div class="subtitle">Сумма брака, ORG0 и топ причин по ISO-неделям</div>
+  <div class="subtitle">Сумма брака, ORG0, топ причин и heatmap</div>
 </header>
 <nav class="topnav">
   <a href="/">Дашборд</a>
@@ -5733,6 +6122,7 @@ tr.total td { background: #eef4fa; font-weight: 700; }
   <a href="/weekly" class="active">Динамика</a>
   <a href="/reason">Карточка</a>
   <a href="/digest">Дайджест</a>
+  <a href="/actions">Действия</a>
   <a href="/status">Статус</a>
 </nav>
 <div class="toolbar">
@@ -5769,6 +6159,10 @@ tr.total td { background: #eef4fa; font-weight: 700; }
     </table>
   </div>
 </section>
+<section class="panel" style="margin-top:12px">
+  <div style="padding:12px 14px 4px;font-weight:700">Heatmap: причины × недели</div>
+  <div class="heatmap-wrap" style="padding:0 14px 14px" id="heatmapBox"><div class="muted">Загрузка…</div></div>
+</section>
 <script>
 function fmt(n) { return Number(n || 0).toLocaleString('ru-RU', { maximumFractionDigits: 0 }); }
 function pct(n) { return (Number(n || 0)).toLocaleString('ru-RU', { maximumFractionDigits: 1 }) + '%'; }
@@ -5778,6 +6172,52 @@ function hydrate() {
   if (q.get('year')) document.getElementById('year').value = q.get('year');
   if (q.get('wh_ids')) document.getElementById('wh_ids').value = q.get('wh_ids');
   if (q.get('top_n')) document.getElementById('top_n').value = q.get('top_n');
+}
+
+function heatColor(intensity) {
+  const t = Math.max(0, Math.min(1, Number(intensity || 0)));
+  const a = 0.12 + t * 0.78;
+  return `rgba(31, 78, 121, ${a.toFixed(3)})`;
+}
+
+async function loadHeatmap() {
+  const box = document.getElementById('heatmapBox');
+  const year = document.getElementById('year').value || new Date().getFullYear();
+  const wh = (document.getElementById('wh_ids').value || '').trim();
+  const q = new URLSearchParams({ year, top_n: '12', week_limit: '12' });
+  if (wh) q.set('wh_ids', wh);
+  try {
+    const r = await fetch('/api/heatmap?' + q);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    const weeks = d.weeks || [];
+    const reasons = d.reasons || [];
+    const map = {};
+    (d.cells || []).forEach(c => { map[c.reason_id + ':' + c.week] = c; });
+    if (!weeks.length || !reasons.length) {
+      box.innerHTML = '<div class="muted">Нет данных для heatmap</div>';
+      return;
+    }
+    box.innerHTML = `<table class="heatmap"><thead><tr><th></th>${weeks.map(w=>`<th>W${w}</th>`).join('')}</tr></thead>
+      <tbody>${reasons.map(reason => `<tr>
+        <td class="rname" data-reason-id="${reason.reason_id}" title="${reason.name}">${reason.name}</td>
+        ${weeks.map(w => {
+          const cell = map[reason.reason_id + ':' + w];
+          const amt = cell ? cell.amount : 0;
+          const inten = cell ? cell.intensity : 0;
+          return `<td class="cell" style="background:${heatColor(inten)}" title="W${w}: ${fmt(amt)}" data-reason-id="${reason.reason_id}"></td>`;
+        }).join('')}
+      </tr>`).join('')}</tbody></table>`;
+    box.querySelectorAll('[data-reason-id]').forEach(el => {
+      el.addEventListener('click', () => {
+        const qq = new URLSearchParams({ year, reason_id: el.dataset.reasonId });
+        if (wh) qq.set('wh_ids', wh);
+        location.href = '/reason?' + qq;
+      });
+    });
+  } catch (e) {
+    box.innerHTML = '<div class="muted">Ошибка heatmap: ' + (e.message || e) + '</div>';
+  }
 }
 
 async function loadWeekly() {
@@ -5820,6 +6260,7 @@ async function loadWeekly() {
     }).join('');
     const t = data.totals || {};
     meta.textContent = `Год ${data.year} · источник ${data.source} · всего ${fmt(t.amount_all)} ₽ · ORG0 ${fmt(t.amount_org0)} ₽ · недель ${weeks.length}`;
+    loadHeatmap();
   } catch (e) {
     meta.textContent = 'Ошибка: ' + (e.message || e);
   }
@@ -6218,6 +6659,7 @@ tr.total td { background: #eef4fa; font-weight: 700; }
   <a href="/weekly">Динамика</a>
   <a href="/reason" class="active">Карточка</a>
   <a href="/digest">Дайджест</a>
+  <a href="/actions">Действия</a>
   <a href="/status">Статус</a>
 </nav>
 <div class="meta" id="meta">Загрузка…</div>
@@ -6273,6 +6715,22 @@ function toggleBookmark(d){
   else list.unshift({ title, href, id: bookmarkKey(d) });
   localStorage.setItem(key, JSON.stringify(list.slice(0,10)));
   return exists < 0;
+}
+function toggleWatchlist(d){
+  if(d.reason_id == null) return false;
+  let list = [];
+  try { list = JSON.parse(localStorage.getItem('kurkuma_reason_watchlist')||'[]')||[]; } catch(_){}
+  const exists = list.findIndex(x => String(x.reason_id) === String(d.reason_id));
+  if (exists >= 0) list.splice(exists, 1);
+  else list.unshift({ reason_id: d.reason_id, title: d.title || ('reason '+d.reason_id) });
+  localStorage.setItem('kurkuma_reason_watchlist', JSON.stringify(list.slice(0,12)));
+  return exists < 0;
+}
+function inWatchlist(d){
+  try {
+    const list = JSON.parse(localStorage.getItem('kurkuma_reason_watchlist')||'[]')||[];
+    return list.some(x => String(x.reason_id) === String(d.reason_id));
+  } catch(_){ return false; }
 }
 async function load(){
   const q = new URLSearchParams(location.search);
@@ -6331,10 +6789,16 @@ async function load(){
       {key:'brand_name', label:'Бренд'}, {key:'amount', label:'Сумма', num:true}
     ]);
     const detailsQ = new URLSearchParams(q);
-    meta.innerHTML = `Источник: ${d.source} · <a class="btn secondary" href="/details?${detailsQ}">Сырые строки</a> <a class="btn secondary" href="/api/reason/export/xlsx?${q}">XLSX</a> <button class="btn secondary" id="btnBookmark" type="button">В закладки</button> <a class="btn secondary" href="/">На дашборд</a>`;
+    const watchLabel = inWatchlist(d) ? 'В watchlist ✓' : 'В watchlist';
+    meta.innerHTML = `Источник: ${d.source} · <a class="btn secondary" href="/details?${detailsQ}">Сырые строки</a> <a class="btn secondary" href="/api/reason/export/xlsx?${q}">XLSX</a> <button class="btn secondary" id="btnBookmark" type="button">В закладки</button> <button class="btn secondary" id="btnWatch" type="button">${watchLabel}</button> <a class="btn secondary" href="/">На дашборд</a>`;
     document.getElementById('btnBookmark').onclick = () => {
       const added = toggleBookmark(d);
       document.getElementById('btnBookmark').textContent = added ? 'В закладках' : 'В закладки';
+    };
+    document.getElementById('btnWatch').onclick = () => {
+      if(d.reason_id == null){ alert('Watchlist только для reason_id'); return; }
+      const added = toggleWatchlist(d);
+      document.getElementById('btnWatch').textContent = added ? 'В watchlist ✓' : 'В watchlist';
     };
   }catch(e){
     meta.textContent = 'Ошибка: ' + (e.message||e);
@@ -6356,42 +6820,178 @@ DIGEST_HTML = """<!DOCTYPE html>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
 :root {
-  --bg: #f4f6f8; --surface: #fff; --text: #152033; --muted: #5b6b7c;
-  --line: #d7e0ea; --primary: #1f4e79; --danger: #b42318;
-  --font: "IBM Plex Sans", "Segoe UI", sans-serif; --mono: "IBM Plex Mono", monospace;
+  --bg: #f4f6f8;
+  --bg-accent: #eef2f6;
+  --surface: #ffffff;
+  --text: #152033;
+  --muted: #5b6b7c;
+  --line: #d7e0ea;
+  --line-strong: #c3cfdb;
+  --primary: #1f4e79;
+  --primary-soft: #e8f0f8;
+  --ok: #1f7a4c;
+  --danger: #b42318;
+  --radius: 12px;
+  --pad: 16px;
+  --font: "IBM Plex Sans", "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, monospace;
 }
 * { box-sizing: border-box; }
-body { margin:0; font:14px/1.45 var(--font); color:var(--text); background:var(--bg); }
-.app-header { padding:18px 16px 8px; }
-.app-header h1 { margin:0; font-size:28px; letter-spacing:-.02em; }
-.subtitle { color:var(--muted); margin-top:4px; }
-.topnav { display:flex; gap:8px; flex-wrap:wrap; padding:0 16px 12px; }
-.topnav a { color:var(--muted); text-decoration:none; font-weight:600; padding:6px 10px; border-radius:8px; }
-.topnav a.active, .topnav a:hover { background:#e8f0f8; color:var(--primary); }
-.toolbar, .panel { margin:0 16px 14px; background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:12px; }
-.toolbar { display:flex; gap:10px; flex-wrap:wrap; align-items:end; }
-.kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin:0 16px 14px; }
-.kpi { background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:12px; }
-.kpi .k { font-size:11px; color:var(--muted); font-weight:700; text-transform:uppercase; }
-.kpi .v { margin-top:4px; font-size:20px; font-weight:700; font-family:var(--mono); }
-.grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:0 16px 16px; }
-.card { background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:12px; }
-.card h3 { margin:0 0 8px; font-size:14px; }
-.muted { color:var(--muted); }
-.btn { border:1px solid var(--line); background:#fff; border-radius:8px; padding:7px 12px; font-weight:600; cursor:pointer; }
-.btn.primary { background:var(--primary); color:#fff; border-color:var(--primary); }
-.item { padding:6px 0; border-bottom:1px solid var(--line); font-size:13px; }
-.item .meta { color:var(--muted); font-size:12px; margin-top:2px; }
-.dyn { color:var(--danger); font-family:var(--mono); font-weight:700; }
-@media (max-width:900px){ .grid{grid-template-columns:1fr;} }
+body {
+  margin: 0;
+  font: 14px/1.45 var(--font);
+  color: var(--text);
+  background:
+    radial-gradient(1200px 420px at 8% -10%, #e7eef7 0%, transparent 55%),
+    linear-gradient(180deg, var(--bg-accent), var(--bg) 220px);
+  min-height: 100vh;
+}
+.page { max-width: 1180px; margin: 0 auto; padding: 0 var(--pad) 28px; }
+.app-header { padding: 22px 0 10px; }
+.app-header h1 { margin: 0; font-size: 30px; letter-spacing: -0.03em; font-weight: 700; }
+.subtitle { margin-top: 6px; color: var(--muted); font-size: 14px; }
+.topnav { display: flex; gap: 6px; flex-wrap: wrap; padding: 0 0 14px; }
+.topnav a {
+  color: var(--muted); text-decoration: none; font-weight: 600;
+  padding: 7px 11px; border-radius: 8px;
+}
+.topnav a.active, .topnav a:hover { background: var(--primary-soft); color: var(--primary); }
+.toolbar {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr)) auto;
+  gap: 10px 12px;
+  align-items: end;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px;
+  margin-bottom: 14px;
+}
+.toolbar label {
+  display: flex; flex-direction: column; gap: 5px;
+  font-size: 11px; font-weight: 700; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .03em;
+}
+.toolbar input {
+  width: 100%; height: 36px; border: 1px solid var(--line-strong);
+  border-radius: 8px; padding: 0 10px; font: 14px var(--font); color: var(--text);
+  background: #fff;
+}
+.toolbar .actions {
+  display: flex; gap: 8px; align-items: end; flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.btn {
+  height: 36px; border: 1px solid var(--line-strong); background: #fff;
+  border-radius: 8px; padding: 0 14px; font: 600 13px var(--font);
+  color: var(--text); cursor: pointer; white-space: nowrap;
+}
+.btn:hover { background: #f7fafc; }
+.btn.primary { background: var(--primary); color: #fff; border-color: var(--primary); }
+.btn.primary:hover { filter: brightness(1.05); }
+.kpis {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.kpi {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 13px;
+  min-height: 84px;
+  display: flex; flex-direction: column; justify-content: space-between;
+}
+.kpi .k {
+  font-size: 11px; color: var(--muted); font-weight: 700;
+  text-transform: uppercase; letter-spacing: .03em; line-height: 1.2;
+}
+.kpi .v {
+  margin-top: 8px; font-size: 20px; font-weight: 700;
+  font-family: var(--mono); letter-spacing: -0.02em; line-height: 1.15;
+  word-break: break-word;
+}
+.kpi .v.up { color: var(--danger); }
+.kpi .v.down { color: var(--ok); }
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  align-items: stretch;
+}
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 14px 10px;
+  display: flex; flex-direction: column; min-height: 280px;
+}
+.card h3 {
+  margin: 0 0 10px; font-size: 14px; font-weight: 700;
+  letter-spacing: -0.01em; padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.card .body { flex: 1; }
+.note {
+  font-size: 12px; color: var(--muted); margin: -2px 0 10px;
+  padding: 6px 8px; background: #f7fafc; border-radius: 8px;
+}
+.list { display: flex; flex-direction: column; }
+.row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: baseline;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+.row:last-child { border-bottom: 0; }
+.row .name {
+  font-size: 13px; font-weight: 600; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.row .meta {
+  font-size: 12px; color: var(--muted); margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.row .val {
+  font-family: var(--mono); font-size: 12px; font-weight: 700;
+  color: var(--text); text-align: right; white-space: nowrap;
+}
+.row .val.dyn { color: var(--danger); }
+.row .val.ok { color: var(--ok); }
+.churn-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+}
+.churn-col h4 {
+  margin: 0 0 6px; font-size: 11px; font-weight: 700;
+  color: var(--muted); text-transform: uppercase; letter-spacing: .03em;
+}
+.empty {
+  color: var(--muted); font-size: 13px; padding: 18px 0;
+  text-align: center;
+}
+@media (max-width: 980px) {
+  .toolbar { grid-template-columns: 1fr 1fr; }
+  .toolbar .actions { grid-column: 1 / -1; justify-content: flex-start; }
+  .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 720px) {
+  .grid, .churn-grid, .kpis { grid-template-columns: 1fr; }
+  .toolbar { grid-template-columns: 1fr; }
+  .card { min-height: 0; }
+}
 @media print {
-  .topnav, .toolbar, .no-print { display:none !important; }
-  body { background:#fff; }
-  .panel, .card, .kpi { break-inside: avoid; box-shadow:none; }
+  .topnav, .toolbar, .no-print { display: none !important; }
+  body { background: #fff; }
+  .page { max-width: none; padding: 0; }
+  .card, .kpi { break-inside: avoid; box-shadow: none; }
 }
 </style>
 </head>
 <body>
+<div class="page">
 <header class="app-header">
   <h1>Дайджест брака</h1>
   <div class="subtitle" id="subtitle">Еженедельный срез KPI, алертов и сдвига ТОП-20</div>
@@ -6403,6 +7003,7 @@ body { margin:0; font:14px/1.45 var(--font); color:var(--text); background:var(-
   <a href="/weekly">Динамика</a>
   <a href="/reason">Карточка</a>
   <a href="/digest" class="active">Дайджест</a>
+  <a href="/actions">Действия</a>
   <a href="/status">Статус</a>
 </nav>
 <div class="toolbar no-print">
@@ -6410,21 +7011,37 @@ body { margin:0; font:14px/1.45 var(--font); color:var(--text); background:var(-
   <label>Пред. нед. <input id="week_prev" type="number"></label>
   <label>Посл. нед. <input id="week_last" type="number"></label>
   <label>WH ids <input id="wh_ids" placeholder="пусто = каталог"></label>
-  <button class="btn primary" id="btnLoad" type="button">Собрать</button>
-  <button class="btn" id="btnPrint" type="button">Печать / PDF</button>
-  <button class="btn" id="btnDownload" type="button">Скачать HTML</button>
+  <div class="actions">
+    <button class="btn primary" id="btnLoad" type="button">Собрать</button>
+    <button class="btn" id="btnSaveSnap" type="button">Сохранить снимок</button>
+    <button class="btn" id="btnPrint" type="button">Печать / PDF</button>
+    <button class="btn" id="btnDownload" type="button">Скачать HTML</button>
+  </div>
 </div>
 <div class="kpis" id="kpis"></div>
 <div class="grid" id="content">
-  <section class="card"><h3>Алерты роста</h3><div id="alerts" class="muted">Загрузка…</div></section>
-  <section class="card"><h3>Сдвиг ТОП-20</h3><div id="churn" class="muted">Загрузка…</div></section>
-  <section class="card"><h3>Корпуса</h3><div id="corpus" class="muted">Загрузка…</div></section>
-  <section class="card"><h3>Крупнейшие дельты</h3><div id="compare" class="muted">Загрузка…</div></section>
+  <section class="card"><h3>Алерты роста</h3><div class="body" id="alerts"><div class="empty">Загрузка…</div></div></section>
+  <section class="card"><h3>Сдвиг ТОП-20</h3><div class="body" id="churn"><div class="empty">Загрузка…</div></div></section>
+  <section class="card"><h3>Корпуса</h3><div class="body" id="corpus"><div class="empty">Загрузка…</div></div></section>
+  <section class="card"><h3>Крупнейшие дельты</h3><div class="body" id="compare"><div class="empty">Загрузка…</div></div></section>
+  <section class="card" style="grid-column:1 / -1"><h3>Снимок: тогда vs сейчас</h3><div class="body" id="snapshotBox"><div class="empty">Загрузка…</div></div></section>
+</div>
 </div>
 <script>
 function fmt(n){ return Number(n||0).toLocaleString('ru-RU',{maximumFractionDigits:0}); }
 function pct(n){ if(n==null) return '—'; return Number(n).toLocaleString('ru-RU',{maximumFractionDigits:1})+'%'; }
 function dyn(n){ if(n==null) return '—'; const s=n>0?'+':''; return s+pct(n); }
+function dynClass(n){
+  if(n==null || Number.isNaN(Number(n))) return '';
+  return Number(n) > 0 ? 'up' : (Number(n) < 0 ? 'down' : '');
+}
+function row(name, meta, val, valCls=''){
+  return `<div class="row">
+    <div><div class="name" title="${String(name).replaceAll('"','&quot;')}">${name}</div>
+    ${meta ? `<div class="meta">${meta}</div>` : ''}</div>
+    <div class="val ${valCls}">${val}</div>
+  </div>`;
+}
 function hydrate(){
   const q = new URLSearchParams(location.search);
   if(q.get('year')) document.getElementById('year').value = q.get('year');
@@ -6451,43 +7068,106 @@ async function load(){
     `Год ${d.year} · недели ${d.week_prev}→${d.week_last}` +
     (d.freshness && d.freshness.max_date ? ` · данные на ${d.freshness.max_date}` : '');
   const k = d.kpis||{}, y=d.yoy||{};
+  const yoyVal = y.yoy_pct==null ? 'нет данных' : dyn(y.yoy_pct);
   document.getElementById('kpis').innerHTML = [
-    ['Всего брак', fmt(k.total_last)],
-    ['ТОП-20', fmt(k.top20_last)],
-    ['Покрытие', pct(k.top20_cover)],
-    ['ORG0 %', pct(k.org0_share)],
-    ['vs ср.4', dyn(k.top20_vs_avg4)],
-    ['YoY', y.yoy_pct==null?'нет данных':dyn(y.yoy_pct)],
-  ].map(([a,b])=>`<div class="kpi"><div class="k">${a}</div><div class="v">${b}</div></div>`).join('');
+    ['Всего брак', fmt(k.total_last), ''],
+    ['ТОП-20', fmt(k.top20_last), ''],
+    ['Покрытие', pct(k.top20_cover), ''],
+    ['ORG0 %', pct(k.org0_share), ''],
+    ['vs ср.4', dyn(k.top20_vs_avg4), dynClass(k.top20_vs_avg4)],
+    ['YoY', yoyVal, y.yoy_pct==null ? '' : dynClass(y.yoy_pct)],
+  ].map(([a,b,c])=>`<div class="kpi"><div class="k">${a}</div><div class="v ${c}">${b}</div></div>`).join('');
+
   const alerts = d.growth_alerts||[];
-  document.getElementById('alerts').innerHTML = alerts.length ? alerts.map(a=>
-    `<div class="item"><b>${a.label}: ${a.name}</b><div class="meta"><span class="dyn">${dyn(a.vs_avg4!=null?a.vs_avg4:a.dynamics)}</span> · ${fmt(a.w_prev)} → ${fmt(a.w_last)}</div></div>`
-  ).join('') : '<div class="muted">Сильного роста нет</div>';
+  document.getElementById('alerts').innerHTML = alerts.length
+    ? `<div class="list">${alerts.slice(0,8).map(a => row(
+        `${a.label}: ${a.name}`,
+        `${fmt(a.w_prev)} → ${fmt(a.w_last)}`,
+        dyn(a.vs_avg4!=null?a.vs_avg4:a.dynamics),
+        'dyn'
+      )).join('')}</div>`
+    : '<div class="empty">Сильного роста нет</div>';
+
   const ch = (d.top20_churn&&d.top20_churn.defects)||{};
   const changed = Boolean(ch.membership_changed);
-  const left = changed ? (ch.entered||[]) : (ch.rank_up||[]);
-  const mid = changed ? (ch.exited||[]) : (ch.rank_down||[]);
+  const left = (changed ? (ch.entered||[]) : (ch.rank_up||[])).slice(0,6);
+  const mid = (changed ? (ch.exited||[]) : (ch.rank_down||[])).slice(0,6);
   const leftTitle = changed ? 'Вошли' : '↑ в рейтинге';
   const midTitle = changed ? 'Вышли' : '↓ в рейтинге';
-  const block = (title, arr, mode) => `<div style="margin-bottom:8px"><b>${title}</b>${(arr||[]).slice(0,6).map(x=>{
-    let meta = fmt(x.amount_last||x.delta);
-    if(mode==='exited') meta = fmt(x.amount_prev);
-    if(mode==='rank') meta = `#${x.rank_prev}→#${x.rank_last} · ${fmt(x.delta)}`;
-    return `<div class="item">${x.name}<div class="meta">${meta}</div></div>`;
-  }).join('')||'<div class="muted">нет</div>'}</div>`;
+  const col = (title, arr, mode) => {
+    if(!arr.length) return `<div class="churn-col"><h4>${title}</h4><div class="empty" style="padding:8px 0;text-align:left">нет</div></div>`;
+    return `<div class="churn-col"><h4>${title}</h4><div class="list">${arr.map(x=>{
+      let val = fmt(x.amount_last||x.delta);
+      let cls = '';
+      if(mode==='exited') val = fmt(x.amount_prev);
+      if(mode==='rank'){ val = `#${x.rank_prev}→#${x.rank_last}`; cls = title.includes('↑') ? 'ok' : 'dyn'; }
+      return row(x.name, mode==='rank' ? fmt(x.delta) : '', val, cls);
+    }).join('')}</div></div>`;
+  };
   document.getElementById('churn').innerHTML =
-    (changed?'':'<div class="muted" style="margin-bottom:6px">Состав ТОП-20 не изменился</div>')+
-    block(leftTitle, left, changed?'entered':'rank')+
-    block(midTitle, mid, changed?'exited':'rank')+
-    block('Δ остались', ch.stayed, 'stayed');
-  document.getElementById('corpus').innerHTML = (d.corpus_compare||[]).map(c=>
-    `<div class="item"><b>${c.name}</b><div class="meta">${fmt(c.amount_last)} · ${dyn(c.dynamics)} · доля ${pct(c.share_of_total)}</div></div>`
-  ).join('') || '<div class="muted">Нет данных</div>';
-  const cmp = [...((d.compare&&d.compare.defects)||[]), ...((d.compare&&d.compare.categories)||[])].slice(0,10);
-  document.getElementById('compare').innerHTML = cmp.map(r=>
-    `<div class="item"><b>${r.name}</b><div class="meta">${fmt(r.amount_a)} → ${fmt(r.amount_b)} · <span class="dyn">${dyn(r.pct)}</span></div></div>`
-  ).join('') || '<div class="muted">Нет данных</div>';
-  window.__digestHtml = document.documentElement.outerHTML;
+    (changed ? '' : '<div class="note">Состав ТОП-20 не изменился — показаны сдвиги ранга</div>') +
+    `<div class="churn-grid">${col(leftTitle, left, changed?'entered':'rank')}${col(midTitle, mid, changed?'exited':'rank')}</div>`;
+
+  const corpus = d.corpus_compare||[];
+  document.getElementById('corpus').innerHTML = corpus.length
+    ? `<div class="list">${corpus.map(c => row(
+        c.name,
+        `доля ${pct(c.share_of_total)} · ORG0 ${pct(c.org0_share)}`,
+        `${fmt(c.amount_last)} · ${dyn(c.dynamics)}`,
+        dynClass(c.dynamics)
+      )).join('')}</div>`
+    : '<div class="empty">Нет данных</div>';
+
+  const cmp = [...((d.compare&&d.compare.defects)||[]), ...((d.compare&&d.compare.categories)||[])].slice(0,8);
+  document.getElementById('compare').innerHTML = cmp.length
+    ? `<div class="list">${cmp.map(r => row(
+        r.name,
+        `${fmt(r.amount_a)} → ${fmt(r.amount_b)}`,
+        dyn(r.pct),
+        dynClass(r.pct)
+      )).join('')}</div>`
+    : '<div class="empty">Нет данных</div>';
+  renderSnapshotCompare(d);
+}
+function snapshotKey(){ return 'kurkuma_digest_snapshot'; }
+function saveSnapshot(d){
+  const snap = {
+    saved_at: new Date().toISOString(),
+    year: d.year, week_prev: d.week_prev, week_last: d.week_last,
+    kpis: d.kpis || {},
+    yoy: d.yoy || {},
+    alerts: (d.growth_alerts||[]).slice(0,8).map(a=>({name:a.name, kind:a.kind, row_id:a.row_id, w_last:a.w_last, dynamics:a.dynamics, vs_avg4:a.vs_avg4})),
+  };
+  localStorage.setItem(snapshotKey(), JSON.stringify(snap));
+  renderSnapshotCompare(d);
+}
+function loadSnapshot(){
+  try { return JSON.parse(localStorage.getItem(snapshotKey())||'null'); } catch(_){ return null; }
+}
+function renderSnapshotCompare(current){
+  const box = document.getElementById('snapshotBox');
+  if(!box) return;
+  const snap = loadSnapshot();
+  if(!snap){
+    box.innerHTML = '<div class="empty">Снимка ещё нет — нажмите «Сохранить снимок»</div>';
+    return;
+  }
+  const ck = current.kpis||{}, sk = snap.kpis||{};
+  const rows = [
+    ['Всего брак', sk.total_last, ck.total_last],
+    ['ТОП-20', sk.top20_last, ck.top20_last],
+    ['Покрытие', sk.top20_cover, ck.top20_cover, true],
+    ['ORG0 %', sk.org0_share, ck.org0_share, true],
+  ];
+  const when = (snap.saved_at||'').slice(0,16).replace('T',' ');
+  box.innerHTML = `<div class="note">Снимок: ${when} · W${snap.week_prev}→${snap.week_last} (${snap.year})</div>
+    <div class="list">${rows.map(([name,a,b,isPct])=>{
+      const av = Number(a||0), bv = Number(b||0), delta = bv-av;
+      const left = isPct ? pct(av) : fmt(av);
+      const right = isPct ? pct(bv) : fmt(bv);
+      const dtxt = isPct ? dyn(delta) : ((delta>0?'+':'')+fmt(delta));
+      return row(name, `${left} → ${right}`, dtxt, dynClass(delta));
+    }).join('')}</div>`;
 }
 document.getElementById('btnLoad').onclick = () => load().catch(e => alert(e.message||e));
 document.getElementById('btnPrint').onclick = () => window.print();
@@ -6500,8 +7180,173 @@ document.getElementById('btnDownload').onclick = () => {
   a.click();
   URL.revokeObjectURL(a.href);
 };
+document.getElementById('btnSaveSnap').onclick = async () => {
+  try {
+    const q = new URLSearchParams(location.search);
+    const r = await fetch('/api/digest?' + q);
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.error||r.statusText);
+    saveSnapshot(d);
+  } catch(e){ alert(e.message||e); }
+};
 hydrate();
-load().catch(e => { document.getElementById('alerts').textContent = 'Ошибка: '+(e.message||e); });
+load().catch(e => { document.getElementById('alerts').innerHTML = '<div class="empty">Ошибка: '+(e.message||e)+'</div>'; });
+</script>
+</body>
+</html>
+"""
+
+
+ACTIONS_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Доска действий</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+:root {
+  --bg:#f4f6f8; --surface:#fff; --text:#152033; --muted:#5b6b7c;
+  --line:#d7e0ea; --primary:#1f4e79; --danger:#b42318; --ok:#1f7a4c;
+  --font:"IBM Plex Sans","Segoe UI",sans-serif; --mono:"IBM Plex Mono",monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.45 var(--font);color:var(--text);background:linear-gradient(180deg,#eef2f6,#f4f6f8 220px)}
+.page{max-width:1180px;margin:0 auto;padding:0 16px 28px}
+.app-header{padding:22px 0 10px}
+.app-header h1{margin:0;font-size:28px;letter-spacing:-.02em}
+.subtitle{margin-top:6px;color:var(--muted)}
+.topnav{display:flex;gap:6px;flex-wrap:wrap;padding:0 0 14px}
+.topnav a{color:var(--muted);text-decoration:none;font-weight:600;padding:7px 11px;border-radius:8px}
+.topnav a.active,.topnav a:hover{background:#e8f0f8;color:var(--primary)}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:end;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:14px}
+.toolbar label{display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase}
+.toolbar input, .toolbar select{height:34px;border:1px solid var(--line);border-radius:8px;padding:0 10px;font:13px var(--font)}
+.btn{height:34px;border:1px solid var(--line);background:#fff;border-radius:8px;padding:0 12px;font:600 13px var(--font);cursor:pointer}
+.btn.primary{background:var(--primary);color:#fff;border-color:var(--primary)}
+.board{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.col{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:12px;min-height:320px}
+.col h3{margin:0 0 10px;font-size:13px;display:flex;justify-content:space-between;gap:8px}
+.col h3 .n{font-family:var(--mono);color:var(--muted)}
+.card{border:1px solid var(--line);border-radius:10px;padding:10px;margin-bottom:8px;cursor:pointer;background:#fafbfd}
+.card:hover{background:#f0f5fa}
+.card .t{font-weight:700;font-size:13px}
+.card .m{margin-top:4px;font-size:12px;color:var(--muted)}
+.card .dyn{color:var(--danger);font-family:var(--mono);font-weight:700}
+.card textarea,.card select{width:100%;margin-top:6px;font:12px var(--font);border:1px solid var(--line);border-radius:6px;padding:5px 7px}
+.card textarea{min-height:48px;resize:vertical}
+.empty{color:var(--muted);font-size:13px;padding:12px 0}
+@media(max-width:980px){.board{grid-template-columns:1fr 1fr}}
+@media(max-width:640px){.board{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="page">
+<header class="app-header">
+  <h1>Доска действий</h1>
+  <div class="subtitle">Алерты роста со статусами из localStorage</div>
+</header>
+<nav class="topnav">
+  <a href="/">Дашборд</a>
+  <a href="/nomenclature">Номенклатура</a>
+  <a href="/details">Детализация</a>
+  <a href="/weekly">Динамика</a>
+  <a href="/reason">Карточка</a>
+  <a href="/digest">Дайджест</a>
+  <a href="/actions" class="active">Действия</a>
+  <a href="/status">Статус</a>
+</nav>
+<div class="toolbar">
+  <label>Год <input id="year" type="number" value="2026"></label>
+  <label>Пред. нед. <input id="week_prev" type="number"></label>
+  <label>Посл. нед. <input id="week_last" type="number"></label>
+  <label>WH ids <input id="wh_ids" placeholder="пусто = каталог"></label>
+  <button class="btn primary" id="btnLoad" type="button">Обновить</button>
+</div>
+<div class="board" id="board"></div>
+</div>
+<script>
+const STATUSES = ['new','watching','escalated','closed'];
+function fmt(n){ return Number(n||0).toLocaleString('ru-RU',{maximumFractionDigits:0}); }
+function dyn(n){ if(n==null) return '—'; const s=n>0?'+':''; return s+Number(n).toLocaleString('ru-RU',{maximumFractionDigits:1})+'%'; }
+function notesKey(){
+  const year=document.getElementById('year').value;
+  const wl=document.getElementById('week_last').value||'na';
+  const wh=(document.getElementById('wh_ids').value||'').trim()||'all';
+  return `kurkuma_alert_notes:${year}:${wl}:${wh}`;
+}
+function loadNotes(){ try{return JSON.parse(localStorage.getItem(notesKey())||'{}')||{};}catch(_){return{};} }
+function saveNotes(n){ localStorage.setItem(notesKey(), JSON.stringify(n||{})); }
+function alertKey(a){ return a.alert_key || ((a.kind==='reason'?'r:':'c:')+(a.row_id??a.name)); }
+function openCard(a){
+  const q=new URLSearchParams({year:document.getElementById('year').value});
+  const wl=document.getElementById('week_last').value; if(wl) q.set('week_last', wl);
+  const wh=(document.getElementById('wh_ids').value||'').trim(); if(wh) q.set('wh_ids', wh);
+  if(a.kind==='reason' && a.row_id!=null) q.set('reason_id', a.row_id);
+  if(a.kind==='category') q.set('parent_name', a.name);
+  location.href='/reason?'+q;
+}
+function render(alerts){
+  const notes=loadNotes();
+  const groups={new:[],watching:[],escalated:[],closed:[]};
+  (alerts||[]).forEach(a=>{
+    const key=alertKey(a);
+    const st=(notes[key]&&notes[key].status)||'new';
+    (groups[st]||groups.new).push({...a, _key:key, _note:notes[key]||{status:st,comment:''}});
+  });
+  const titles={new:'New',watching:'Watching',escalated:'Escalated',closed:'Closed'};
+  document.getElementById('board').innerHTML = STATUSES.map(st=>{
+    const list=groups[st]||[];
+    return `<section class="col"><h3>${titles[st]} <span class="n">${list.length}</span></h3>
+      ${list.length?list.map(a=>`<div class="card" data-key="${a._key}">
+        <div class="t">${a.label}: ${a.name}</div>
+        <div class="m"><span class="dyn">${dyn(a.vs_avg4!=null?a.vs_avg4:a.dynamics)}</span> · ${fmt(a.w_prev)} → ${fmt(a.w_last)}</div>
+        <select data-role="status">${STATUSES.map(s=>`<option value="${s}"${s===st?' selected':''}>${s}</option>`).join('')}</select>
+        <textarea data-role="comment" placeholder="комментарий">${a._note.comment||''}</textarea>
+      </div>`).join(''):'<div class="empty">Пусто</div>'}
+    </section>`;
+  }).join('');
+  document.querySelectorAll('.card').forEach(card=>{
+    const key=card.dataset.key;
+    const persist=()=>{
+      const n=loadNotes();
+      n[key]={status:card.querySelector('[data-role=status]').value, comment:card.querySelector('[data-role=comment]').value||''};
+      saveNotes(n); render(alerts);
+    };
+    card.querySelector('[data-role=status]').onchange=persist;
+    card.querySelector('[data-role=comment]').onchange=persist;
+    card.addEventListener('click', (e)=>{
+      if(e.target.closest('select,textarea')) return;
+      const a=(alerts||[]).find(x=>alertKey(x)===key);
+      if(a) openCard(a);
+    });
+  });
+}
+async function load(){
+  const q=new URLSearchParams();
+  const year=document.getElementById('year').value;
+  const wp=document.getElementById('week_prev').value;
+  const wl=document.getElementById('week_last').value;
+  const wh=(document.getElementById('wh_ids').value||'').trim();
+  if(year) q.set('year', year);
+  if(wp) q.set('week_prev', wp);
+  if(wl) q.set('week_last', wl);
+  if(wh) q.set('wh_ids', wh);
+  const r=await fetch('/api/digest?'+q);
+  const d=await r.json();
+  if(!r.ok) throw new Error(d.error||r.statusText);
+  if(!document.getElementById('week_prev').value) document.getElementById('week_prev').value=d.week_prev;
+  if(!document.getElementById('week_last').value) document.getElementById('week_last').value=d.week_last;
+  history.replaceState(null,'','/actions?'+q);
+  render(d.growth_alerts||[]);
+}
+document.getElementById('btnLoad').onclick=()=>load().catch(e=>alert(e.message||e));
+const q0=new URLSearchParams(location.search);
+if(q0.get('year')) document.getElementById('year').value=q0.get('year');
+if(q0.get('week_prev')) document.getElementById('week_prev').value=q0.get('week_prev');
+if(q0.get('week_last')) document.getElementById('week_last').value=q0.get('week_last');
+if(q0.get('wh_ids')) document.getElementById('wh_ids').value=q0.get('wh_ids');
+load().catch(e=>{ document.getElementById('board').innerHTML='<div class="empty">Ошибка: '+(e.message||e)+'</div>'; });
 </script>
 </body>
 </html>
@@ -6896,6 +7741,7 @@ tr.total td { background: #eef4fa; font-weight: 700; }
   <a href="/weekly">Динамика</a>
   <a href="/reason">Карточка</a>
   <a href="/digest">Дайджест</a>
+  <a href="/actions">Действия</a>
   <a href="/status" class="active">Статус</a>
 </nav>
 <div class="meta" id="meta">Загрузка…</div>
@@ -7319,6 +8165,7 @@ tr.total td { background: #eef4fa; font-weight: 700; }
   <a href="/weekly">Динамика</a>
   <a href="/reason">Карточка</a>
   <a href="/digest">Дайджест</a>
+  <a href="/actions">Действия</a>
   <a href="/status">Статус</a>
 </nav>
 <div class="wrap">
@@ -7520,6 +8367,10 @@ def register_routes(application) -> None:
     @application.route("/digest")
     def digest_page():
         return DIGEST_HTML
+
+    @application.route("/actions")
+    def actions_page():
+        return ACTIONS_HTML
 
     @application.route("/api/admin/login", methods=["POST"])
     def api_admin_login():
@@ -8120,6 +8971,99 @@ def register_routes(application) -> None:
                     ),
                     "freshness": fetch_freshness_payload(),
                 }
+            )
+        except QueryParamError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
+    @application.route("/api/heatmap")
+    def api_heatmap():
+        env_err = check_db_env()
+        if env_err:
+            return jsonify({"error": env_err}), 503
+        try:
+            cfg = _cfg()
+            year = _year_arg(cfg.get("week_year", 2026))
+            wh_ids = _optional_wh_ids()
+            top_n = _detail_positive_int_arg(
+                request.args, "top_n", 12, min_value=3, max_value=20
+            )
+            week_limit = _detail_positive_int_arg(
+                request.args, "week_limit", 12, min_value=4, max_value=26
+            )
+            return jsonify(
+                fetch_reason_heatmap(
+                    year=year,
+                    office_id=cfg.get("office_id"),
+                    wh_ids=wh_ids,
+                    top_n=top_n,
+                    week_limit=week_limit,
+                )
+            )
+        except QueryParamError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
+    @application.route("/api/corpus/reasons")
+    def api_corpus_reasons():
+        env_err = check_db_env()
+        if env_err:
+            return jsonify({"error": env_err}), 503
+        try:
+            cfg = _cfg()
+            year = _year_arg(cfg.get("week_year", 2026))
+            corpus = _int_arg("corpus", None)
+            if corpus is None or corpus not in (1, 2, 3):
+                raise QueryParamError("Укажите corpus=1|2|3")
+            week_prev = _int_arg("week_prev", cfg.get("week_prev", 20))
+            week_last = _int_arg("week_last", cfg.get("week_last", 21))
+            if week_prev is None or week_last is None:
+                raise QueryParamError("Укажите week_prev и week_last")
+            limit = _detail_positive_int_arg(
+                request.args, "limit", 10, min_value=3, max_value=20
+            )
+            return jsonify(
+                fetch_corpus_reasons(
+                    corpus=corpus,
+                    year=year,
+                    week_prev=week_prev,
+                    week_last=week_last,
+                    office_id=cfg.get("office_id"),
+                    cfg=cfg,
+                    limit=limit,
+                )
+            )
+        except QueryParamError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
+    @application.route("/api/watchlist")
+    def api_watchlist():
+        env_err = check_db_env()
+        if env_err:
+            return jsonify({"error": env_err}), 503
+        try:
+            cfg = _cfg()
+            year = _year_arg(cfg.get("week_year", 2026))
+            week_prev = _int_arg("week_prev", cfg.get("week_prev", 20))
+            week_last = _int_arg("week_last", cfg.get("week_last", 21))
+            if week_prev is None or week_last is None:
+                raise QueryParamError("Укажите week_prev и week_last")
+            raw_ids = str(request.args.get("reason_ids", "") or "").strip()
+            reason_ids = parse_wh_ids(raw_ids) if raw_ids else []
+            wh_ids = _optional_wh_ids()
+            return jsonify(
+                fetch_watchlist_status(
+                    reason_ids=reason_ids,
+                    year=year,
+                    week_prev=week_prev,
+                    week_last=week_last,
+                    office_id=cfg.get("office_id"),
+                    wh_ids=wh_ids,
+                )
             )
         except QueryParamError as exc:
             return jsonify({"error": str(exc)}), 400
