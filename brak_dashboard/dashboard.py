@@ -4267,19 +4267,93 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: var(-
 .modal h3 { margin:0 0 10px; font-family: var(--display); font-size:18px; font-weight:600; color:var(--text); }
 .modal .body { display:grid; gap:8px; }
 .modal .row { border: 0; padding: 0; justify-content: flex-end; }
-.bars { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(18px,1fr); gap:3px; align-items:end; height:140px; }
-.bar { background: var(--primary); border-radius: 3px 3px 1px 1px; min-height:2px; width:100%; }
-.bar.org0 { background: var(--warn); }
-.wlabel { font-size:10px; color:var(--muted); text-align:center; font-family:var(--mono); }
-.heatmap { border-collapse: separate; border-spacing: 2px; font-size: 11px; }
-.heatmap th, .heatmap td { padding: 0; text-align: center; min-width: 26px; height: 24px; }
+.bars { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(28px,1fr); gap:6px; align-items:end; height:160px; padding: 4px 2px 0; }
+.bar-wrap { display:flex; flex-direction:column; align-items:center; gap:6px; min-width:0; height:100%; }
+.bar-stack {
+  flex: 1 1 auto; width: 100%; max-width: 28px;
+  display:flex; flex-direction:column; justify-content:flex-end; align-items:stretch;
+  gap: 2px; min-height: 0;
+}
+.bar {
+  background: linear-gradient(180deg, #5AA8A4, var(--primary));
+  border-radius: 6px 6px 2px 2px; min-height:2px; width:100%;
+  transition: opacity var(--ease), transform var(--ease);
+}
+.bar.org0 {
+  background: linear-gradient(180deg, #E0B35A, var(--warn));
+  border-radius: 4px 4px 2px 2px;
+}
+.bar-wrap:hover .bar { opacity: .92; transform: translateY(-1px); }
+.wlabel { font-size:11px; color:var(--muted); text-align:center; font-family:var(--mono); font-weight:600; }
+.weekly-chart {
+  padding: 14px 14px 8px;
+  border-bottom: 1px solid var(--line-soft);
+  background: linear-gradient(180deg, #FBFDFF 0%, #fff 100%);
+}
+.weekly-chart-head {
+  display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between;
+  gap:10px; margin-bottom: 12px;
+}
+.weekly-chart-head h3 {
+  margin:0; font-family: var(--display); font-size:16px; font-weight:600;
+  border:0; padding:0; text-transform:none; letter-spacing:.01em;
+}
+.chart-legend { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
+.chart-legend span {
+  display:inline-flex; align-items:center; gap:6px;
+  font-size:12px; color: var(--muted); font-weight:600;
+}
+.chart-legend i {
+  width:10px; height:10px; border-radius:3px; display:inline-block;
+}
+.chart-legend .lg-all { background: var(--primary); }
+.chart-legend .lg-org0 { background: var(--warn); }
+.weekly-table-wrap { overflow:auto; padding: 0 0 4px; }
+.weekly-table { width:100%; border-collapse:collapse; font-size:12.5px; }
+.weekly-table th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--bg-soft); color: var(--muted);
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em;
+  padding: 10px 12px; border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+.weekly-table td {
+  padding: 11px 12px; border-bottom: 1px solid var(--line-soft);
+  vertical-align: top;
+}
+.weekly-table tr:hover td { background: var(--primary-soft); }
+.weekly-table .week-cell {
+  font-family: var(--mono); font-weight: 700; color: var(--primary);
+  white-space: nowrap;
+}
+.weekly-table .num { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.reason-chips { display:flex; flex-wrap:wrap; gap:6px; max-width: 520px; }
+.reason-chip {
+  display:inline-flex; align-items:baseline; gap:6px;
+  padding: 4px 8px; border-radius: 8px;
+  background: var(--bg-soft); border: 1px solid var(--line-soft);
+  font-size: 12px; line-height: 1.25; color: var(--text);
+  max-width: 100%;
+}
+.reason-chip b {
+  font-weight: 600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  max-width: 220px;
+}
+.reason-chip .amt { font-family: var(--mono); color: var(--muted); font-size: 11px; white-space: nowrap; }
+.panel-title {
+  padding: 12px 14px 8px; margin: 0;
+  font-family: var(--display); font-size: 16px; font-weight: 600;
+  border-bottom: 1px solid var(--line-soft);
+}
+.heatmap { border-collapse: separate; border-spacing: 3px; font-size: 11px; width: max-content; min-width: 100%; }
+.heatmap th, .heatmap td { padding: 0; text-align: center; min-width: 28px; height: 26px; }
 .heatmap th { color: var(--muted); font-weight: 600; font-family: var(--mono); background: transparent; border:0; text-transform:none; }
 .heatmap .rname {
-  text-align:left; padding:0 8px 0 0; min-width:150px; max-width:210px;
+  text-align:left; padding:0 10px 0 0; min-width:160px; max-width:220px;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--text);
   font-weight:600; cursor:pointer; border:0; background:transparent; text-transform:none;
 }
-.heatmap td.cell { border-radius: 3px; cursor: pointer; border:0; }
+.heatmap td.cell { border-radius: 5px; cursor: pointer; border:0; }
 .board { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; width:100%; }
 .col { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:12px; min-height:280px; }
 .col h3 {
@@ -6095,7 +6169,7 @@ __SHARED_CSS__
 <section class="hero-band" data-reveal="fade-down">
   <div class="hero-kicker">Weekly · trend</div>
   <h2>Динамика <span class="text-accent">по неделям</span></h2>
-  <p class="hero-lead">Сумма брака, доля ORG0, топ причин и heatmap — тот же срез, с появлением блоков при скролле.</p>
+  <p class="hero-lead">Недельный тренд суммы брака и ORG0, топ причин и heatmap — без лишнего шума.</p>
   <a class="scrolldown" href="#weeklyFilters">К фильтрам <span class="chev" aria-hidden="true"></span></a>
 </section>
 
@@ -6117,36 +6191,47 @@ __SHARED_CSS__
   <div class="meta" id="meta" data-reveal="fade-up">Загрузка…</div>
 </section>
 
-<section class="mod-section">
-  <h2 class="section-title" data-reveal="fade-right">График <span class="text-accent">и таблица</span></h2>
-<section class="panel" data-reveal="zoom-in">
-  <div class="chart">
-    <div class="bars" id="bars"></div>
-  </div>
-  <div style="overflow:auto">
-    <table>
-      <thead>
-        <tr>
-          <th>Неделя</th>
-          <th class="num">Всего, ₽</th>
-          <th class="num">ORG0, ₽</th>
-          <th class="num">ORG0 %</th>
-          <th class="num">Строк</th>
-          <th>Топ причин</th>
-        </tr>
-      </thead>
-      <tbody id="tbody"></tbody>
-    </table>
-  </div>
-</section>
-<section class="panel" style="margin-top:12px" data-reveal="fade-up">
-  <div style="padding:12px 14px 4px;font-weight:700">Heatmap: причины × недели</div>
-  <div class="heatmap-wrap" style="padding:0 14px 14px" id="heatmapBox"><div class="muted">Загрузка…</div></div>
-</section>
+<section class="mod-section no-rule">
+  <h2 class="section-title" data-reveal="fade-right">Недельный <span class="text-accent">срез</span></h2>
+  <section class="panel" data-reveal="zoom-in" style="padding:0; overflow:hidden">
+    <div class="weekly-chart">
+      <div class="weekly-chart-head">
+        <h3>Сумма брака по неделям</h3>
+        <div class="chart-legend">
+          <span><i class="lg-all"></i> Всего</span>
+          <span><i class="lg-org0"></i> ORG0</span>
+        </div>
+      </div>
+      <div class="bars" id="bars"></div>
+    </div>
+    <div class="weekly-table-wrap">
+      <table class="weekly-table">
+        <thead>
+          <tr>
+            <th>Неделя</th>
+            <th class="num">Всего, ₽</th>
+            <th class="num">ORG0, ₽</th>
+            <th class="num">ORG0 %</th>
+            <th class="num">Строк</th>
+            <th>Топ причин</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel" style="margin-top:12px; padding:0; overflow:hidden" data-reveal="fade-up">
+    <h3 class="panel-title">Heatmap: причины × недели</h3>
+    <div class="heatmap-wrap" style="padding:10px 14px 14px" id="heatmapBox"><div class="muted">Загрузка…</div></div>
+  </section>
 </section>
 <script>
 function fmt(n) { return Number(n || 0).toLocaleString('ru-RU', { maximumFractionDigits: 0 }); }
 function pct(n) { return (Number(n || 0)).toLocaleString('ru-RU', { maximumFractionDigits: 1 }) + '%'; }
+function esc(s) {
+  return String(s ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
+}
 
 function hydrate() {
   const q = new URLSearchParams(location.search);
@@ -6159,6 +6244,15 @@ function heatColor(intensity) {
   const t = Math.max(0, Math.min(1, Number(intensity || 0)));
   const a = 0.10 + t * 0.55;
   return `rgba(47, 125, 122, ${a.toFixed(3)})`;
+}
+
+function renderReasonChips(list) {
+  const rows = Array.isArray(list) ? list : [];
+  if (!rows.length) return '<span class="muted">—</span>';
+  return `<div class="reason-chips">${rows.map(t => {
+    const name = esc(t.reason_descr || '—');
+    return `<span class="reason-chip" title="${name}"><b>${name}</b><span class="amt">${fmt(t.amount)}</span></span>`;
+  }).join('')}</div>`;
 }
 
 async function loadHeatmap() {
@@ -6176,12 +6270,12 @@ async function loadHeatmap() {
     const map = {};
     (d.cells || []).forEach(c => { map[c.reason_id + ':' + c.week] = c; });
     if (!weeks.length || !reasons.length) {
-      box.innerHTML = '<div class="muted">Нет данных для heatmap</div>';
+      box.innerHTML = '<div class="muted-box">Нет данных для heatmap</div>';
       return;
     }
     box.innerHTML = `<table class="heatmap"><thead><tr><th></th>${weeks.map(w=>`<th>W${w}</th>`).join('')}</tr></thead>
       <tbody>${reasons.map(reason => `<tr>
-        <td class="rname" data-reason-id="${reason.reason_id}" title="${reason.name}">${reason.name}</td>
+        <td class="rname" data-reason-id="${reason.reason_id}" title="${esc(reason.name)}">${esc(reason.name)}</td>
         ${weeks.map(w => {
           const cell = map[reason.reason_id + ':' + w];
           const amt = cell ? cell.amount : 0;
@@ -6197,7 +6291,7 @@ async function loadHeatmap() {
       });
     });
   } catch (e) {
-    box.innerHTML = '<div class="muted">Ошибка heatmap: ' + (e.message || e) + '</div>';
+    box.innerHTML = '<div class="muted-box">Ошибка heatmap: ' + (e.message || e) + '</div>';
   }
 }
 
@@ -6217,28 +6311,28 @@ async function loadWeekly() {
     history.replaceState(null, '', '/weekly?' + q);
     const weeks = data.weeks || [];
     const maxAmt = Math.max(1, ...weeks.map(w => w.amount_all || 0));
+    const chartH = 132;
     document.getElementById('bars').innerHTML = weeks.map(w => {
-      const h = Math.max(2, Math.round((w.amount_all || 0) / maxAmt * 180));
-      const h0 = Math.max(0, Math.round((w.amount_org0 || 0) / maxAmt * 180));
-      return `<div class="bar-wrap" title="W${w.week}: ${fmt(w.amount_all)}">
-        <div class="bar-stack" style="--h:${h}px">
+      const h = Math.max(4, Math.round((w.amount_all || 0) / maxAmt * chartH));
+      const h0 = Math.max(0, Math.round((w.amount_org0 || 0) / maxAmt * chartH));
+      return `<div class="bar-wrap" title="W${w.week}: всего ${fmt(w.amount_all)} · ORG0 ${fmt(w.amount_org0)}">
+        <div class="bar-stack">
           <div class="bar" style="height:${h}px"></div>
-          <div class="bar org0" style="height:${h0}px"></div>
+          <div class="bar org0" style="height:${Math.max(h0 ? 3 : 0, h0)}px"></div>
         </div>
         <div class="wlabel">${w.week}</div>
       </div>`;
-    }).join('');
+    }).join('') || '<div class="muted-box">Нет недель</div>';
     document.getElementById('tbody').innerHTML = weeks.map(w => {
-      const top = (w.top_reasons || []).map(t => `${t.reason_descr} (${fmt(t.amount)})`).join('; ');
       return `<tr>
-        <td>${w.week}</td>
+        <td class="week-cell">W${w.week}</td>
         <td class="num">${fmt(w.amount_all)}</td>
         <td class="num">${fmt(w.amount_org0)}</td>
         <td class="num">${pct(w.org0_share)}</td>
         <td class="num">${fmt(w.row_count)}</td>
-        <td class="top">${top || '—'}</td>
+        <td>${renderReasonChips(w.top_reasons)}</td>
       </tr>`;
-    }).join('');
+    }).join('') || '<tr><td colspan="6" class="muted">Нет данных</td></tr>';
     const t = data.totals || {};
     meta.textContent = `Год ${data.year} · источник ${data.source} · всего ${fmt(t.amount_all)} ₽ · ORG0 ${fmt(t.amount_org0)} ₽ · недель ${weeks.length}`;
     if (typeof revealRefresh === 'function') revealRefresh();
