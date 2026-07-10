@@ -4596,6 +4596,18 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: var(-
   border-top: 1px dashed var(--line);
 }
 .actions-row .label { font-size:11px; color:var(--muted); font-weight:700; text-transform:uppercase; }
+.toolbar.compact-toolbar {
+  display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between;
+  gap: 14px; padding: 16px;
+  background: linear-gradient(180deg, #FFFFFF 0%, #F9FBFC 100%);
+  box-shadow: var(--shadow);
+}
+.toolbar.compact-toolbar .fields {
+  display: flex; flex-wrap: wrap; gap: 12px; align-items: end; flex: 1 1 320px;
+}
+.toolbar.compact-toolbar .fields > label { min-width: 108px; }
+.toolbar.compact-toolbar .fields > label.wide { min-width: 200px; flex: 1 1 200px; }
+.toolbar.compact-toolbar .actions-row { flex: 0 0 auto; }
 .modal-overlay {
   position:fixed; inset:0; background:rgba(30,42,50,.35); display:none;
   align-items:center; justify-content:center; z-index:80;
@@ -7148,17 +7160,19 @@ __SHARED_CSS__
 </section>
 <section class="mod-section no-print" id="digestFilters">
   <h2 class="section-title" data-reveal="fade-right">Параметры</h2>
-  <div class="toolbar no-print" data-reveal="fade-up">
-  <label>Год <input id="year" type="number" value="2026"></label>
-  <label>Пред. нед. <input id="week_prev" type="number"></label>
-  <label>Посл. нед. <input id="week_last" type="number"></label>
-  <label>WH ids <input id="wh_ids" placeholder="пусто = каталог"></label>
-  <div class="actions">
-    <button class="btn primary" id="btnLoad" type="button">Собрать</button>
-    <button class="btn" id="btnSaveSnap" type="button">Сохранить снимок</button>
-    <button class="btn" id="btnPrint" type="button">Печать / PDF</button>
-    <button class="btn" id="btnDownload" type="button">Скачать HTML</button>
-  </div>
+  <div class="toolbar compact-toolbar no-print" data-reveal="fade-up">
+    <div class="fields">
+      <label>Год <input id="year" type="number" value="2026"></label>
+      <label>Пред. неделя <select id="week_prev"></select></label>
+      <label>Посл. неделя <select id="week_last"></select></label>
+      <label class="wide">WH <input id="wh_ids" placeholder="пусто = весь каталог"></label>
+    </div>
+    <div class="actions-row">
+      <button class="btn primary" id="btnLoad" type="button">Собрать</button>
+      <button class="btn export" id="btnSaveSnap" type="button">Сохранить снимок</button>
+      <button class="btn export" id="btnPrint" type="button">Печать / PDF</button>
+      <button class="btn export" id="btnDownload" type="button">Скачать HTML</button>
+    </div>
   </div>
 </section>
 <section class="mod-section no-rule" id="digestBody">
@@ -7190,9 +7204,40 @@ function row(name, meta, val, valCls=''){
 function hydrate(){
   const q = new URLSearchParams(location.search);
   if(q.get('year')) document.getElementById('year').value = q.get('year');
-  if(q.get('week_prev')) document.getElementById('week_prev').value = q.get('week_prev');
-  if(q.get('week_last')) document.getElementById('week_last').value = q.get('week_last');
   if(q.get('wh_ids')) document.getElementById('wh_ids').value = q.get('wh_ids');
+  return {
+    week_prev: q.get('week_prev'),
+    week_last: q.get('week_last'),
+  };
+}
+function fillWeekSelects(weeks, wp, wl){
+  const prev = document.getElementById('week_prev');
+  const last = document.getElementById('week_last');
+  const list = Array.isArray(weeks) ? weeks : [];
+  const opts = list.map(w => `<option value="${w}">${w}</option>`).join('');
+  prev.innerHTML = opts || '<option value="">—</option>';
+  last.innerHTML = opts || '<option value="">—</option>';
+  if(wp != null && wp !== '') prev.value = String(wp);
+  if(wl != null && wl !== '') last.value = String(wl);
+  if(!prev.value && list.length >= 2) prev.value = String(list[list.length - 2]);
+  if(!last.value && list.length) last.value = String(list[list.length - 1]);
+}
+async function initWeeks(urlWeeks){
+  const year = document.getElementById('year').value;
+  const q = new URLSearchParams();
+  if(year) q.set('year', year);
+  const wh = (document.getElementById('wh_ids').value||'').trim();
+  if(wh) q.set('wh_ids', wh);
+  const r = await fetch('/api/weeks?' + q);
+  const raw = await r.text();
+  if(!r.ok) throw new Error(raw||r.statusText);
+  const d = JSON.parse(raw);
+  if(d.year) document.getElementById('year').value = d.year;
+  fillWeekSelects(
+    d.weeks || [],
+    (urlWeeks && urlWeeks.week_prev) || d.week_prev,
+    (urlWeeks && urlWeeks.week_last) || d.week_last
+  );
 }
 async function load(){
   const q = new URLSearchParams();
@@ -7209,6 +7254,9 @@ async function load(){
   if(!r.ok) throw new Error(raw||r.statusText);
   const d = JSON.parse(raw);
   history.replaceState(null,'','/digest?'+q);
+  if(d.week_prev != null) document.getElementById('week_prev').value = String(d.week_prev);
+  if(d.week_last != null) document.getElementById('week_last').value = String(d.week_last);
+  if(d.year != null) document.getElementById('year').value = String(d.year);
   document.getElementById('subtitle').textContent =
     `Год ${d.year} · недели ${d.week_prev}→${d.week_last}` +
     (d.freshness && d.freshness.max_date ? ` · данные на ${d.freshness.max_date}` : '');
@@ -7335,8 +7383,18 @@ document.getElementById('btnSaveSnap').onclick = async () => {
     saveSnapshot(d);
   } catch(e){ alert(e.message||e); }
 };
-hydrate();
-load().catch(e => { document.getElementById('alerts').innerHTML = '<div class="empty">Ошибка: '+(e.message||e)+'</div>'; });
+document.getElementById('year').addEventListener('change', () => {
+  initWeeks(null).catch(() => {});
+});
+(async () => {
+  try {
+    const urlWeeks = hydrate();
+    await initWeeks(urlWeeks);
+    await load();
+  } catch(e) {
+    document.getElementById('alerts').innerHTML = '<div class="empty">Ошибка: '+(e.message||e)+'</div>';
+  }
+})();
 </script>
 </div>
 </div>
@@ -7380,12 +7438,16 @@ __SHARED_CSS__
   <p class="hero-lead">Алерты роста со статусами из localStorage — колонки появляются каскадом.</p>
 </section>
 <section class="mod-section no-rule">
-  <div class="toolbar" data-reveal="fade-up">
-  <label>Год <input id="year" type="number" value="2026"></label>
-  <label>Пред. нед. <input id="week_prev" type="number"></label>
-  <label>Посл. нед. <input id="week_last" type="number"></label>
-  <label>WH ids <input id="wh_ids" placeholder="пусто = каталог"></label>
-  <button class="btn primary" id="btnLoad" type="button">Обновить</button>
+  <div class="toolbar compact-toolbar" data-reveal="fade-up">
+    <div class="fields">
+      <label>Год <input id="year" type="number" value="2026"></label>
+      <label>Пред. неделя <select id="week_prev"></select></label>
+      <label>Посл. неделя <select id="week_last"></select></label>
+      <label class="wide">WH <input id="wh_ids" placeholder="пусто = весь каталог"></label>
+    </div>
+    <div class="actions-row">
+      <button class="btn primary" id="btnLoad" type="button">Обновить</button>
+    </div>
   </div>
   <div class="board stagger" id="board"></div>
 </section>
@@ -7409,6 +7471,34 @@ function openCard(a){
   if(a.kind==='reason' && a.row_id!=null) q.set('reason_id', a.row_id);
   if(a.kind==='category') q.set('parent_name', a.name);
   location.href='/reason?'+q;
+}
+function fillWeekSelects(weeks, wp, wl){
+  const prev = document.getElementById('week_prev');
+  const last = document.getElementById('week_last');
+  const list = Array.isArray(weeks) ? weeks : [];
+  const opts = list.map(w => `<option value="${w}">${w}</option>`).join('');
+  prev.innerHTML = opts || '<option value="">—</option>';
+  last.innerHTML = opts || '<option value="">—</option>';
+  if(wp != null && wp !== '') prev.value = String(wp);
+  if(wl != null && wl !== '') last.value = String(wl);
+  if(!prev.value && list.length >= 2) prev.value = String(list[list.length - 2]);
+  if(!last.value && list.length) last.value = String(list[list.length - 1]);
+}
+async function initWeeks(urlWeeks){
+  const year = document.getElementById('year').value;
+  const q = new URLSearchParams();
+  if(year) q.set('year', year);
+  const wh = (document.getElementById('wh_ids').value||'').trim();
+  if(wh) q.set('wh_ids', wh);
+  const r = await fetch('/api/weeks?' + q);
+  const d = await r.json();
+  if(!r.ok) throw new Error(d.error||r.statusText);
+  if(d.year) document.getElementById('year').value = d.year;
+  fillWeekSelects(
+    d.weeks || [],
+    (urlWeeks && urlWeeks.week_prev) || d.week_prev,
+    (urlWeeks && urlWeeks.week_last) || d.week_last
+  );
 }
 function render(alerts){
   const notes=loadNotes();
@@ -7460,18 +7550,27 @@ async function load(){
   const r=await fetch('/api/digest?'+q);
   const d=await r.json();
   if(!r.ok) throw new Error(d.error||r.statusText);
-  if(!document.getElementById('week_prev').value) document.getElementById('week_prev').value=d.week_prev;
-  if(!document.getElementById('week_last').value) document.getElementById('week_last').value=d.week_last;
+  if(d.week_prev != null) document.getElementById('week_prev').value = String(d.week_prev);
+  if(d.week_last != null) document.getElementById('week_last').value = String(d.week_last);
+  if(d.year != null) document.getElementById('year').value = String(d.year);
   history.replaceState(null,'','/actions?'+q);
   render(d.growth_alerts||[]);
 }
 document.getElementById('btnLoad').onclick=()=>load().catch(e=>alert(e.message||e));
-const q0=new URLSearchParams(location.search);
-if(q0.get('year')) document.getElementById('year').value=q0.get('year');
-if(q0.get('week_prev')) document.getElementById('week_prev').value=q0.get('week_prev');
-if(q0.get('week_last')) document.getElementById('week_last').value=q0.get('week_last');
-if(q0.get('wh_ids')) document.getElementById('wh_ids').value=q0.get('wh_ids');
-load().catch(e=>{ document.getElementById('board').innerHTML='<div class="empty">Ошибка: '+(e.message||e)+'</div>'; });
+document.getElementById('year').addEventListener('change', () => {
+  initWeeks(null).catch(() => {});
+});
+(async () => {
+  try {
+    const q0=new URLSearchParams(location.search);
+    if(q0.get('year')) document.getElementById('year').value=q0.get('year');
+    if(q0.get('wh_ids')) document.getElementById('wh_ids').value=q0.get('wh_ids');
+    await initWeeks({ week_prev: q0.get('week_prev'), week_last: q0.get('week_last') });
+    await load();
+  } catch(e) {
+    document.getElementById('board').innerHTML='<div class="empty">Ошибка: '+(e.message||e)+'</div>';
+  }
+})();
 </script>
 </div>
 </div>
