@@ -3068,6 +3068,215 @@ def fetch_corpus_reasons(
     return payload
 
 
+def _finalize_reason_deltas(
+    raw: list[tuple[Any, ...]],
+    *,
+    limit: int = 20,
+) -> tuple[list[dict[str, Any]], dict[str, float | None]]:
+    items: list[dict[str, Any]] = []
+    for r in raw:
+        if r[0] is None and not (r[1] or "").strip():
+            continue
+        amount_a = to_float(r[2])
+        amount_b = to_float(r[3])
+        if amount_a == 0 and amount_b == 0:
+            continue
+        delta = amount_b - amount_a
+        pct = ((amount_b / amount_a - 1.0) * 100) if amount_a else (100.0 if amount_b else None)
+        items.append(
+            {
+                "kind": "reason",
+                "row_id": int(r[0]) if r[0] is not None else None,
+                "name": (r[1] or "—"),
+                "amount_a": amount_a,
+                "amount_b": amount_b,
+                "delta": delta,
+                "pct": pct,
+            }
+        )
+    total_a = sum(i["amount_a"] for i in items)
+    total_b = sum(i["amount_b"] for i in items)
+    items.sort(key=lambda x: (-abs(x["delta"]), -x["amount_b"]))
+    lim = max(1, min(50, int(limit)))
+    totals: dict[str, float | None] = {
+        "amount_a": total_a,
+        "amount_b": total_b,
+        "delta": total_b - total_a,
+        "pct": ((total_b / total_a - 1.0) * 100) if total_a else (100.0 if total_b else None),
+    }
+    return items[:lim], totals
+
+
+def _report_year_clauses(
+    src: dict[str, str],
+    year: int,
+) -> tuple[list[str], list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if src["base_not_null_clause"]:
+        clauses.append(src["base_not_null_clause"])
+    if _use_report_matview() and src["table"] != NORM_VIEW:
+        clauses.append(src["year_clause"])
+        params.append(year)
+    else:
+        year_start = date.fromisocalendar(year, 1, 1)
+        year_end = date.fromisocalendar(year + 1, 1, 1)
+        clauses.append(src["year_clause"])
+        params.extend([year_start, year_end])
+    return clauses, params
+
+
+def fetch_reason_week_compare(
+    *,
+    wh_ids: list[int] | None,
+    office_id: int | None,
+    year: int,
+    week_a: int,
+    week_b: int,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """All reasons: week_a vs week_b on the same WH slice, sorted by |delta|."""
+    if week_a == week_b:
+        raise QueryParamError("Выберите разные недели для сравнения")
+    lim = max(1, min(50, int(limit)))
+    sorted_wh = sorted(wh_ids) if wh_ids else []
+    cache_key = (
+        f"cmp_week_v1:{year}:{week_a}:{week_b}:{office_id}:"
+        f"{','.join(map(str, sorted_wh))}:{lim}"
+    )
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    src = _report_source()
+    clauses, params = _report_year_clauses(src, year)
+    if office_id is not None:
+        clauses.append("office_id = %s")
+        params.append(office_id)
+    if wh_ids:
+        clauses.append("wh_id = ANY(%s)")
+        params.append(wh_ids)
+    clauses.append(f"{src['week_expr']} IN (%s, %s)")
+    params.extend([week_a, week_b])
+    where = " WHERE " + " AND ".join(clauses)
+    sql = f"""
+        SELECT
+            reason_id,
+            MAX(COALESCE(NULLIF(BTRIM(reason_descr), ''), '—')) AS name,
+            COALESCE(SUM({src['amount_expr']}) FILTER (WHERE {src['week_expr']} = %s), 0) AS amount_a,
+            COALESCE(SUM({src['amount_expr']}) FILTER (WHERE {src['week_expr']} = %s), 0) AS amount_b
+        FROM {src['table']}
+        {where}
+        GROUP BY reason_id
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, [week_a, week_b, *params])
+        raw = cur.fetchall()
+    reasons, totals = _finalize_reason_deltas(raw, limit=lim)
+    payload = {
+        "mode": "week",
+        "year": year,
+        "slice_a": {
+            "label": f"W{week_a}",
+            "week": week_a,
+            "wh_count": len(sorted_wh) if sorted_wh else None,
+        },
+        "slice_b": {
+            "label": f"W{week_b}",
+            "week": week_b,
+            "wh_count": len(sorted_wh) if sorted_wh else None,
+        },
+        "reasons": reasons,
+        "totals": totals,
+    }
+    _cache_set(cache_key, payload, CACHE_TTL_SEC)
+    return payload
+
+
+def fetch_corpus_week_compare(
+    *,
+    corpus_a: int,
+    corpus_b: int,
+    office_id: int | None,
+    year: int,
+    week: int,
+    limit: int = 20,
+    cfg: dict | None = None,
+) -> dict[str, Any]:
+    """All reasons: corpus_a vs corpus_b on the same week, sorted by |delta|."""
+    ca, cb = int(corpus_a), int(corpus_b)
+    if ca == cb:
+        raise QueryParamError("Выберите разные корпуса для сравнения")
+    if ca not in (1, 2, 3) or cb not in (1, 2, 3):
+        raise QueryParamError("Корпус должен быть 1, 2 или 3")
+    lim = max(1, min(50, int(limit)))
+    cfg = cfg or load_config()
+    corpus_map = _corpus_wh_map(cfg)
+    wh_a = corpus_map.get(ca) or []
+    wh_b = corpus_map.get(cb) or []
+    if not wh_a:
+        raise QueryParamError(f"Корпус {ca}: нет WH в справочнике")
+    if not wh_b:
+        raise QueryParamError(f"Корпус {cb}: нет WH в справочнике")
+    union_wh = sorted(set(wh_a) | set(wh_b))
+    cache_key = (
+        f"cmp_corpus_v1:{year}:{week}:{ca}:{cb}:{office_id}:"
+        f"{','.join(map(str, union_wh))}:{lim}"
+    )
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    src = _report_source()
+    clauses, params = _report_year_clauses(src, year)
+    if office_id is not None:
+        clauses.append("office_id = %s")
+        params.append(office_id)
+    clauses.append("wh_id = ANY(%s)")
+    params.append(union_wh)
+    clauses.append(f"{src['week_expr']} = %s")
+    params.append(week)
+    where = " WHERE " + " AND ".join(clauses)
+    sql = f"""
+        SELECT
+            reason_id,
+            MAX(COALESCE(NULLIF(BTRIM(reason_descr), ''), '—')) AS name,
+            COALESCE(SUM({src['amount_expr']}) FILTER (WHERE wh_id = ANY(%s)), 0) AS amount_a,
+            COALESCE(SUM({src['amount_expr']}) FILTER (WHERE wh_id = ANY(%s)), 0) AS amount_b
+        FROM {src['table']}
+        {where}
+        GROUP BY reason_id
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, [wh_a, wh_b, *params])
+        raw = cur.fetchall()
+    reasons, totals = _finalize_reason_deltas(raw, limit=lim)
+    payload = {
+        "mode": "corpus",
+        "year": year,
+        "slice_a": {
+            "label": f"{ca} корпус",
+            "corpus": ca,
+            "name": f"{ca} корпус",
+            "week": week,
+            "wh_count": len(wh_a),
+        },
+        "slice_b": {
+            "label": f"{cb} корпус",
+            "corpus": cb,
+            "name": f"{cb} корпус",
+            "week": week,
+            "wh_count": len(wh_b),
+        },
+        "reasons": reasons,
+        "totals": totals,
+    }
+    _cache_set(cache_key, payload, CACHE_TTL_SEC)
+    return payload
+
+
 def fetch_watchlist_status(
     *,
     reason_ids: list[int],
@@ -4525,6 +4734,15 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: var(-
 .building-btns button.active:hover, .presets button.active:hover {
   background: var(--primary-2); color: #fff; border-color: var(--primary-2);
 }
+.mode-toggle { display:flex; flex-wrap:wrap; gap:6px; }
+.mode-toggle button.active {
+  background: var(--primary); color:#fff; border-color:var(--primary);
+  box-shadow: 0 3px 10px rgba(47,125,122,.2);
+}
+.mode-toggle button.active:hover {
+  background: var(--primary-2); border-color: var(--primary-2); color:#fff;
+}
+.compare-fields-hidden { display: none !important; }
 .wh-grid {
   display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
   gap:6px 10px; max-height:180px; overflow:auto; padding:6px 0;
@@ -4984,6 +5202,7 @@ __SHARED_CSS__
   <a href="/weekly">Динамика</a>
   <a href="/reason">Карточка</a>
   <a href="/digest">Дайджест</a>
+  <a href="/compare">Сравнение</a>
   <a href="/actions">Действия</a>
   <a href="/status">Статус</a>
 </nav>
@@ -5602,7 +5821,16 @@ function updatePeriodCompare(compare) {
     box.innerHTML = '<div class="muted-box">Нет данных для сравнения</div>';
     return;
   }
-  box.innerHTML = `<div class="muted" style="margin-bottom:6px">Неделя ${c.week_a} → ${c.week_b}</div>
+  const moreQ = new URLSearchParams({
+    mode: 'week',
+    week_a: String(c.week_a),
+    week_b: String(c.week_b),
+    year: document.getElementById('year').value,
+  });
+  const wh = selectedWh.size ? Array.from(selectedWh).join(',') : '';
+  if (wh) moreQ.set('wh_ids', wh);
+  box.innerHTML = `<div class="muted" style="margin-bottom:6px">Неделя ${c.week_a} → ${c.week_b}
+      · <a href="/compare?${moreQ}" style="color:var(--primary-2);font-weight:700;text-decoration:none">Подробнее →</a></div>
     <table class="delta-table"><thead><tr><th>Тип</th><th>Название</th><th class="num">Δ ₽</th><th class="num">%</th></tr></thead>
     <tbody>${rows.map(r => {
       const kind = r.kind === 'category' ? 'кат.' : 'деф.';
@@ -6454,6 +6682,7 @@ __SHARED_CSS__
   <a href="/weekly">Динамика</a>
   <a href="/reason">Карточка</a>
   <a href="/digest">Дайджест</a>
+  <a href="/compare">Сравнение</a>
   <a href="/actions">Действия</a>
   <a href="/status">Статус</a>
 </nav>
@@ -6722,6 +6951,7 @@ __SHARED_CSS__
   <a href="/weekly" class="active">Динамика</a>
   <a href="/reason">Карточка</a>
   <a href="/digest">Дайджест</a>
+  <a href="/compare">Сравнение</a>
   <a href="/actions">Действия</a>
   <a href="/status">Статус</a>
 </nav>
@@ -6948,6 +7178,7 @@ __SHARED_CSS__
   <a href="/weekly">Динамика</a>
   <a href="/reason" class="active">Карточка</a>
   <a href="/digest">Дайджест</a>
+  <a href="/compare">Сравнение</a>
   <a href="/actions">Действия</a>
   <a href="/status">Статус</a>
 </nav>
@@ -7147,6 +7378,7 @@ __SHARED_CSS__
   <a href="/weekly">Динамика</a>
   <a href="/reason">Карточка</a>
   <a href="/digest" class="active">Дайджест</a>
+  <a href="/compare">Сравнение</a>
   <a href="/actions">Действия</a>
   <a href="/status">Статус</a>
 </nav>
@@ -7427,6 +7659,7 @@ __SHARED_CSS__
   <a href="/weekly">Динамика</a>
   <a href="/reason">Карточка</a>
   <a href="/digest">Дайджест</a>
+  <a href="/compare">Сравнение</a>
   <a href="/actions" class="active">Действия</a>
   <a href="/status">Статус</a>
 </nav>
@@ -7603,6 +7836,7 @@ __SHARED_CSS__
   <a href="/weekly">Динамика</a>
   <a href="/reason">Карточка</a>
   <a href="/digest">Дайджест</a>
+  <a href="/compare">Сравнение</a>
   <a href="/actions">Действия</a>
   <a href="/status" class="active">Статус</a>
 </nav>
@@ -7691,6 +7925,7 @@ __SHARED_CSS__
   <a href="/weekly">Динамика</a>
   <a href="/reason">Карточка</a>
   <a href="/digest">Дайджест</a>
+  <a href="/compare">Сравнение</a>
   <a href="/actions">Действия</a>
   <a href="/status">Статус</a>
 </nav>
@@ -7802,10 +8037,278 @@ loadData();
 """
 
 
+COMPARE_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Сравнение срезов</title>
+<style>
+__SHARED_CSS__
+</style>
+</head>
+<body>
+<div class="app-shell">
+<div class="app-top"><div class="app-top-inner">
+<div class="brand-row">
+  <h1>Сравнение</h1>
+  <div class="subtitle" id="subtitle">Неделя vs неделя или корпус vs корпус — дельта по причинам</div>
+</div>
+<nav class="topnav">
+  <a href="/">Дашборд</a>
+  <a href="/nomenclature">Номенклатура</a>
+  <a href="/details">Детализация</a>
+  <a href="/weekly">Динамика</a>
+  <a href="/reason">Карточка</a>
+  <a href="/digest">Дайджест</a>
+  <a href="/compare" class="active">Сравнение</a>
+  <a href="/actions">Действия</a>
+  <a href="/status">Статус</a>
+</nav>
+</div></div>
+<div class="page-body">
+<section class="hero-band" data-reveal="fade-down">
+  <div class="hero-kicker">Compare · slices</div>
+  <h2>Сравнение <span class="text-accent">срезов</span></h2>
+  <p class="hero-lead">Два среза на одном экране: недели или корпуса, с дельтой по причинам.</p>
+</section>
+<section class="mod-section" id="compareFilters">
+  <h2 class="section-title" data-reveal="fade-right">Параметры</h2>
+  <div class="toolbar compact-toolbar" data-reveal="fade-up">
+    <div class="fields">
+      <div class="mode-toggle" id="modeToggle">
+        <button type="button" class="btn secondary active" data-mode="week">Неделя vs неделя</button>
+        <button type="button" class="btn secondary" data-mode="corpus">Корпус vs корпус</button>
+      </div>
+      <label>Год <input id="year" type="number" value="2026"></label>
+      <label id="fldWeekA">Срез A <select id="week_a"></select></label>
+      <label id="fldWeekB">Срез B <select id="week_b"></select></label>
+      <label id="fldWeek" class="compare-fields-hidden">Неделя <select id="week"></select></label>
+      <label id="fldCorpusA" class="compare-fields-hidden">Корпус A
+        <select id="corpus_a"><option value="1">1 корпус</option><option value="2">2 корпус</option><option value="3">3 корпус</option></select>
+      </label>
+      <label id="fldCorpusB" class="compare-fields-hidden">Корпус B
+        <select id="corpus_b"><option value="1">1 корпус</option><option value="2" selected>2 корпус</option><option value="3">3 корпус</option></select>
+      </label>
+      <label id="fldWh" class="wide">WH <input id="wh_ids" placeholder="пусто = весь каталог"></label>
+      <label>ТОП <select id="limit"><option>10</option><option selected>20</option><option>30</option><option>50</option></select></label>
+    </div>
+    <div class="actions-row">
+      <button class="btn primary" id="btnLoad" type="button">Сравнить</button>
+    </div>
+  </div>
+</section>
+<section class="mod-section no-rule" id="compareBody">
+  <h2 class="section-title" data-reveal="fade-right">Дельта <span class="text-accent">по причинам</span></h2>
+  <div class="kpis stagger" id="kpis">
+    <div class="kpi" data-reveal="flip-left"><div class="k" id="kpiALabel">Срез A</div><div class="v" id="kpiA">—</div></div>
+    <div class="kpi" data-reveal="flip-left"><div class="k" id="kpiBLabel">Срез B</div><div class="v" id="kpiB">—</div></div>
+    <div class="kpi" data-reveal="flip-left"><div class="k">Δ ₽</div><div class="v" id="kpiDelta">—</div></div>
+    <div class="kpi" data-reveal="flip-left"><div class="k">Δ %</div><div class="v" id="kpiPct">—</div></div>
+  </div>
+  <div class="card" data-reveal="fade-up">
+    <h3>Причины по |Δ|</h3>
+    <div class="muted" style="margin:0 0 8px;font-size:12px">Клик по строке → карточка причины</div>
+    <div class="body" id="compareTable"><div class="muted-box">Загрузка…</div></div>
+  </div>
+</section>
+<script>
+let MODE = 'week';
+function fmt(n){ return Number(n||0).toLocaleString('ru-RU',{maximumFractionDigits:0}); }
+function pct(n){ if(n==null) return '—'; return Number(n).toLocaleString('ru-RU',{maximumFractionDigits:1})+'%'; }
+function dyn(n){ if(n==null) return '—'; const s=n>0?'+':''; return s+pct(n); }
+function dynClass(n){
+  if(n==null || Number.isNaN(Number(n))) return '';
+  return Number(n) > 0 ? 'up' : (Number(n) < 0 ? 'down' : '');
+}
+function setMode(mode){
+  MODE = mode === 'corpus' ? 'corpus' : 'week';
+  document.querySelectorAll('#modeToggle button').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.mode === MODE);
+  });
+  const weekMode = MODE === 'week';
+  document.getElementById('fldWeekA').classList.toggle('compare-fields-hidden', !weekMode);
+  document.getElementById('fldWeekB').classList.toggle('compare-fields-hidden', !weekMode);
+  document.getElementById('fldWh').classList.toggle('compare-fields-hidden', !weekMode);
+  document.getElementById('fldWeek').classList.toggle('compare-fields-hidden', weekMode);
+  document.getElementById('fldCorpusA').classList.toggle('compare-fields-hidden', weekMode);
+  document.getElementById('fldCorpusB').classList.toggle('compare-fields-hidden', weekMode);
+}
+function fillWeekSelects(weeks, wa, wb, w){
+  const list = Array.isArray(weeks) ? weeks : [];
+  const opts = list.map(x => `<option value="${x}">${x}</option>`).join('') || '<option value="">—</option>';
+  ['week_a','week_b','week'].forEach(id => {
+    const el = document.getElementById(id);
+    const keep = el.value;
+    el.innerHTML = opts;
+    if(keep) el.value = keep;
+  });
+  const a = document.getElementById('week_a');
+  const b = document.getElementById('week_b');
+  const one = document.getElementById('week');
+  if(wa != null && wa !== '') a.value = String(wa);
+  if(wb != null && wb !== '') b.value = String(wb);
+  if(w != null && w !== '') one.value = String(w);
+  if(!a.value && list.length >= 2) a.value = String(list[list.length - 2]);
+  if(!b.value && list.length) b.value = String(list[list.length - 1]);
+  if(!one.value && list.length) one.value = String(list[list.length - 1]);
+}
+function hydrate(){
+  const q = new URLSearchParams(location.search);
+  if(q.get('year')) document.getElementById('year').value = q.get('year');
+  if(q.get('wh_ids')) document.getElementById('wh_ids').value = q.get('wh_ids');
+  if(q.get('limit')) document.getElementById('limit').value = q.get('limit');
+  if(q.get('corpus_a')) document.getElementById('corpus_a').value = q.get('corpus_a');
+  if(q.get('corpus_b')) document.getElementById('corpus_b').value = q.get('corpus_b');
+  if(q.get('mode') === 'corpus') setMode('corpus');
+  else setMode('week');
+  return {
+    week_a: q.get('week_a'),
+    week_b: q.get('week_b'),
+    week: q.get('week'),
+  };
+}
+async function initWeeks(urlWeeks){
+  const year = document.getElementById('year').value;
+  const q = new URLSearchParams();
+  if(year) q.set('year', year);
+  const wh = (document.getElementById('wh_ids').value||'').trim();
+  if(wh) q.set('wh_ids', wh);
+  const r = await fetch('/api/weeks?' + q);
+  const raw = await r.text();
+  if(!r.ok) throw new Error(raw||r.statusText);
+  const d = JSON.parse(raw);
+  if(d.year) document.getElementById('year').value = d.year;
+  fillWeekSelects(
+    d.weeks || [],
+    (urlWeeks && urlWeeks.week_a) || d.week_prev,
+    (urlWeeks && urlWeeks.week_b) || d.week_last,
+    (urlWeeks && urlWeeks.week) || d.week_last
+  );
+}
+function openReason(row){
+  if(!row || row.row_id == null) return;
+  const q = new URLSearchParams({
+    year: document.getElementById('year').value,
+    reason_id: String(row.row_id),
+  });
+  const week = MODE === 'week'
+    ? document.getElementById('week_b').value
+    : document.getElementById('week').value;
+  if(week) q.set('week_last', week);
+  if(MODE === 'week'){
+    const wh = (document.getElementById('wh_ids').value||'').trim();
+    if(wh) q.set('wh_ids', wh);
+  }
+  location.href = '/reason?' + q;
+}
+function renderTable(rows){
+  const box = document.getElementById('compareTable');
+  if(!rows.length){
+    box.innerHTML = '<div class="muted-box">Нет данных для сравнения</div>';
+    return;
+  }
+  box.innerHTML = `<div class="table-wrap"><table class="delta-table">
+    <thead><tr>
+      <th>Причина</th>
+      <th class="num">A ₽</th>
+      <th class="num">B ₽</th>
+      <th class="num">Δ ₽</th>
+      <th class="num">Δ %</th>
+    </tr></thead>
+    <tbody>${rows.map(r => {
+      const name = String(r.name||'—').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('"','&quot;');
+      const rid = r.row_id == null ? '' : String(r.row_id);
+      return `<tr class="drill-row" data-reason-id="${rid}" title="Открыть карточку">
+        <td>${name}${rid ? ` <span class="muted">#${rid}</span>` : ''}</td>
+        <td class="num">${fmt(r.amount_a)}</td>
+        <td class="num">${fmt(r.amount_b)}</td>
+        <td class="num ${dynClass(r.delta)}">${fmt(r.delta)}</td>
+        <td class="num ${dynClass(r.pct)}">${dyn(r.pct)}</td>
+      </tr>`;
+    }).join('')}</tbody></table></div>`;
+  box.querySelectorAll('tr.drill-row').forEach(tr => {
+    tr.addEventListener('click', () => {
+      const id = tr.dataset.reasonId;
+      if(!id) return;
+      openReason({ row_id: Number(id) });
+    });
+  });
+}
+async function load(){
+  const q = new URLSearchParams({ mode: MODE });
+  const year = document.getElementById('year').value;
+  const limit = document.getElementById('limit').value;
+  if(year) q.set('year', year);
+  if(limit) q.set('limit', limit);
+  if(MODE === 'week'){
+    const wa = document.getElementById('week_a').value;
+    const wb = document.getElementById('week_b').value;
+    const wh = (document.getElementById('wh_ids').value||'').trim();
+    if(wa) q.set('week_a', wa);
+    if(wb) q.set('week_b', wb);
+    if(wh) q.set('wh_ids', wh);
+  } else {
+    q.set('week', document.getElementById('week').value);
+    q.set('corpus_a', document.getElementById('corpus_a').value);
+    q.set('corpus_b', document.getElementById('corpus_b').value);
+  }
+  const box = document.getElementById('compareTable');
+  box.innerHTML = '<div class="muted-box">Загрузка…</div>';
+  const r = await fetch('/api/compare?' + q);
+  const raw = await r.text();
+  if(!r.ok) throw new Error(raw||r.statusText);
+  const d = JSON.parse(raw);
+  history.replaceState(null, '', '/compare?' + q);
+  const a = d.slice_a || {}, b = d.slice_b || {}, t = d.totals || {};
+  document.getElementById('subtitle').textContent =
+    `${a.label || 'A'} vs ${b.label || 'B'} · ${d.year}` +
+    (MODE === 'corpus' && a.week != null ? ` · W${a.week}` : '');
+  document.getElementById('kpiALabel').textContent = a.label || 'Срез A';
+  document.getElementById('kpiBLabel').textContent = b.label || 'Срез B';
+  document.getElementById('kpiA').textContent = fmt(t.amount_a);
+  document.getElementById('kpiB').textContent = fmt(t.amount_b);
+  const deltaEl = document.getElementById('kpiDelta');
+  deltaEl.textContent = fmt(t.delta);
+  deltaEl.className = 'v ' + dynClass(t.delta);
+  const pctEl = document.getElementById('kpiPct');
+  pctEl.textContent = dyn(t.pct);
+  pctEl.className = 'v ' + dynClass(t.pct);
+  renderTable(d.reasons || []);
+}
+document.getElementById('modeToggle').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-mode]');
+  if(!btn) return;
+  setMode(btn.dataset.mode);
+});
+document.getElementById('btnLoad').onclick = () => load().catch(e => {
+  document.getElementById('compareTable').innerHTML =
+    `<div class="muted-box">Ошибка: ${e.message||e}</div>`;
+});
+document.getElementById('year').addEventListener('change', () => {
+  initWeeks(null).catch(() => {});
+});
+(async () => {
+  try {
+    const urlWeeks = hydrate();
+    await initWeeks(urlWeeks);
+    await load();
+  } catch(e) {
+    document.getElementById('compareTable').innerHTML =
+      `<div class="muted-box">Ошибка: ${e.message||e}</div>`;
+  }
+})();
+</script>
+</div>
+</div>
+</body>
+</html>
+"""
+
 
 def _materialize_shared_assets() -> None:
     global DASHBOARD_HTML, DETAILS_HTML, WEEKLY_HTML, REASON_HTML
-    global DIGEST_HTML, ACTIONS_HTML, STATUS_HTML, NOMENCLATURE_HTML
+    global DIGEST_HTML, ACTIONS_HTML, STATUS_HTML, NOMENCLATURE_HTML, COMPARE_HTML
     pages = [
         "DASHBOARD_HTML",
         "DETAILS_HTML",
@@ -7815,6 +8318,7 @@ def _materialize_shared_assets() -> None:
         "ACTIONS_HTML",
         "STATUS_HTML",
         "NOMENCLATURE_HTML",
+        "COMPARE_HTML",
     ]
     g = globals()
     for name in pages:
@@ -7929,6 +8433,10 @@ def register_routes(application) -> None:
     @application.route("/digest")
     def digest_page():
         return DIGEST_HTML
+
+    @application.route("/compare")
+    def compare_page():
+        return COMPARE_HTML
 
     @application.route("/actions")
     def actions_page():
@@ -8528,6 +9036,60 @@ def register_routes(application) -> None:
                     limit=limit,
                 )
             )
+        except QueryParamError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
+    @application.route("/api/compare")
+    def api_compare():
+        env_err = check_db_env()
+        if env_err:
+            return jsonify({"error": env_err}), 503
+        try:
+            cfg = _cfg()
+            year = _year_arg(cfg.get("week_year", 2026))
+            mode = (request.args.get("mode") or "week").strip().lower()
+            limit = int(_int_arg("limit", 20) or 20)
+            office_id = cfg.get("office_id")
+
+            def _week_arg(name: str, default: int) -> int:
+                raw = request.args.get(name, "")
+                if raw is None or str(raw).strip() == "":
+                    return default
+                try:
+                    return int(raw)
+                except (TypeError, ValueError):
+                    return default
+
+            if mode == "corpus":
+                week = _week_arg("week", cfg.get("week_last", 21))
+                corpus_a = int(_int_arg("corpus_a", 1) or 1)
+                corpus_b = int(_int_arg("corpus_b", 2) or 2)
+                payload = fetch_corpus_week_compare(
+                    corpus_a=corpus_a,
+                    corpus_b=corpus_b,
+                    office_id=office_id,
+                    year=year,
+                    week=week,
+                    limit=limit,
+                    cfg=cfg,
+                )
+            elif mode == "week":
+                week_a = _week_arg("week_a", cfg.get("week_prev", 20))
+                week_b = _week_arg("week_b", cfg.get("week_last", 21))
+                wh_ids = _resolve_wh_ids(cfg)
+                payload = fetch_reason_week_compare(
+                    wh_ids=wh_ids,
+                    office_id=office_id,
+                    year=year,
+                    week_a=week_a,
+                    week_b=week_b,
+                    limit=limit,
+                )
+            else:
+                raise QueryParamError("mode: week или corpus")
+            return jsonify(payload)
         except QueryParamError as exc:
             return jsonify({"error": str(exc)}), 400
         except Exception as exc:
