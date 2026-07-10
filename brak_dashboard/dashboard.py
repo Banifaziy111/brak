@@ -1057,6 +1057,54 @@ def build_kpi_payload(report: dict) -> dict[str, float]:
     }
 
 
+def fetch_summa_obshay_week(
+    *,
+    wh_ids: list[int] | None,
+    office_id: int | None,
+    year: int,
+    week_last: int,
+) -> dict[str, float]:
+    """Secondary money metric from norm view: summa_obshay vs amount for week_last."""
+    sorted_wh = sorted(wh_ids) if wh_ids else []
+    cache_key = f"summa_obsh_v1:{year}:{week_last}:{office_id}:{','.join(map(str, sorted_wh))}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    _ensure_brak_data_norm()
+    range_start = date.fromisocalendar(year, week_last, 1)
+    range_end = date.fromisocalendar(year, week_last, 7) + timedelta(days=1)
+    clauses = ["date IS NOT NULL", "date >= %s", "date < %s"]
+    params: list[Any] = [range_start, range_end]
+    if office_id is not None:
+        clauses.append("office_id = %s")
+        params.append(office_id)
+    if wh_ids:
+        clauses.append("wh_id = ANY(%s)")
+        params.append(wh_ids)
+    where = " WHERE " + " AND ".join(clauses)
+    sql = f"""
+        SELECT
+            COALESCE(SUM(amount), 0) AS amount_fact,
+            COALESCE(SUM(summa_obshay), 0) AS summa_obshay
+        FROM {NORM_VIEW}
+        {where}
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        row = cur.fetchone()
+    amount_fact = to_float(row[0] if row else 0)
+    summa_obshay = to_float(row[1] if row else 0)
+    out = {
+        "summa_obshay_last": summa_obshay,
+        "amount_fact_last": amount_fact,
+        "fact_vs_summa": (amount_fact / summa_obshay * 100) if summa_obshay else 0.0,
+    }
+    _cache_set(cache_key, out, CACHE_TTL_SEC)
+    return out
+
+
 def _avg4_weeks(weeks: list[int], week_last: int) -> list[int]:
     prior = sorted(w for w in weeks if w <= week_last)
     if not prior:
@@ -1364,6 +1412,204 @@ def fetch_corpus_comparison(
 
     _cache_set(cache_key, rows, CACHE_TTL_SEC)
     return rows
+
+
+def fetch_corpus_weekly_series(
+    *,
+    office_id: int | None,
+    year: int,
+    limit_weeks: int = 12,
+    cfg: dict | None = None,
+) -> dict[str, Any]:
+    """Weekly amount series for corpus 1/2/3 (line chart on dashboard)."""
+    cfg = cfg or load_config()
+    corpus_map = _corpus_wh_map(cfg)
+    corpus_sig = ";".join(
+        f"{c}:{','.join(map(str, ids))}" for c, ids in sorted(corpus_map.items())
+    )
+    lim = max(4, min(26, int(limit_weeks)))
+    cache_key = f"corpus_series_v1:{year}:{office_id}:{lim}:{corpus_sig}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    empty = {
+        "weeks": [],
+        "series": [
+            {"corpus": c, "name": f"{c} корпус", "amounts": {}} for c in (1, 2, 3)
+        ],
+    }
+    all_wh: list[int] = []
+    for ids in corpus_map.values():
+        all_wh.extend(ids)
+    all_wh = sorted(set(all_wh))
+    if not all_wh:
+        _cache_set(cache_key, empty, CACHE_TTL_SEC)
+        return empty
+
+    src = _report_source()
+    clauses: list[str] = []
+    params: list[Any] = []
+    if src["base_not_null_clause"]:
+        clauses.append(src["base_not_null_clause"])
+    if _use_report_matview() and src["table"] != NORM_VIEW:
+        clauses.append(src["year_clause"])
+        params.append(year)
+    else:
+        year_start = date.fromisocalendar(year, 1, 1)
+        year_end = date.fromisocalendar(year + 1, 1, 1)
+        clauses.append(src["year_clause"])
+        params.extend([year_start, year_end])
+    if office_id is not None:
+        clauses.append("office_id = %s")
+        params.append(office_id)
+    clauses.append("wh_id = ANY(%s)")
+    params.append(all_wh)
+
+    case_parts: list[str] = []
+    case_params: list[Any] = []
+    for corpus in (1, 2, 3):
+        ids = corpus_map.get(corpus) or []
+        if not ids:
+            continue
+        case_parts.append("WHEN wh_id = ANY(%s) THEN %s")
+        case_params.extend([ids, corpus])
+    if not case_parts:
+        _cache_set(cache_key, empty, CACHE_TTL_SEC)
+        return empty
+
+    corpus_case = "CASE " + " ".join(case_parts) + " END"
+    where = " WHERE " + " AND ".join(clauses)
+    sql = f"""
+        SELECT week_no, corpus, COALESCE(SUM(amount), 0) AS amount
+        FROM (
+            SELECT
+                {src['week_expr']}::int AS week_no,
+                {corpus_case} AS corpus,
+                {src['amount_expr']} AS amount
+            FROM {src['table']}
+            {where}
+        ) t
+        WHERE corpus IS NOT NULL
+        GROUP BY 1, 2
+        ORDER BY 1, 2
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, [*case_params, *params])
+        raw = cur.fetchall()
+
+    by_corpus: dict[int, dict[int, float]] = {1: {}, 2: {}, 3: {}}
+    week_set: set[int] = set()
+    for r in raw:
+        if r[0] is None or r[1] is None:
+            continue
+        week_no = int(r[0])
+        corpus = int(r[1])
+        if corpus not in by_corpus:
+            continue
+        week_set.add(week_no)
+        by_corpus[corpus][week_no] = to_float(r[2])
+
+    weeks = sorted(week_set)
+    if lim > 0 and len(weeks) > lim:
+        weeks = weeks[-lim:]
+    series = []
+    for corpus in (1, 2, 3):
+        amounts = {str(w): by_corpus[corpus].get(w, 0.0) for w in weeks}
+        series.append(
+            {
+                "corpus": corpus,
+                "name": f"{corpus} корпус",
+                "amounts": amounts,
+            }
+        )
+    out = {"weeks": weeks, "series": series}
+    _cache_set(cache_key, out, CACHE_TTL_SEC)
+    return out
+
+
+def fetch_top_nm_brands(
+    *,
+    wh_ids: list[int] | None,
+    office_id: int | None,
+    year: int,
+    week_last: int,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """TOP nm_id / brands by amount for week_last (main dashboard)."""
+    lim = max(3, min(20, int(limit)))
+    sorted_wh = sorted(wh_ids) if wh_ids else []
+    cache_key = (
+        f"top_nm_brand_v1:{year}:{week_last}:{office_id}:"
+        f"{','.join(map(str, sorted_wh))}:{lim}"
+    )
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    _ensure_brak_data_norm()
+    range_start = date.fromisocalendar(year, week_last, 1)
+    range_end = date.fromisocalendar(year, week_last, 7) + timedelta(days=1)
+    clauses = ["date IS NOT NULL", "date >= %s", "date < %s"]
+    params: list[Any] = [range_start, range_end]
+    if office_id is not None:
+        clauses.append("office_id = %s")
+        params.append(office_id)
+    if wh_ids:
+        clauses.append("wh_id = ANY(%s)")
+        params.append(wh_ids)
+    where = " WHERE " + " AND ".join(clauses)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT nm_id, COALESCE(MAX(title), '—') AS title,
+                   COALESCE(SUM(amount), 0) AS amount
+            FROM {NORM_VIEW}
+            {where}
+            GROUP BY nm_id
+            ORDER BY amount DESC NULLS LAST
+            LIMIT %s
+            """,
+            [*params, lim],
+        )
+        top_nm = [
+            {
+                "nm_id": int(r[0]) if r[0] is not None else None,
+                "title": r[1] or "—",
+                "amount": to_float(r[2]),
+            }
+            for r in cur.fetchall()
+        ]
+        cur.execute(
+            f"""
+            SELECT COALESCE(NULLIF(BTRIM(brand_name), ''), '—') AS brand,
+                   COALESCE(SUM(amount), 0) AS amount
+            FROM {NORM_VIEW}
+            {where}
+            GROUP BY 1
+            ORDER BY amount DESC
+            LIMIT %s
+            """,
+            [*params, lim],
+        )
+        top_brands = [
+            {"brand_name": r[0] or "—", "amount": to_float(r[1])}
+            for r in cur.fetchall()
+        ]
+
+    total_nm = sum(x["amount"] for x in top_nm) or 0.0
+    total_br = sum(x["amount"] for x in top_brands) or 0.0
+    for item in top_nm:
+        item["share"] = (item["amount"] / total_nm * 100) if total_nm else 0.0
+    for item in top_brands:
+        item["share"] = (item["amount"] / total_br * 100) if total_br else 0.0
+
+    out = {"week_last": week_last, "top_nm": top_nm, "top_brands": top_brands}
+    _cache_set(cache_key, out, CACHE_TTL_SEC)
+    return out
 
 
 def build_growth_alerts(
@@ -3545,7 +3791,8 @@ def render_table(
     )
     body.append(
         f"<tr class='total'>"
-        f"<td colspan='2' class='sticky col-id'><b>Итого</b></td>"
+        f"<td class='sticky col-id'><b>Σ</b></td>"
+        f"<td class='name sticky col-name'><b>Итого</b></td>"
         f"{week_total_cells}"
         f"<td class='n metric' style='{_e(heat_style(t['dynamics'], 'dynamics'))}'><b>{fmt_pct(t['dynamics'])}</b></td>"
         f"<td class='n metric'><b>{fmt_pct(t['share'])}</b></td>"
@@ -3569,7 +3816,8 @@ def render_table(
         all_pct = (all_last / all_avg * 100) if all_avg else None
         body.append(
             f"<tr class='total'>"
-            f"<td colspan='2' class='sticky col-id'><b>Итого по всем</b></td>"
+            f"<td class='sticky col-id'><b>Σ</b></td>"
+            f"<td class='name sticky col-name'><b>Итого по всем</b></td>"
             f"{all_week_cells}"
             f"<td class='n metric'><b>{fmt_pct(all_dyn)}</b></td>"
             f"<td class='n metric'><b>—</b></td>"
@@ -3906,36 +4154,42 @@ input[type=text]:focus, input[type=number]:focus, select:focus, textarea:focus {
   box-shadow: 0 0 0 3px var(--primary-soft);
 }
 textarea { height: auto; min-height: 56px; padding: 8px 10px; color: var(--text); background: #fff; }
-.btn, .actions button, .presets button, .building-btns button, button {
+.btn, .actions button, .presets button, .building-btns button, button,
+a.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   height: 36px; border: 1px solid var(--line); background: #fff; color: var(--text);
   border-radius: var(--radius-sm); padding: 0 12px; font: 600 12.5px/1 var(--font);
-  cursor: pointer; white-space: nowrap;
+  cursor: pointer; white-space: nowrap; text-decoration: none; box-sizing: border-box;
+  vertical-align: middle;
   transition: background var(--ease), color var(--ease), border-color var(--ease), box-shadow var(--ease);
 }
-.btn:hover, .actions button:hover, .presets button:hover, .building-btns button:hover, button:hover {
-  background: var(--bg-soft); border-color: #C5D0D8;
+.btn:hover, .actions button:hover, .presets button:hover, .building-btns button:hover, button:hover,
+a.btn:hover {
+  background: var(--bg-soft); border-color: #C5D0D8; text-decoration: none; color: var(--text);
 }
-.btn.primary, .actions button.primary, button.primary {
+.btn.primary, .actions button.primary, button.primary, a.btn.primary {
   background: var(--primary); border-color: var(--primary); color: #fff;
   box-shadow: 0 4px 14px rgba(47,125,122,.22);
 }
-.btn.primary:hover, .actions button.primary:hover, button.primary:hover {
+.btn.primary:hover, .actions button.primary:hover, button.primary:hover, a.btn.primary:hover {
   background: var(--primary-2); border-color: var(--primary-2); color: #fff;
 }
-.btn.secondary, .actions button.secondary, button.secondary {
+.btn.secondary, .actions button.secondary, button.secondary, a.btn.secondary {
   background: var(--primary-soft); border-color: rgba(47,125,122,.28); color: var(--primary);
 }
-.btn.secondary:hover, .actions button.secondary:hover, button.secondary:hover {
+.btn.secondary:hover, .actions button.secondary:hover, button.secondary:hover, a.btn.secondary:hover {
   background: rgba(47,125,122,.18); border-color: var(--primary); color: var(--primary);
 }
-.btn.export, .actions button.export, button.export {
+.btn.export, .actions button.export, button.export, a.btn.export {
   background: #fff; border-color: var(--line); color: var(--muted);
 }
-.btn.export:hover, .actions button.export:hover, button.export:hover {
+.btn.export:hover, .actions button.export:hover, button.export:hover, a.btn.export:hover {
   border-color: var(--primary); color: var(--primary); background: var(--primary-soft);
 }
 .kpis {
-  display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 10px; margin: 0 0 12px; width: 100%;
 }
 .kpi, .kpis .kpi {
@@ -3954,6 +4208,9 @@ textarea { height: auto; min-height: 56px; padding: 8px 10px; color: var(--text)
 .kpi .v {
   margin-top: 8px; font-size: 22px; font-weight: 600; font-family: var(--mono);
   letter-spacing: -0.02em; line-height: 1.1; word-break: break-word; color: var(--text);
+}
+.kpi .kpi-sub {
+  margin-top: 4px; font-size: 11px; color: var(--muted); font-family: var(--mono); font-weight: 600;
 }
 .kpi .v.up, .dyn, .alert-item .dyn, .board .card .dyn { color: var(--danger); }
 .kpi .v.down { color: var(--ok); }
@@ -4007,6 +4264,8 @@ textarea { height: auto; min-height: 56px; padding: 8px 10px; color: var(--text)
   min-width: 100%;
   table-layout: fixed;
   font-size: 12px;
+  border-collapse: separate;
+  border-spacing: 0;
 }
 #reportGrid .table-scroll th,
 #reportGrid .table-scroll td,
@@ -4059,6 +4318,55 @@ textarea { height: auto; min-height: 56px; padding: 8px 10px; color: var(--text)
   white-space: normal;
   line-height: 1.2;
 }
+/* Freeze ID + name while scrolling horizontally */
+#reportGrid .table-scroll th.sticky.col-id,
+#reportGrid .table-scroll td.sticky.col-id,
+.report-grid .table-scroll th.sticky.col-id,
+.report-grid .table-scroll td.sticky.col-id {
+  position: sticky;
+  left: 0;
+  z-index: 3;
+  background: #fff;
+  box-shadow: 1px 0 0 var(--line-soft);
+}
+#reportGrid .table-scroll th.sticky.col-name,
+#reportGrid .table-scroll td.sticky.col-name,
+#reportGrid .table-scroll td.name.sticky,
+.report-grid .table-scroll th.sticky.col-name,
+.report-grid .table-scroll td.sticky.col-name,
+.report-grid .table-scroll td.name.sticky {
+  position: sticky;
+  left: 52px;
+  z-index: 3;
+  background: #fff;
+  box-shadow: 2px 0 6px rgba(30, 42, 50, 0.08);
+}
+#reportGrid .table-scroll thead th.sticky.col-id,
+.report-grid .table-scroll thead th.sticky.col-id {
+  z-index: 5;
+  background: var(--bg-soft);
+  top: 0;
+}
+#reportGrid .table-scroll thead th.sticky.col-name,
+.report-grid .table-scroll thead th.sticky.col-name {
+  z-index: 5;
+  background: var(--bg-soft);
+  top: 0;
+  left: 52px;
+}
+#reportGrid .table-scroll tr:hover td.sticky,
+.report-grid .table-scroll tr:hover td.sticky,
+#reportGrid .table-scroll tr:hover td.name.sticky,
+.report-grid .table-scroll tr:hover td.name.sticky {
+  background: #E8F3F2;
+}
+#reportGrid .table-scroll tr.total td.sticky,
+.report-grid .table-scroll tr.total td.sticky,
+#reportGrid .table-scroll tr.total td.name.sticky,
+.report-grid .table-scroll tr.total td.name.sticky {
+  background: var(--bg-soft);
+  font-weight: 700;
+}
 .insight-card, .card, .panel { padding: 14px; margin: 0; overflow: hidden; }
 .table-wrap, .heatmap-wrap { width: 100%; overflow-x: auto; }
 .chips, .pager {
@@ -4090,6 +4398,17 @@ textarea { height: auto; min-height: 56px; padding: 8px 10px; color: var(--text)
   display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
   padding: 10px 12px; margin: 0 0 12px; width: 100%; box-sizing: border-box;
   background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+}
+.meta .meta-label {
+  flex: 1 1 auto;
+  min-width: 160px;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.35;
+}
+.meta .meta-label b { color: var(--text); font-family: var(--mono); font-weight: 600; }
+.meta .meta-actions {
+  display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center;
 }
 .presets .label { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; }
 .alert-item .meta, .item .meta, .watch-item .meta, .row .meta {
@@ -4158,10 +4477,34 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: var(-
   display:grid; grid-template-columns:1fr auto auto; gap:10px; align-items:center;
   padding:7px 0; border-bottom:1px solid var(--line-soft); font-size:13px;
 }
+.dim-row.drill {
+  cursor:pointer; border-radius:6px; padding-left:6px; padding-right:6px; margin:0 -6px;
+  transition: background var(--ease);
+}
+.dim-row.drill:hover { background: var(--primary-soft); }
 .dim-row .name { font-weight:600; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .dim-row .amt { font-family:var(--mono); font-weight:700; text-align:right; white-space:nowrap; }
 .dim-row .dyn { font-family:var(--mono); font-size:12px; text-align:right; min-width:64px; }
 .dim-row .share { color:var(--muted); font-size:11px; font-weight:600; }
+.corpus-line-wrap { margin-top:14px; padding-top:12px; border-top:1px solid var(--line-soft); }
+.corpus-line-head {
+  display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between;
+  gap:8px; margin-bottom:8px;
+}
+.corpus-line-head .title { font-size:12px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+.corpus-line-chart { width:100%; height:150px; }
+.corpus-line-chart svg { width:100%; height:100%; display:block; }
+.corpus-line-chart .grid-line { stroke: var(--line-soft); stroke-width:1; }
+.corpus-line-chart .axis-label { fill: var(--muted); font-size:10px; font-family: var(--mono); }
+.corpus-line-chart .series-1 { stroke: #2F7D7A; fill: none; stroke-width:2.2; }
+.corpus-line-chart .series-2 { stroke: #C48A2A; fill: none; stroke-width:2.2; }
+.corpus-line-chart .series-3 { stroke: #C45C4A; fill: none; stroke-width:2.2; }
+.corpus-line-chart .dot-1 { fill: #2F7D7A; }
+.corpus-line-chart .dot-2 { fill: #C48A2A; }
+.corpus-line-chart .dot-3 { fill: #C45C4A; }
+.lg-c1 { background:#2F7D7A; }
+.lg-c2 { background:#C48A2A; }
+.lg-c3 { background:#C45C4A; }
 .top-wh { margin-top:4px; font-size:11px; color:var(--muted); line-height:1.35; }
 .search-box { position:relative; }
 .search-drop {
@@ -4308,10 +4651,10 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: var(-
 }
 .chart-legend .lg-all { background: var(--primary); }
 .chart-legend .lg-org0 { background: var(--warn); }
-.weekly-table-wrap { overflow:auto; padding: 0 0 4px; }
-.weekly-table { width:100%; border-collapse:collapse; font-size:12.5px; }
+.weekly-table-wrap { overflow:auto; padding: 0 0 4px; max-height: 520px; }
+.weekly-table { width:max-content; min-width:100%; border-collapse:separate; border-spacing:0; font-size:12.5px; }
 .weekly-table th {
-  position: sticky; top: 0; z-index: 1;
+  position: sticky; top: 0; z-index: 2;
   background: var(--bg-soft); color: var(--muted);
   font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em;
   padding: 10px 12px; border-bottom: 1px solid var(--line);
@@ -4319,13 +4662,26 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: var(-
 }
 .weekly-table td {
   padding: 11px 12px; border-bottom: 1px solid var(--line-soft);
-  vertical-align: top;
+  vertical-align: top; background: #fff;
 }
 .weekly-table tr:hover td { background: var(--primary-soft); }
-.weekly-table .week-cell {
+.weekly-table .week-cell,
+.weekly-table th:first-child {
+  position: sticky;
+  left: 0;
+  z-index: 3;
+  background: #fff;
+  box-shadow: 2px 0 6px rgba(30, 42, 50, 0.08);
   font-family: var(--mono); font-weight: 700; color: var(--primary);
-  white-space: nowrap;
+  white-space: nowrap; min-width: 72px;
 }
+.weekly-table th:first-child {
+  z-index: 5;
+  background: var(--bg-soft);
+  top: 0;
+  color: var(--muted);
+}
+.weekly-table tr:hover .week-cell { background: #E8F3F2; }
 .weekly-table .num { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .reason-chips { display:flex; flex-wrap:wrap; gap:6px; max-width: 520px; }
 .reason-chip {
@@ -4349,11 +4705,34 @@ tr.drill-row:hover, .delta-table tr:hover, .watch-item:hover { background: var(-
 .heatmap th, .heatmap td { padding: 0; text-align: center; min-width: 28px; height: 26px; }
 .heatmap th { color: var(--muted); font-weight: 600; font-family: var(--mono); background: transparent; border:0; text-transform:none; }
 .heatmap .rname {
+  position: sticky; left: 0; z-index: 2;
   text-align:left; padding:0 10px 0 0; min-width:160px; max-width:220px;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--text);
-  font-weight:600; cursor:pointer; border:0; background:transparent; text-transform:none;
+  font-weight:600; cursor:pointer; border:0; background:#fff; text-transform:none;
 }
 .heatmap td.cell { border-radius: 5px; cursor: pointer; border:0; }
+.table-wrap { overflow: auto; }
+.table-wrap table { border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; }
+.table-wrap th.sticky-col,
+.table-wrap td.sticky-col {
+  position: sticky;
+  z-index: 3;
+  background: #fff;
+}
+.table-wrap thead th.sticky-col {
+  top: 0;
+  z-index: 5;
+  background: var(--bg-soft);
+}
+.table-wrap th.sticky-col-0,
+.table-wrap td.sticky-col-0 { left: 0; box-shadow: 1px 0 0 var(--line-soft); min-width: 88px; }
+.table-wrap th.sticky-col-1,
+.table-wrap td.sticky-col-1 {
+  left: 88px; box-shadow: 2px 0 6px rgba(30,42,50,.08);
+  min-width: 140px; max-width: 220px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.table-wrap tr:hover td.sticky-col { background: #E8F3F2; }
 .board { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; width:100%; }
 .col { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:12px; min-height:280px; }
 .col h3 {
@@ -4648,8 +5027,9 @@ __SHARED_CSS__
   <h2 class="section-title" data-reveal="fade-right">Ключевые <span class="text-accent">показатели</span></h2>
   <div class="kpis stagger" id="kpis">
   <div class="kpi" data-reveal="flip-left"><div class="k">Всего брак (посл. нед.)</div><div class="v" id="kpiTotal">—</div></div>
+  <div class="kpi" data-reveal="flip-left"><div class="k">Общая сумма (summa)</div><div class="v" id="kpiSummaObshay">—</div><div class="kpi-sub" id="kpiSummaRatio">—</div></div>
   <div class="kpi" data-reveal="flip-left"><div class="k">ТОП-20 (посл. нед.)</div><div class="v" id="kpiTop20">—</div></div>
-  <div class="kpi" data-reveal="flip-left"><div class="k">ORG0 от общего</div><div class="v" id="kpiOrg0Share">—</div><div class="spark" id="org0Spark"></div></div>
+  <div class="kpi" data-reveal="flip-left"><div class="k">ORG0 от общего</div><div class="v" id="kpiOrg0Share">—</div><div class="kpi-sub" id="kpiOrg0Abs">—</div><div class="spark" id="org0Spark"></div></div>
   <div class="kpi" data-reveal="flip-left"><div class="k">Покрытие ТОП-20</div><div class="v" id="kpiCover">—</div></div>
   <div class="kpi" data-reveal="flip-left"><div class="k">ТОП-20 vs ср. 4 нед.</div><div class="v" id="kpiVsAvg4">—</div></div>
   <div class="kpi" data-reveal="flip-left"><div class="k">YoY (та же неделя)</div><div class="v" id="kpiYoy">—</div></div>
@@ -4663,6 +5043,17 @@ __SHARED_CSS__
   <section class="insight-card" data-reveal="flip-left">
     <h3>Сравнение корпусов</h3>
     <div class="body" id="corpusCompare"><div class="muted-box">Загрузка…</div></div>
+    <div class="corpus-line-wrap">
+      <div class="corpus-line-head">
+        <div class="title">Сумма по неделям</div>
+        <div class="chart-legend">
+          <span><i class="lg-c1"></i>1 корпус</span>
+          <span><i class="lg-c2"></i>2 корпус</span>
+          <span><i class="lg-c3"></i>3 корпус</span>
+        </div>
+      </div>
+      <div class="corpus-line-chart" id="corpusWeeklyChart"><div class="muted-box">Загрузка…</div></div>
+    </div>
   </section>
   <section class="insight-card" data-reveal="flip-left">
     <h3>Алерты роста</h3>
@@ -4700,11 +5091,24 @@ __SHARED_CSS__
   <div class="insight-grid stagger">
   <section class="insight-card" data-reveal="fade-up">
     <h3>ТОП предметов</h3>
+    <div class="muted" style="margin:0 0 6px;font-size:12px">Клик по строке → детализация</div>
     <div class="body" id="dimSubject"><div class="muted-box">Загрузка…</div></div>
   </section>
   <section class="insight-card" data-reveal="fade-up">
     <h3>Владелец / статус</h3>
     <div class="body" id="dimOwnerState"><div class="muted-box">Загрузка…</div></div>
+  </section>
+  </div>
+  <div class="insight-grid stagger">
+  <section class="insight-card" data-reveal="fade-up">
+    <h3>ТОП nm_id</h3>
+    <div class="muted" style="margin:0 0 6px;font-size:12px">Посл. неделя · клик → детализация</div>
+    <div class="body" id="topNmMain"><div class="muted-box">Загрузка…</div></div>
+  </section>
+  <section class="insight-card" data-reveal="fade-up">
+    <h3>ТОП бренды</h3>
+    <div class="muted" style="margin:0 0 6px;font-size:12px">Посл. неделя · клик → детализация</div>
+    <div class="body" id="topBrandsMain"><div class="muted-box">Загрузка…</div></div>
   </section>
   </div>
 </section>
@@ -4847,8 +5251,13 @@ function setText(id, value) {
 function updateKpis(kpis, yoy) {
   const d = kpis || {};
   setText('kpiTotal', fmtInt(d.total_last || 0));
+  setText('kpiSummaObshay', fmtInt(d.summa_obshay_last || 0));
+  setText('kpiSummaRatio', d.summa_obshay_last
+    ? ('факт ' + fmtPct(d.fact_vs_summa || 0) + ' от общей')
+    : 'нет summa_obshay');
   setText('kpiTop20', fmtInt(d.top20_last || 0));
   setText('kpiOrg0Share', fmtPct(d.org0_share || 0));
+  setText('kpiOrg0Abs', fmtInt(d.org0_last || 0) + ' ₽');
   setText('kpiCover', fmtPct(d.top20_cover || 0));
   setText('kpiVsAvg4', dynText(d.top20_vs_avg4));
   const y = yoy || {};
@@ -4889,30 +5298,158 @@ function updateFreshness(f) {
   `;
 }
 
-function renderDimRows(rows) {
+function isoWeekDate(year, week, weekday) {
+  const jan4 = new Date(Date.UTC(Number(year), 0, 4));
+  const day = jan4.getUTCDay() || 7;
+  const monday = new Date(jan4);
+  monday.setUTCDate(jan4.getUTCDate() - day + 1 + (Number(week) - 1) * 7 + (Number(weekday) - 1));
+  return monday.toISOString().slice(0, 10);
+}
+
+function openDetailsFromDim(dimKey, name) {
+  if (!name || name === '—') return;
+  const field = dimKey === 'subject' ? 'subject_name'
+    : (dimKey === 'owner' ? 'owner_product' : 'state_id');
+  const year = Number(document.getElementById('year').value) || new Date().getFullYear();
+  const { wp, wl } = selectedWeeks();
+  const q = new URLSearchParams();
+  q.set(field, name);
+  q.set('date_from', isoWeekDate(year, wp, 1));
+  q.set('date_to', isoWeekDate(year, wl, 7));
+  const wh = selectedWh.size ? Array.from(selectedWh).join(',') : '';
+  if (wh) q.set('wh_ids', wh);
+  window.location.href = '/details?' + q.toString();
+}
+
+function openDetailsFromProduct(kind, value) {
+  if (value == null || value === '' || value === '—') return;
+  const year = Number(document.getElementById('year').value) || new Date().getFullYear();
+  const { wp, wl } = selectedWeeks();
+  const q = new URLSearchParams();
+  if (kind === 'nm') q.set('nm_id', String(value));
+  else q.set('brand_name', String(value));
+  q.set('date_from', isoWeekDate(year, wp, 1));
+  q.set('date_to', isoWeekDate(year, wl, 7));
+  const wh = selectedWh.size ? Array.from(selectedWh).join(',') : '';
+  if (wh) q.set('wh_ids', wh);
+  window.location.href = '/details?' + q.toString();
+}
+
+function renderDimRows(rows, dimKey) {
   const list = Array.isArray(rows) ? rows : [];
   if (!list.length) return '<div class="muted-box">Нет данных</div>';
   return `<div class="dim-list">${list.map(r => {
     const dyn = r.dynamics;
     const dynCls = dyn == null ? '' : (dyn > 2 ? 'color:var(--danger)' : (dyn < -2 ? 'color:var(--ok)' : ''));
-    return `<div class="dim-row">
-      <div class="name" title="${String(r.name||'').replaceAll('"','&quot;')}">${r.name || '—'}
+    const name = r.name || '—';
+    const canDrill = dimKey && name !== '—';
+    const esc = String(name).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('"','&quot;');
+    return `<div class="dim-row${canDrill ? ' drill' : ''}"${canDrill ? ` data-dim-key="${dimKey}" data-dim-value="${esc}" title="Открыть детализацию"` : ''}>
+      <div class="name" title="${esc}">${esc}
         <div class="share">${fmtPct(r.share || 0)} доли</div></div>
       <div class="amt">${fmtInt(r.amount_last)}</div>
       <div class="dyn" style="${dynCls}">${dynText(dyn)}</div>
     </div>`;
   }).join('')}</div>`;
 }
+function bindDimDrills(root) {
+  if (!root) return;
+  root.querySelectorAll('.dim-row.drill[data-dim-key]').forEach(el => {
+    el.addEventListener('click', () => openDetailsFromDim(el.dataset.dimKey, el.dataset.dimValue));
+  });
+}
 function updateDimBreakdowns(payload) {
   const sub = document.getElementById('dimSubject');
   const own = document.getElementById('dimOwnerState');
   if (!sub || !own) return;
   const dims = (payload && payload.dims) || {};
-  sub.innerHTML = renderDimRows((dims.subject || {}).rows);
-  const ownerHtml = renderDimRows((dims.owner || {}).rows);
-  const stateHtml = renderDimRows((dims.state || {}).rows);
-  own.innerHTML = `<div class="muted" style="margin-bottom:6px;font-weight:700">Владелец (FBO/FBS/1P)</div>${ownerHtml}
-    <div class="muted" style="margin:12px 0 6px;font-weight:700">Статус (state_id)</div>${stateHtml}`;
+  sub.innerHTML = renderDimRows((dims.subject || {}).rows, 'subject');
+  bindDimDrills(sub);
+  const ownerHtml = renderDimRows((dims.owner || {}).rows, 'owner');
+  const stateHtml = renderDimRows((dims.state || {}).rows, 'state');
+  own.innerHTML = `<div class="muted" style="margin-bottom:6px;font-weight:700">Владелец (FBO/FBS/1P) · клик → детали</div>${ownerHtml}
+    <div class="muted" style="margin:12px 0 6px;font-weight:700">Статус (state_id) · клик → детали</div>${stateHtml}`;
+  bindDimDrills(own);
+  updateTopNmBrands(payload);
+}
+function updateTopNmBrands(payload) {
+  const nmBox = document.getElementById('topNmMain');
+  const brBox = document.getElementById('topBrandsMain');
+  if (!nmBox || !brBox) return;
+  const nm = (payload && payload.top_nm) || [];
+  const brands = (payload && payload.top_brands) || [];
+  if (!nm.length) nmBox.innerHTML = '<div class="muted-box">Нет данных</div>';
+  else {
+    nmBox.innerHTML = `<div class="dim-list">${nm.map(r => {
+      const id = r.nm_id == null ? '' : String(r.nm_id);
+      const title = String(r.title || '—').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('"','&quot;');
+      return `<div class="dim-row drill" data-product="nm" data-value="${id}" title="Открыть детализацию">
+        <div class="name" title="${title}">${id || '—'} · ${title}
+          <div class="share">${fmtPct(r.share || 0)} доли</div></div>
+        <div class="amt">${fmtInt(r.amount)}</div>
+      </div>`;
+    }).join('')}</div>`;
+    nmBox.querySelectorAll('.dim-row.drill').forEach(el => {
+      el.addEventListener('click', () => openDetailsFromProduct('nm', el.dataset.value));
+    });
+  }
+  if (!brands.length) brBox.innerHTML = '<div class="muted-box">Нет данных</div>';
+  else {
+    brBox.innerHTML = `<div class="dim-list">${brands.map(r => {
+      const name = String(r.brand_name || '—').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('"','&quot;');
+      return `<div class="dim-row drill" data-product="brand" data-value="${name}" title="Открыть детализацию">
+        <div class="name" title="${name}">${name}
+          <div class="share">${fmtPct(r.share || 0)} доли</div></div>
+        <div class="amt">${fmtInt(r.amount)}</div>
+      </div>`;
+    }).join('')}</div>`;
+    brBox.querySelectorAll('.dim-row.drill').forEach(el => {
+      el.addEventListener('click', () => openDetailsFromProduct('brand', el.dataset.value));
+    });
+  }
+}
+function updateCorpusWeeklySeries(payload) {
+  const box = document.getElementById('corpusWeeklyChart');
+  if (!box) return;
+  const weeks = (payload && payload.weeks) || [];
+  const series = (payload && payload.series) || [];
+  if (!weeks.length || !series.length) {
+    box.innerHTML = '<div class="muted-box">Нет данных по неделям</div>';
+    return;
+  }
+  const W = 520, H = 150, padL = 8, padR = 8, padT = 10, padB = 22;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  let maxV = 1;
+  series.forEach(s => {
+    weeks.forEach(w => {
+      const v = Number((s.amounts || {})[String(w)] || 0);
+      if (v > maxV) maxV = v;
+    });
+  });
+  const xAt = (i) => padL + (weeks.length <= 1 ? plotW / 2 : (i / (weeks.length - 1)) * plotW);
+  const yAt = (v) => padT + plotH - (Number(v) / maxV) * plotH;
+  const grid = [0.25, 0.5, 0.75, 1].map(p => {
+    const y = padT + plotH * (1 - p);
+    return `<line class="grid-line" x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}"/>`;
+  }).join('');
+  const labels = weeks.map((w, i) => {
+    if (weeks.length > 10 && i % 2 === 1 && i !== weeks.length - 1) return '';
+    return `<text class="axis-label" x="${xAt(i)}" y="${H - 4}" text-anchor="middle">W${w}</text>`;
+  }).join('');
+  const lines = series.map(s => {
+    const c = Number(s.corpus) || 0;
+    const pts = weeks.map((w, i) => {
+      const v = Number((s.amounts || {})[String(w)] || 0);
+      return `${xAt(i).toFixed(1)},${yAt(v).toFixed(1)}`;
+    }).join(' ');
+    const dots = weeks.map((w, i) => {
+      const v = Number((s.amounts || {})[String(w)] || 0);
+      return `<circle class="dot-${c}" cx="${xAt(i).toFixed(1)}" cy="${yAt(v).toFixed(1)}" r="2.5">
+        <title>${s.name}: W${w} · ${fmtInt(v)}</title></circle>`;
+    }).join('');
+    return `<polyline class="series-${c}" points="${pts}"/>${dots}`;
+  }).join('');
+  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Сумма по корпусам">${grid}${lines}${labels}</svg>`;
 }
 function updateCorpusCompare(rows) {
   const box = document.getElementById('corpusCompare');
@@ -5773,8 +6310,12 @@ async function loadFreshness() {
 async function loadDimBreakdowns() {
   const sub = document.getElementById('dimSubject');
   const own = document.getElementById('dimOwnerState');
+  const nmBox = document.getElementById('topNmMain');
+  const brBox = document.getElementById('topBrandsMain');
   if (sub) sub.innerHTML = '<div class="muted-box">Загрузка…</div>';
   if (own) own.innerHTML = '<div class="muted-box">Загрузка…</div>';
+  if (nmBox) nmBox.innerHTML = '<div class="muted-box">Загрузка…</div>';
+  if (brBox) brBox.innerHTML = '<div class="muted-box">Загрузка…</div>';
   const wh = selectedWh.size ? Array.from(selectedWh).join(',') : '';
   const { wp, wl } = selectedWeeks();
   const q = new URLSearchParams({
@@ -5790,6 +6331,8 @@ async function loadDimBreakdowns() {
   } catch (e) {
     if (sub) sub.innerHTML = `<div class="muted-box">Не удалось загрузить предметы: ${e.message || e}</div>`;
     if (own) own.innerHTML = '<div class="muted-box">Не удалось загрузить владельца/статус</div>';
+    if (nmBox) nmBox.innerHTML = '<div class="muted-box">Не удалось загрузить nm_id</div>';
+    if (brBox) brBox.innerHTML = '<div class="muted-box">Не удалось загрузить бренды</div>';
   }
 }
 
@@ -5822,6 +6365,7 @@ async function loadReport() {
     updateKpis(data.kpis || null, data.yoy || null);
     updateOrg0Spark(data.org0_series || []);
     updateCorpusCompare(data.corpus_compare || []);
+    updateCorpusWeeklySeries(data.corpus_weekly_series || null);
     updatePeriodCompare(data.compare || null);
     updateTop20Churn(data.top20_churn || null);
     updateGrowthAlerts(data.growth_alerts || [], data.alert_thresholds || thr);
@@ -5851,8 +6395,11 @@ async function loadReport() {
     setText('status', 'Ошибка: ' + e.message);
     const setBox = (id, html) => { const el = document.getElementById(id); if (el) el.innerHTML = html; };
     setBox('corpusCompare', '<div class="muted-box">Не удалось загрузить сравнение</div>');
+    setBox('corpusWeeklyChart', '<div class="muted-box">Не удалось загрузить график</div>');
     setBox('dimSubject', '<div class="muted-box">Не удалось загрузить предметы</div>');
     setBox('dimOwnerState', '<div class="muted-box">Не удалось загрузить владельца/статус</div>');
+    setBox('topNmMain', '<div class="muted-box">Не удалось загрузить nm_id</div>');
+    setBox('topBrandsMain', '<div class="muted-box">Не удалось загрузить бренды</div>');
     setBox('growthAlerts', '<div class="muted-box">Не удалось загрузить алерты</div>');
     setBox('periodCompare', '<div class="muted-box">Не удалось загрузить сравнение недель</div>');
     setBox('top20Churn', '<div class="muted-box">Не удалось загрузить сдвиг ТОП-20</div>');
@@ -6064,23 +6611,26 @@ async function loadDetails(page = 1, pushState = true) {
     if (pushState) history.replaceState(null, '', '/details?' + q);
     const sortBy = formEl('sort_by').value;
     const sortDir = formEl('sort_dir').value;
-    thead.innerHTML = columns.map(c => {
+    thead.innerHTML = columns.map((c, idx) => {
       const sortable = SORTABLE.has(c.key);
       const active = sortable && c.key === sortBy;
       const mark = active ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';
-      const cls = sortable ? ` class="sortable${active ? ' active-sort' : ''}" data-sort="${c.key}"` : '';
+      const sticky = idx < 2 ? ` sticky-col sticky-col-${idx}` : '';
+      const base = sortable ? `sortable${active ? ' active-sort' : ''}` : '';
+      const cls = ` class="${[base, sticky].filter(Boolean).join(' ')}"${sortable ? ` data-sort="${c.key}"` : ''}`;
       return `<th${cls}>${c.label}${mark}</th>`;
     }).join('');
     thead.querySelectorAll('[data-sort]').forEach(th => {
       th.addEventListener('click', () => setSort(th.dataset.sort));
     });
     tbody.innerHTML = (data.rows || []).map(row => {
-      return '<tr>' + columns.map(c => {
+      return '<tr>' + columns.map((c, idx) => {
         const rawVal = row[c.key];
         const value = fmtValue(rawVal);
         const isNum = typeof rawVal === 'number';
         const canClick = clickFilters.has(c.key) && rawVal !== null && rawVal !== undefined && rawVal !== '';
-        const cls = [isNum ? 'num' : '', canClick ? 'clickable' : ''].filter(Boolean).join(' ');
+        const sticky = idx < 2 ? `sticky-col sticky-col-${idx}` : '';
+        const cls = [isNum ? 'num' : '', canClick ? 'clickable' : '', sticky].filter(Boolean).join(' ');
         const attrs = canClick
           ? ` class="${cls}" data-filter-key="${c.key}" data-filter-value="${String(rawVal).replaceAll('"', '&quot;')}" title="Фильтр: ${c.key}=${String(value).replaceAll('"', '&quot;')}"`
           : ` class="${cls}" title="${String(value).replaceAll('"', '&quot;')}"`;
@@ -6528,7 +7078,15 @@ async function load(){
     ]);
     const detailsQ = new URLSearchParams(q);
     const watchLabel = inWatchlist(d) ? 'В watchlist ✓' : 'В watchlist';
-    meta.innerHTML = `Источник: ${d.source} · <a class="btn secondary" href="/details?${detailsQ}">Сырые строки</a> <a class="btn secondary" href="/api/reason/export/xlsx?${q}">XLSX</a> <button class="btn secondary" id="btnBookmark" type="button">В закладки</button> <button class="btn secondary" id="btnWatch" type="button">${watchLabel}</button> <a class="btn secondary" href="/">На дашборд</a>`;
+    meta.innerHTML = `
+      <div class="meta-label">Источник: <b>${d.source || '—'}</b></div>
+      <div class="meta-actions">
+        <a class="btn secondary" href="/details?${detailsQ}">Сырые строки</a>
+        <a class="btn secondary" href="/api/reason/export/xlsx?${q}">XLSX</a>
+        <button class="btn secondary" id="btnBookmark" type="button">В закладки</button>
+        <button class="btn secondary" id="btnWatch" type="button">${watchLabel}</button>
+        <a class="btn secondary" href="/">На дашборд</a>
+      </div>`;
     document.getElementById('btnBookmark').onclick = () => {
       const added = toggleBookmark(d);
       document.getElementById('btnBookmark').textContent = added ? 'В закладках' : 'В закладки';
@@ -7057,7 +7615,7 @@ __SHARED_CSS__
     <table>
       <thead>
         <tr>
-          <th>Номенклатура</th>
+          <th class="sticky-col sticky-col-0">Номенклатура</th>
           <th class="num">1 корпус</th>
           <th class="num">2 корпус</th>
           <th class="num">3 корпус</th>
@@ -7086,7 +7644,7 @@ async function loadData() {
     rows.forEach((it) => {
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td>${it.nomenclature ?? '—'}</td>
+        <td class="sticky-col sticky-col-0">${it.nomenclature ?? '—'}</td>
         <td class="num">${fmtInt(it.corpus_1)}</td>
         <td class="num">${fmtInt(it.corpus_2)}</td>
         <td class="num">${fmtInt(it.corpus_3)}</td>
@@ -7098,7 +7656,7 @@ async function loadData() {
     totalTr.className = 'total';
     const t = data.totals || {};
     totalTr.innerHTML = `
-      <td>Итого</td>
+      <td class="sticky-col sticky-col-0"><b>Итого</b></td>
       <td class="num">${fmtInt(t.corpus_1)}</td>
       <td class="num">${fmtInt(t.corpus_2)}</td>
       <td class="num">${fmtInt(t.corpus_3)}</td>
@@ -7402,6 +7960,18 @@ def register_routes(application) -> None:
                 week_last=week_last,
                 cfg=cfg,
             )
+            corpus_weekly_series = fetch_corpus_weekly_series(
+                office_id=office_id,
+                year=year,
+                limit_weeks=12,
+                cfg=cfg,
+            )
+            summa_kpi = fetch_summa_obshay_week(
+                wh_ids=wh_ids,
+                office_id=office_id,
+                year=year,
+                week_last=week_last,
+            )
             growth_alerts = build_growth_alerts(
                 data,
                 min_dynamics=alert_wow,
@@ -7485,14 +8055,17 @@ def register_routes(application) -> None:
             )
         )
 
+        kpis = build_kpi_payload(data)
+        kpis.update(summa_kpi)
         payload = {
             "html": html_grid,
             "year": year,
             "weeks": weeks,
             "week_prev": week_prev,
             "week_last": week_last,
-            "kpis": build_kpi_payload(data),
+            "kpis": kpis,
             "corpus_compare": corpus_compare,
+            "corpus_weekly_series": corpus_weekly_series,
             "growth_alerts": growth_alerts,
             "alert_thresholds": {
                 "wow": alert_wow,
@@ -7562,6 +8135,15 @@ def register_routes(application) -> None:
                 week_last=week_last,
                 limit=limit,
             )
+            tops = fetch_top_nm_brands(
+                wh_ids=wh_ids,
+                office_id=office_id,
+                year=year,
+                week_last=week_last,
+                limit=limit,
+            )
+            payload["top_nm"] = tops.get("top_nm") or []
+            payload["top_brands"] = tops.get("top_brands") or []
             return jsonify(payload)
         except QueryParamError as exc:
             return jsonify({"error": str(exc)}), 400
